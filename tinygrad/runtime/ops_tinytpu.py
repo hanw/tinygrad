@@ -78,7 +78,8 @@ class TinyTPURenderer(Renderer):
                                "out": diag["out_arg"],
                                "act": diag["act_arg"],
                                "weight": diag["weight_arg"],
-                               "num_vecs": diag["num_vecs"]})
+                               "num_vecs": diag["num_vecs"],
+                               "num_weight_tiles": diag["num_weight_tiles"]})
         return json.dumps({
             "op": "UNSUPPORTED",
             "reason": diag["reason"],
@@ -104,6 +105,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         "op_counts": dict(sorted(op_counts.items())),
         "out_arg": None, "act_arg": None, "weight_arg": None,
         "num_vecs": None,
+        "num_weight_tiles": None,
     }
 
     param_sizes: dict[int, int] = {}
@@ -116,25 +118,34 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
 
     if len(params) == 3 and is_gemm and has_store:
         sizes = sorted(param_sizes.values())
-        if sizes[-1] == 16:
-            weight_arg = next(arg for arg, sz in param_sizes.items() if sz == 16)
+        candidate_weights = [arg for arg, sz in param_sizes.items() if sz >= 16 and sz % 16 == 0]
+        for weight_arg in candidate_weights:
+            weight_size = param_sizes[weight_arg]
+            num_weight_tiles = weight_size // 16
             non_weight = {arg: sz for arg, sz in param_sizes.items() if arg != weight_arg}
             out_arg = 0
-            act_arg = next(arg for arg in non_weight if arg != out_arg)
+            if out_arg not in non_weight:
+                continue
+            act_arg = next((arg for arg in non_weight if arg != out_arg), None)
+            if act_arg is None:
+                continue
             out_size = non_weight.get(out_arg)
             act_size = non_weight.get(act_arg)
-            if out_size == act_size and out_size is not None and out_size >= 4 and out_size % 4 == 0:
+            if out_size is None or act_size is None or act_size < 4 or act_size % 4 != 0:
+                continue
+            if out_size == act_size * num_weight_tiles:
                 diag.update({
                     "supported": True,
                     "reason": "supported gemm4x4",
                     "out_arg": out_arg,
                     "act_arg": act_arg,
                     "weight_arg": weight_arg,
-                    "num_vecs": out_size // 4,
+                    "num_vecs": act_size // 4,
+                    "num_weight_tiles": num_weight_tiles,
                 })
                 return diag
         diag["reason"] = f"unexpected param sizes {sizes}"
-        diag["notes"].append("Current TinyTPU backend only handles int32 matmul cases where the weight buffer is one 4x4 tile and the activation/output buffers are matching multiples of 4 elements.")
+        diag["notes"].append("Current TinyTPU backend only handles int32 matmul cases where the weight buffer is one or more 4x4 tiles and the output buffer matches activation_rows x output_tile_count.")
     else:
         diag["reason"] = f"params={len(params)} gemm={is_gemm}"
 
@@ -262,21 +273,30 @@ class TinyTPUProgram:
 
         # Decode int32 data from the raw bytearrays
         act_i32    = np.frombuffer(bytes(act_buf),    dtype="<i4")
-        weight_i32 = np.frombuffer(bytes(weight_buf), dtype="<i4")       # shape (16,)
+        weight_i32 = np.frombuffer(bytes(weight_buf), dtype="<i4")
         num_vecs   = int(prog.get("num_vecs", max(1, act_i32.size // _ROWS)))
+        num_weight_tiles = int(prog.get("num_weight_tiles", max(1, weight_i32.size // (_ROWS * _COLS))))
+        out_cols = num_weight_tiles * _COLS
 
         if act_i32.size != num_vecs * _ROWS:
             raise RuntimeError(f"TinyTPU activation buffer size {act_i32.size} does not match num_vecs={num_vecs}")
-        if len(out_buf) < num_vecs * _ROWS * _BYTES_PER_ELEM:
-            raise RuntimeError(f"TinyTPU output buffer too small for num_vecs={num_vecs}")
+        if weight_i32.size != num_weight_tiles * _ROWS * _COLS:
+            raise RuntimeError(f"TinyTPU weight buffer size {weight_i32.size} does not match num_weight_tiles={num_weight_tiles}")
+        if len(out_buf) < num_vecs * out_cols * _BYTES_PER_ELEM:
+            raise RuntimeError(f"TinyTPU output buffer too small for shape=({num_vecs}, {out_cols})")
 
         # Downcast to int8 (hardware operand type)
-        weight_i8 = weight_i32.reshape(_ROWS, _COLS).astype(np.int8)
+        weight_matrix = weight_i32.reshape(_ROWS, out_cols)
+        weight_tiles = [weight_matrix[:, tile_idx * _COLS : (tile_idx + 1) * _COLS].astype(np.int8)
+                        for tile_idx in range(num_weight_tiles)]
         sim = _sim_path()
-        out_i32 = np.empty(num_vecs * _ROWS, dtype="<i4")
+        out_i32 = np.empty(num_vecs * out_cols, dtype="<i4")
         act_rows = act_i32.reshape(num_vecs, _ROWS).astype(np.int8)
         for i, act_i8 in enumerate(act_rows):
-            out_i32[i * _ROWS : (i + 1) * _ROWS] = _run_gemm_vec(sim, weight_i8, act_i8)
+            row_base = i * out_cols
+            for tile_idx, weight_i8 in enumerate(weight_tiles):
+                col_base = row_base + tile_idx * _COLS
+                out_i32[col_base : col_base + _COLS] = _run_gemm_vec(sim, weight_i8, act_i8)
         out_buf[: len(out_i32) * _BYTES_PER_ELEM] = out_i32.tobytes()
         return 1e-3  # placeholder timing (seconds)
 
