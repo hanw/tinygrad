@@ -246,6 +246,15 @@ def _run_gemm_vec(sim: str, weight_i8: np.ndarray, act_i8: np.ndarray) -> list[i
     return result
 
 
+def _require_int8_range(name: str, values: np.ndarray) -> None:
+    if values.size == 0:
+        return
+    min_val = int(values.min())
+    max_val = int(values.max())
+    if min_val < -128 or max_val > 127:
+        raise ValueError(f"TinyTPU {name} values must fit in signed int8, got range [{min_val}, {max_val}]")
+
+
 # ---------------------------------------------------------------------------
 # Program — drives the BSV simulator
 # ---------------------------------------------------------------------------
@@ -284,6 +293,9 @@ class TinyTPUProgram:
             raise RuntimeError(f"TinyTPU weight buffer size {weight_i32.size} does not match num_weight_tiles={num_weight_tiles}")
         if len(out_buf) < num_vecs * out_cols * _BYTES_PER_ELEM:
             raise RuntimeError(f"TinyTPU output buffer too small for shape=({num_vecs}, {out_cols})")
+
+        _require_int8_range("weight", weight_i32)
+        _require_int8_range("activation", act_i32)
 
         # Downcast to int8 (hardware operand type)
         weight_matrix = weight_i32.reshape(_ROWS, out_cols)
