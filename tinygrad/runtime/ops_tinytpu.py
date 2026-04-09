@@ -326,10 +326,13 @@ def _unsupported_message(prog: dict) -> str:
     parts = [f"TinyTPU: unsupported op '{prog.get('op')}' (reason: {prog.get('reason', 'n/a')})"]
     missing = prog.get("missing_instructions") or []
     notes = prog.get("notes") or []
+    op_counts = prog.get("op_counts") or {}
     if missing:
         parts.append("missing instructions: " + ", ".join(str(x) for x in missing))
     if notes:
         parts.append("notes: " + " | ".join(str(x) for x in notes))
+    if op_counts:
+        parts.append("op_counts: " + ", ".join(f"{k}={v}" for k, v in sorted(op_counts.items())))
     return "; ".join(parts)
 
 
