@@ -80,6 +80,8 @@ class TinyTPURenderer(Renderer):
                                "weight": diag["weight_arg"],
                                "num_vecs": diag["num_vecs"],
                                "batch_count": diag["batch_count"],
+                               "act_batch_count": diag["act_batch_count"],
+                               "weight_batch_count": diag["weight_batch_count"],
                                "rows_per_batch": diag["rows_per_batch"],
                                "num_k_tiles": diag["num_k_tiles"],
                                "num_weight_tiles": diag["num_weight_tiles"]})
@@ -109,6 +111,8 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         "out_arg": None, "act_arg": None, "weight_arg": None,
         "num_vecs": None,
         "batch_count": None,
+        "act_batch_count": None,
+        "weight_batch_count": None,
         "rows_per_batch": None,
         "num_k_tiles": None,
         "num_weight_tiles": None,
@@ -142,9 +146,15 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
                 continue
             out_size = non_weight.get(out_arg)
             act_size = non_weight.get(act_arg)
-            tiling = _infer_tiling(out_size, act_size, weight_size)
+            prefer_broadcast = (
+                op_counts.get("RANGE", 0) > 1 and
+                op_counts.get("LOAD", 0) > 8 and
+                out_size is not None and act_size is not None and
+                act_size < out_size and weight_size > out_size
+            )
+            tiling = _infer_tiling(out_size, act_size, weight_size, prefer_broadcast=prefer_broadcast)
             if tiling is not None:
-                batch_count, rows_per_batch, num_k_tiles, inferred_n_tiles = tiling
+                batch_count, act_batch_count, weight_batch_count, rows_per_batch, num_k_tiles, inferred_n_tiles = tiling
                 diag.update({
                     "supported": True,
                     "reason": "supported gemm4x4",
@@ -153,6 +163,8 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
                     "weight_arg": weight_arg,
                     "num_vecs": batch_count * rows_per_batch,
                     "batch_count": batch_count,
+                    "act_batch_count": act_batch_count,
+                    "weight_batch_count": weight_batch_count,
                     "rows_per_batch": rows_per_batch,
                     "num_k_tiles": num_k_tiles,
                     "num_weight_tiles": inferred_n_tiles,
@@ -276,7 +288,7 @@ def _run_gemm_vec(sim: str, weight_i8: np.ndarray, act_i8: np.ndarray) -> list[i
     return result
 
 
-def _infer_tiling(out_size: int | None, act_size: int | None, weight_size: int) -> tuple[int, int, int, int] | None:
+def _infer_tiling(out_size: int | None, act_size: int | None, weight_size: int, prefer_broadcast: bool = False) -> tuple[int, int, int, int, int, int] | None:
     if out_size is None or act_size is None:
         return None
     if out_size <= 0 or act_size <= 0 or weight_size <= 0:
@@ -286,23 +298,53 @@ def _infer_tiling(out_size: int | None, act_size: int | None, weight_size: int) 
     act_quads = act_size // _ROWS
     out_quads = out_size // _COLS
     weight_tiles = weight_size // (_ROWS * _COLS)
-    for batch_count in range(1, math.gcd(math.gcd(act_quads, out_quads), weight_tiles) + 1):
-        if act_quads % batch_count != 0 or out_quads % batch_count != 0 or weight_tiles % batch_count != 0:
+    candidates: list[tuple[int, int, int, int, int, int]] = []
+    for batch_count in range(1, out_quads + 1):
+        if out_quads % batch_count != 0:
             continue
-        act_per_batch = act_quads // batch_count
         out_per_batch = out_quads // batch_count
-        weight_per_batch = weight_tiles // batch_count
-        common = math.gcd(act_per_batch, out_per_batch)
-        for rows_per_batch in range(1, common + 1):
-            if act_per_batch % rows_per_batch != 0 or out_per_batch % rows_per_batch != 0:
+        for act_batch_count in (1, batch_count):
+            if act_quads % act_batch_count != 0:
                 continue
-            num_k_tiles = act_per_batch // rows_per_batch
-            num_n_tiles = out_per_batch // rows_per_batch
-            if num_k_tiles <= 0 or num_n_tiles <= 0:
-                continue
-            if num_k_tiles * num_n_tiles == weight_per_batch:
-                return batch_count, rows_per_batch, num_k_tiles, num_n_tiles
-    return None
+            act_per_batch = act_quads // act_batch_count
+            for weight_batch_count in (1, batch_count):
+                if max(act_batch_count, weight_batch_count) != batch_count:
+                    continue
+                if weight_tiles % weight_batch_count != 0:
+                    continue
+                weight_per_batch = weight_tiles // weight_batch_count
+                common = math.gcd(act_per_batch, out_per_batch)
+                for rows_per_batch in range(1, common + 1):
+                    if act_per_batch % rows_per_batch != 0 or out_per_batch % rows_per_batch != 0:
+                        continue
+                    num_k_tiles = act_per_batch // rows_per_batch
+                    num_n_tiles = out_per_batch // rows_per_batch
+                    if num_k_tiles <= 0 or num_n_tiles <= 0:
+                        continue
+                    if num_k_tiles * num_n_tiles == weight_per_batch:
+                        candidates.append((batch_count, act_batch_count, weight_batch_count, rows_per_batch, num_k_tiles, num_n_tiles))
+    if not candidates:
+        return None
+    def _score(t: tuple[int, int, int, int, int, int]) -> tuple[int, int, int, int, int]:
+        if prefer_broadcast:
+            return (
+                int(t[1] != t[2] or t[0] > 1),
+                -abs(t[4] - t[5]),
+                t[4] * t[5],
+                t[3],
+                -t[0],
+            )
+        return (
+            t[4] * t[5],
+            -abs(t[4] - t[5]),
+            t[3],
+            -(t[1] + t[2]),
+            -t[0],
+        )
+    return max(
+        candidates,
+        key=_score,
+    )
 
 
 def _tiling_failure_note(out_size: int | None, act_size: int | None, weight_size: int) -> str:
@@ -372,6 +414,8 @@ class TinyTPUProgram:
         weight_i32 = np.frombuffer(bytes(weight_buf), dtype="<i4")
         num_vecs   = int(prog.get("num_vecs", max(1, act_i32.size // _ROWS)))
         batch_count = int(prog.get("batch_count", 1))
+        act_batch_count = int(prog.get("act_batch_count", batch_count))
+        weight_batch_count = int(prog.get("weight_batch_count", batch_count))
         rows_per_batch = int(prog.get("rows_per_batch", max(1, num_vecs // max(1, batch_count))))
         num_k_tiles = int(prog.get("num_k_tiles", max(1, act_i32.size // max(1, num_vecs * _ROWS))))
         num_weight_tiles = int(prog.get("num_weight_tiles", max(1, weight_i32.size // (_ROWS * _COLS))))
@@ -380,10 +424,10 @@ class TinyTPUProgram:
 
         if num_vecs != batch_count * rows_per_batch:
             raise RuntimeError(f"TinyTPU row factoring mismatch: num_vecs={num_vecs}, batch_count={batch_count}, rows_per_batch={rows_per_batch}")
-        if act_i32.size != num_vecs * k_cols:
-            raise RuntimeError(f"TinyTPU activation buffer size {act_i32.size} does not match shape=({num_vecs}, {k_cols})")
-        if weight_i32.size != batch_count * num_k_tiles * num_weight_tiles * _ROWS * _COLS:
-            raise RuntimeError(f"TinyTPU weight buffer size {weight_i32.size} does not match tiling=({batch_count}, {num_k_tiles}, {num_weight_tiles})")
+        if act_i32.size != act_batch_count * rows_per_batch * k_cols:
+            raise RuntimeError(f"TinyTPU activation buffer size {act_i32.size} does not match shape=({act_batch_count}, {rows_per_batch}, {k_cols})")
+        if weight_i32.size != weight_batch_count * num_k_tiles * num_weight_tiles * _ROWS * _COLS:
+            raise RuntimeError(f"TinyTPU weight buffer size {weight_i32.size} does not match tiling=({weight_batch_count}, {num_k_tiles}, {num_weight_tiles})")
         if len(out_buf) < num_vecs * out_cols * _BYTES_PER_ELEM:
             raise RuntimeError(f"TinyTPU output buffer too small for shape=({num_vecs}, {out_cols})")
 
@@ -391,16 +435,16 @@ class TinyTPUProgram:
         _require_int8_range("activation", act_i32)
 
         # Downcast to int8 (hardware operand type)
-        weight_tensor = weight_i32.reshape(batch_count, k_cols, out_cols)
+        weight_tensor = weight_i32.reshape(weight_batch_count, k_cols, out_cols)
         sim = _sim_path()
         out_i32 = np.empty(num_vecs * out_cols, dtype="<i4")
-        act_rows = act_i32.reshape(batch_count, rows_per_batch, k_cols).astype(np.int8)
+        act_rows = act_i32.reshape(act_batch_count, rows_per_batch, k_cols).astype(np.int8)
         for batch_idx in range(batch_count):
             for row_idx in range(rows_per_batch):
                 flat_row = batch_idx * rows_per_batch + row_idx
                 row_base = flat_row * out_cols
-                act_row = act_rows[batch_idx, row_idx]
-                weight_matrix = weight_tensor[batch_idx]
+                act_row = act_rows[min(batch_idx, act_batch_count - 1), row_idx]
+                weight_matrix = weight_tensor[min(batch_idx, weight_batch_count - 1)]
                 for tile_idx in range(num_weight_tiles):
                     col_base = row_base + tile_idx * _COLS
                     acc = np.zeros(_COLS, dtype=np.int32)
