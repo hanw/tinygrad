@@ -118,6 +118,12 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
             return diag
         param_sizes[p.arg] = p.dtype.size
 
+    if is_gemm and (len(param_sizes) == 1 or (param_sizes and all(sz == 0 for sz in param_sizes.values()))):
+        diag["reason"] = "zero-sized gemm"
+        diag["notes"].append("Zero-sized GEMM buffers are not lowered through the current TinyTPU path.")
+        diag["missing_instructions"] = ["SXU_DISPATCH_VPU", "SXU_LOAD_VREG", "SXU_STORE_VREG"]
+        return diag
+
     if len(params) == 3 and is_gemm and has_store:
         sizes = sorted(param_sizes.values())
         candidate_weights = [arg for arg, sz in param_sizes.items() if sz >= 16 and sz % 16 == 0]
