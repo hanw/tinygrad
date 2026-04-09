@@ -123,7 +123,6 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         candidate_weights = [arg for arg, sz in param_sizes.items() if sz >= 16 and sz % 16 == 0]
         for weight_arg in candidate_weights:
             weight_size = param_sizes[weight_arg]
-            num_weight_tiles = weight_size // 16
             non_weight = {arg: sz for arg, sz in param_sizes.items() if arg != weight_arg}
             out_arg = 0
             if out_arg not in non_weight:
@@ -149,6 +148,22 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
                 return diag
         diag["reason"] = f"unexpected param sizes {sizes}"
         diag["notes"].append("Current TinyTPU backend only handles int32 matmul cases whose flattened buffers can be factored into MxK, KxN, and MxN with K and N tiled in groups of 4.")
+        if len(candidate_weights) == 1:
+            weight_arg = candidate_weights[0]
+            non_weight = {arg: sz for arg, sz in param_sizes.items() if arg != weight_arg}
+            out_size = non_weight.get(0)
+            act_arg = next((arg for arg in non_weight if arg != 0), None)
+            act_size = non_weight.get(act_arg) if act_arg is not None else None
+            diag["notes"].append(_tiling_failure_note(out_size, act_size, param_sizes[weight_arg]))
+        else:
+            out_size = param_sizes.get(0)
+            remaining = {arg: sz for arg, sz in param_sizes.items() if arg != 0}
+            if len(remaining) == 2:
+                by_size = sorted(remaining.items(), key=lambda item: item[1])
+                act_size = by_size[0][1]
+                weight_size = by_size[1][1]
+                diag["notes"].append(_tiling_failure_note(out_size, act_size, weight_size))
+            diag["notes"].append("No buffer looked like a valid 4x4-tiled weight matrix.")
     else:
         diag["reason"] = f"params={len(params)} gemm={is_gemm}"
 
@@ -273,6 +288,23 @@ def _infer_tiling(out_size: int | None, act_size: int | None, weight_size: int) 
     if num_k_tiles <= 0 or num_n_tiles <= 0 or num_k_tiles * num_n_tiles != weight_tiles:
         return None
     return num_vecs, num_k_tiles, num_n_tiles
+
+
+def _tiling_failure_note(out_size: int | None, act_size: int | None, weight_size: int) -> str:
+    issues: list[str] = []
+    if act_size is None or out_size is None:
+        return "missing activation or output buffer size for GEMM factoring"
+    if act_size <= 0 or out_size <= 0 or weight_size <= 0:
+        return "zero-sized GEMM buffers are not lowered through the current TinyTPU path"
+    if act_size % _ROWS != 0:
+        issues.append(f"activation size {act_size} is not divisible by {_ROWS}")
+    if out_size % _COLS != 0:
+        issues.append(f"output size {out_size} is not divisible by {_COLS}")
+    if weight_size % (_ROWS * _COLS) != 0:
+        issues.append(f"weight size {weight_size} is not divisible by {_ROWS * _COLS}")
+    if not issues:
+        issues.append(f"sizes out={out_size}, act={act_size}, weight={weight_size} do not factor into MxK, KxN, MxN tiles")
+    return "; ".join(issues)
 
 
 def _require_int8_range(name: str, values: np.ndarray) -> None:
