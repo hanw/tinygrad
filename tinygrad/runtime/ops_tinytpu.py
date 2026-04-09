@@ -77,7 +77,8 @@ class TinyTPURenderer(Renderer):
             return json.dumps({"op": "GEMM4x4",
                                "out": diag["out_arg"],
                                "act": diag["act_arg"],
-                               "weight": diag["weight_arg"]})
+                               "weight": diag["weight_arg"],
+                               "num_vecs": diag["num_vecs"]})
         return json.dumps({
             "op": "UNSUPPORTED",
             "reason": diag["reason"],
@@ -102,6 +103,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         "notes": [],
         "op_counts": dict(sorted(op_counts.items())),
         "out_arg": None, "act_arg": None, "weight_arg": None,
+        "num_vecs": None,
     }
 
     param_sizes: dict[int, int] = {}
@@ -114,14 +116,25 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
 
     if len(params) == 3 and is_gemm and has_store:
         sizes = sorted(param_sizes.values())
-        if sizes == [4, 4, 16]:
+        if sizes[-1] == 16:
             weight_arg = next(arg for arg, sz in param_sizes.items() if sz == 16)
+            non_weight = {arg: sz for arg, sz in param_sizes.items() if arg != weight_arg}
             out_arg = 0
-            act_arg = next(arg for arg in param_sizes if arg != weight_arg and arg != out_arg)
-            diag.update({"supported": True, "reason": "supported gemm4x4", "out_arg": out_arg, "act_arg": act_arg, "weight_arg": weight_arg})
-            return diag
+            act_arg = next(arg for arg in non_weight if arg != out_arg)
+            out_size = non_weight.get(out_arg)
+            act_size = non_weight.get(act_arg)
+            if out_size == act_size and out_size is not None and out_size >= 4 and out_size % 4 == 0:
+                diag.update({
+                    "supported": True,
+                    "reason": "supported gemm4x4",
+                    "out_arg": out_arg,
+                    "act_arg": act_arg,
+                    "weight_arg": weight_arg,
+                    "num_vecs": out_size // 4,
+                })
+                return diag
         diag["reason"] = f"unexpected param sizes {sizes}"
-        diag["notes"].append("Current TinyTPU backend only handles 1x4 @ 4x4 int32 matmul lowered to [out=4, act=4, weight=16] buffers.")
+        diag["notes"].append("Current TinyTPU backend only handles int32 matmul cases where the weight buffer is one 4x4 tile and the activation/output buffers are matching multiples of 4 elements.")
     else:
         diag["reason"] = f"params={len(params)} gemm={is_gemm}"
 
@@ -195,6 +208,33 @@ def _parse_sim_output(stdout: str) -> list[int] | None:
     return None
 
 
+def _run_gemm_vec(sim: str, weight_i8: np.ndarray, act_i8: np.ndarray) -> list[int]:
+    bundle_text = _build_gemm_bundle(weight_i8, act_i8)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        f.write(bundle_text)
+        bundle_path = f.name
+
+    try:
+        env = {**os.environ, "TINYTPU_BUNDLE": bundle_path}
+        proc = subprocess.run([sim], env=env, capture_output=True, text=True, timeout=30)
+    finally:
+        os.unlink(bundle_path)
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"TinyTPU sim exited {proc.returncode}\n"
+            f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
+        )
+
+    result = _parse_sim_output(proc.stdout)
+    if result is None:
+        raise RuntimeError(
+            f"TinyTPU sim produced no mxu_result\n"
+            f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
+        )
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Program — drives the BSV simulator
 # ---------------------------------------------------------------------------
@@ -221,42 +261,22 @@ class TinyTPUProgram:
         weight_buf = bufs[prog["weight"]]
 
         # Decode int32 data from the raw bytearrays
-        act_i32    = np.frombuffer(bytes(act_buf),    dtype="<i4")       # shape (4,)
+        act_i32    = np.frombuffer(bytes(act_buf),    dtype="<i4")
         weight_i32 = np.frombuffer(bytes(weight_buf), dtype="<i4")       # shape (16,)
+        num_vecs   = int(prog.get("num_vecs", max(1, act_i32.size // _ROWS)))
+
+        if act_i32.size != num_vecs * _ROWS:
+            raise RuntimeError(f"TinyTPU activation buffer size {act_i32.size} does not match num_vecs={num_vecs}")
+        if len(out_buf) < num_vecs * _ROWS * _BYTES_PER_ELEM:
+            raise RuntimeError(f"TinyTPU output buffer too small for num_vecs={num_vecs}")
 
         # Downcast to int8 (hardware operand type)
-        act_i8    = act_i32.astype(np.int8)
         weight_i8 = weight_i32.reshape(_ROWS, _COLS).astype(np.int8)
-
-        # Write text bundle to a temp file
-        bundle_text = _build_gemm_bundle(weight_i8, act_i8)
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-            f.write(bundle_text)
-            bundle_path = f.name
-
-        try:
-            sim = _sim_path()
-            env = {**os.environ, "TINYTPU_BUNDLE": bundle_path}
-            proc = subprocess.run([sim], env=env,
-                                  capture_output=True, text=True, timeout=30)
-        finally:
-            os.unlink(bundle_path)
-
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"TinyTPU sim exited {proc.returncode}\n"
-                f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
-            )
-
-        result = _parse_sim_output(proc.stdout)
-        if result is None:
-            raise RuntimeError(
-                f"TinyTPU sim produced no mxu_result\n"
-                f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
-            )
-
-        # Write int32 results back to the output buffer
-        out_i32 = np.array(result, dtype="<i4")
+        sim = _sim_path()
+        out_i32 = np.empty(num_vecs * _ROWS, dtype="<i4")
+        act_rows = act_i32.reshape(num_vecs, _ROWS).astype(np.int8)
+        for i, act_i8 in enumerate(act_rows):
+            out_i32[i * _ROWS : (i + 1) * _ROWS] = _run_gemm_vec(sim, weight_i8, act_i8)
         out_buf[: len(out_i32) * _BYTES_PER_ELEM] = out_i32.tobytes()
         return 1e-3  # placeholder timing (seconds)
 
