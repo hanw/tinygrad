@@ -255,6 +255,17 @@ def _require_int8_range(name: str, values: np.ndarray) -> None:
         raise ValueError(f"TinyTPU {name} values must fit in signed int8, got range [{min_val}, {max_val}]")
 
 
+def _unsupported_message(prog: dict) -> str:
+    parts = [f"TinyTPU: unsupported op '{prog.get('op')}' (reason: {prog.get('reason', 'n/a')})"]
+    missing = prog.get("missing_instructions") or []
+    notes = prog.get("notes") or []
+    if missing:
+        parts.append("missing instructions: " + ", ".join(str(x) for x in missing))
+    if notes:
+        parts.append("notes: " + " | ".join(str(x) for x in notes))
+    return "; ".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Program — drives the BSV simulator
 # ---------------------------------------------------------------------------
@@ -271,10 +282,7 @@ class TinyTPUProgram:
                  **kwargs) -> float | None:
         prog = self.prog
         if prog.get("op") != "GEMM4x4":
-            raise NotImplementedError(
-                f"TinyTPU: unsupported op '{prog.get('op')}' "
-                f"(reason: {prog.get('reason', 'n/a')})"
-            )
+            raise NotImplementedError(_unsupported_message(prog))
 
         out_buf    = bufs[prog["out"]]
         act_buf    = bufs[prog["act"]]
