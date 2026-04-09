@@ -9,7 +9,7 @@ The BSV simulator binary is located via the TINYTPU_SIM environment variable
 """
 
 from __future__ import annotations
-import os, json, subprocess, tempfile
+import os, json, subprocess, tempfile, math
 from collections import Counter
 import numpy as np
 from tinygrad.device import Compiled, Allocator, BufferSpec
@@ -79,6 +79,7 @@ class TinyTPURenderer(Renderer):
                                "act": diag["act_arg"],
                                "weight": diag["weight_arg"],
                                "num_vecs": diag["num_vecs"],
+                               "num_k_tiles": diag["num_k_tiles"],
                                "num_weight_tiles": diag["num_weight_tiles"]})
         return json.dumps({
             "op": "UNSUPPORTED",
@@ -105,6 +106,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         "op_counts": dict(sorted(op_counts.items())),
         "out_arg": None, "act_arg": None, "weight_arg": None,
         "num_vecs": None,
+        "num_k_tiles": None,
         "num_weight_tiles": None,
     }
 
@@ -131,21 +133,22 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
                 continue
             out_size = non_weight.get(out_arg)
             act_size = non_weight.get(act_arg)
-            if out_size is None or act_size is None or act_size < 4 or act_size % 4 != 0:
-                continue
-            if out_size == act_size * num_weight_tiles:
+            tiling = _infer_tiling(out_size, act_size, weight_size)
+            if tiling is not None:
+                num_vecs, num_k_tiles, inferred_n_tiles = tiling
                 diag.update({
                     "supported": True,
                     "reason": "supported gemm4x4",
                     "out_arg": out_arg,
                     "act_arg": act_arg,
                     "weight_arg": weight_arg,
-                    "num_vecs": act_size // 4,
-                    "num_weight_tiles": num_weight_tiles,
+                    "num_vecs": num_vecs,
+                    "num_k_tiles": num_k_tiles,
+                    "num_weight_tiles": inferred_n_tiles,
                 })
                 return diag
         diag["reason"] = f"unexpected param sizes {sizes}"
-        diag["notes"].append("Current TinyTPU backend only handles int32 matmul cases where the weight buffer is one or more 4x4 tiles and the output buffer matches activation_rows x output_tile_count.")
+        diag["notes"].append("Current TinyTPU backend only handles int32 matmul cases whose flattened buffers can be factored into MxK, KxN, and MxN with K and N tiled in groups of 4.")
     else:
         diag["reason"] = f"params={len(params)} gemm={is_gemm}"
 
@@ -246,6 +249,32 @@ def _run_gemm_vec(sim: str, weight_i8: np.ndarray, act_i8: np.ndarray) -> list[i
     return result
 
 
+def _infer_tiling(out_size: int | None, act_size: int | None, weight_size: int) -> tuple[int, int, int] | None:
+    if out_size is None or act_size is None:
+        return None
+    if out_size <= 0 or act_size <= 0 or weight_size <= 0:
+        return None
+    if act_size % _ROWS != 0 or out_size % _COLS != 0 or weight_size % (_ROWS * _COLS) != 0:
+        return None
+    act_quads = act_size // _ROWS
+    out_quads = out_size // _COLS
+    weight_tiles = weight_size // (_ROWS * _COLS)
+    numer = act_quads * out_quads
+    if numer % weight_tiles != 0:
+        return None
+    num_vecs_sq = numer // weight_tiles
+    num_vecs = math.isqrt(num_vecs_sq)
+    if num_vecs <= 0 or num_vecs * num_vecs != num_vecs_sq:
+        return None
+    if act_quads % num_vecs != 0 or out_quads % num_vecs != 0:
+        return None
+    num_k_tiles = act_quads // num_vecs
+    num_n_tiles = out_quads // num_vecs
+    if num_k_tiles <= 0 or num_n_tiles <= 0 or num_k_tiles * num_n_tiles != weight_tiles:
+        return None
+    return num_vecs, num_k_tiles, num_n_tiles
+
+
 def _require_int8_range(name: str, values: np.ndarray) -> None:
     if values.size == 0:
         return
@@ -292,13 +321,15 @@ class TinyTPUProgram:
         act_i32    = np.frombuffer(bytes(act_buf),    dtype="<i4")
         weight_i32 = np.frombuffer(bytes(weight_buf), dtype="<i4")
         num_vecs   = int(prog.get("num_vecs", max(1, act_i32.size // _ROWS)))
+        num_k_tiles = int(prog.get("num_k_tiles", max(1, act_i32.size // max(1, num_vecs * _ROWS))))
         num_weight_tiles = int(prog.get("num_weight_tiles", max(1, weight_i32.size // (_ROWS * _COLS))))
         out_cols = num_weight_tiles * _COLS
+        k_cols = num_k_tiles * _ROWS
 
-        if act_i32.size != num_vecs * _ROWS:
-            raise RuntimeError(f"TinyTPU activation buffer size {act_i32.size} does not match num_vecs={num_vecs}")
-        if weight_i32.size != num_weight_tiles * _ROWS * _COLS:
-            raise RuntimeError(f"TinyTPU weight buffer size {weight_i32.size} does not match num_weight_tiles={num_weight_tiles}")
+        if act_i32.size != num_vecs * k_cols:
+            raise RuntimeError(f"TinyTPU activation buffer size {act_i32.size} does not match shape=({num_vecs}, {k_cols})")
+        if weight_i32.size != num_k_tiles * num_weight_tiles * _ROWS * _COLS:
+            raise RuntimeError(f"TinyTPU weight buffer size {weight_i32.size} does not match tiling=({num_k_tiles}, {num_weight_tiles})")
         if len(out_buf) < num_vecs * out_cols * _BYTES_PER_ELEM:
             raise RuntimeError(f"TinyTPU output buffer too small for shape=({num_vecs}, {out_cols})")
 
@@ -306,17 +337,21 @@ class TinyTPUProgram:
         _require_int8_range("activation", act_i32)
 
         # Downcast to int8 (hardware operand type)
-        weight_matrix = weight_i32.reshape(_ROWS, out_cols)
-        weight_tiles = [weight_matrix[:, tile_idx * _COLS : (tile_idx + 1) * _COLS].astype(np.int8)
-                        for tile_idx in range(num_weight_tiles)]
+        weight_matrix = weight_i32.reshape(k_cols, out_cols)
         sim = _sim_path()
         out_i32 = np.empty(num_vecs * out_cols, dtype="<i4")
-        act_rows = act_i32.reshape(num_vecs, _ROWS).astype(np.int8)
-        for i, act_i8 in enumerate(act_rows):
+        act_rows = act_i32.reshape(num_vecs, k_cols).astype(np.int8)
+        for i, act_row in enumerate(act_rows):
             row_base = i * out_cols
-            for tile_idx, weight_i8 in enumerate(weight_tiles):
+            for tile_idx in range(num_weight_tiles):
                 col_base = row_base + tile_idx * _COLS
-                out_i32[col_base : col_base + _COLS] = _run_gemm_vec(sim, weight_i8, act_i8)
+                acc = np.zeros(_COLS, dtype=np.int32)
+                for k_idx in range(num_k_tiles):
+                    act_i8 = act_row[k_idx * _ROWS : (k_idx + 1) * _ROWS]
+                    weight_i8 = weight_matrix[k_idx * _ROWS : (k_idx + 1) * _ROWS,
+                                              tile_idx * _COLS : (tile_idx + 1) * _COLS].astype(np.int8)
+                    acc += np.array(_run_gemm_vec(sim, weight_i8, act_i8), dtype=np.int32)
+                out_i32[col_base : col_base + _COLS] = acc
         out_buf[: len(out_i32) * _BYTES_PER_ELEM] = out_i32.tobytes()
         return 1e-3  # placeholder timing (seconds)
 
