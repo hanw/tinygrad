@@ -10,6 +10,7 @@ The BSV simulator binary is located via the TINYTPU_SIM environment variable
 
 from __future__ import annotations
 import os, json, subprocess, tempfile
+from collections import Counter
 import numpy as np
 from tinygrad.device import Compiled, Allocator, BufferSpec
 from tinygrad.renderer import Renderer
@@ -71,42 +72,91 @@ class TinyTPURenderer(Renderer):
     local_max   = (1,) * 3
 
     def render(self, uops: list[UOp]) -> str:  # type: ignore[override]
-        params     = [u for u in uops if u.op is Ops.PARAM]
-        has_mulacc = any(u.op is Ops.MULACC for u in uops)
-        # UNROLL optimization replaces MULACC with chained MUL+ADD inside a RANGE
-        has_mul    = any(u.op is Ops.MUL    for u in uops)
-        has_range  = any(u.op is Ops.RANGE  for u in uops)
-        has_store  = any(u.op is Ops.STORE  for u in uops)
-        is_gemm    = has_mulacc or (has_mul and has_range)
+        diag = analyze_tinytpu_uops(uops)
+        if diag["supported"]:
+            return json.dumps({"op": "GEMM4x4",
+                               "out": diag["out_arg"],
+                               "act": diag["act_arg"],
+                               "weight": diag["weight_arg"]})
+        return json.dumps({
+            "op": "UNSUPPORTED",
+            "reason": diag["reason"],
+            "missing_instructions": diag["missing_instructions"],
+            "notes": diag["notes"],
+            "op_counts": diag["op_counts"],
+        })
 
-        # Must be exactly 3 params (out, act, weight) with a matmul pattern.
-        if len(params) != 3 or not is_gemm or not has_store:
-            return json.dumps({"op": "UNSUPPORTED",
-                               "reason": f"params={len(params)} gemm={is_gemm}"})
+def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
+    params = [u for u in uops if u.op is Ops.PARAM]
+    op_counts = Counter(u.op.name for u in uops)
+    has_mulacc = any(u.op is Ops.MULACC for u in uops)
+    has_mul = any(u.op is Ops.MUL for u in uops)
+    has_range = any(u.op is Ops.RANGE for u in uops)
+    has_store = any(u.op is Ops.STORE for u in uops)
+    is_gemm = has_mulacc or (has_mul and has_range)
 
-        # Identify roles by PtrDType size (number of elements).
-        param_sizes = {}
-        for p in params:
-            if isinstance(p.dtype, PtrDType):
-                param_sizes[p.arg] = p.dtype.size
-            else:
-                return json.dumps({"op": "UNSUPPORTED", "reason": "non-ptr param"})
+    diag = {
+        "supported": False,
+        "reason": "",
+        "missing_instructions": [],
+        "notes": [],
+        "op_counts": dict(sorted(op_counts.items())),
+        "out_arg": None, "act_arg": None, "weight_arg": None,
+    }
 
+    param_sizes: dict[int, int] = {}
+    for p in params:
+        if not isinstance(p.dtype, PtrDType):
+            diag["reason"] = "non-ptr param"
+            diag["notes"].append("TinyTPU kernels currently expect pointer-backed buffers only.")
+            return diag
+        param_sizes[p.arg] = p.dtype.size
+
+    if len(params) == 3 and is_gemm and has_store:
         sizes = sorted(param_sizes.values())
-        # Expected: [4, 4, 16] for (1×4 output, 1×4 activation, 4×4 weight)
-        if sizes != [4, 4, 16]:
-            return json.dumps({"op": "UNSUPPORTED",
-                               "reason": f"unexpected param sizes {sizes}"})
+        if sizes == [4, 4, 16]:
+            weight_arg = next(arg for arg, sz in param_sizes.items() if sz == 16)
+            out_arg = 0
+            act_arg = next(arg for arg in param_sizes if arg != weight_arg and arg != out_arg)
+            diag.update({"supported": True, "reason": "supported gemm4x4", "out_arg": out_arg, "act_arg": act_arg, "weight_arg": weight_arg})
+            return diag
+        diag["reason"] = f"unexpected param sizes {sizes}"
+        diag["notes"].append("Current TinyTPU backend only handles 1x4 @ 4x4 int32 matmul lowered to [out=4, act=4, weight=16] buffers.")
+    else:
+        diag["reason"] = f"params={len(params)} gemm={is_gemm}"
 
-        # Find the weight param (size 16) and output param (arg 0 by tinygrad convention)
-        weight_arg = next(arg for arg, sz in param_sizes.items() if sz == 16)
-        out_arg    = 0  # tinygrad always puts the output buffer first
-        act_arg    = next(arg for arg in param_sizes if arg != weight_arg and arg != out_arg)
+    missing: list[str] = []
+    notes: list[str] = []
+    uses_load_store = op_counts.get("LOAD", 0) > 0 or op_counts.get("STORE", 0) > 0
+    uses_cmp_select = op_counts.get("CMPLT", 0) > 0 or op_counts.get("WHERE", 0) > 0
+    uses_group = op_counts.get("GROUP", 0) > 0
+    multi_store = op_counts.get("STORE", 0) > 1
 
-        return json.dumps({"op": "GEMM4x4",
-                           "out": out_arg,
-                           "act": act_arg,
-                           "weight": weight_arg})
+    if is_gemm and (uses_cmp_select or multi_store or uses_group):
+        missing.extend(["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"])
+        notes.append("This looks like a fused MXU kernel with a pointwise epilogue. TinyTPU only lowers the bare GEMM today.")
+        notes.append("To support this, the compiler needs to split or lower the epilogue and provide a path from MXU results into the VPU/VMEM pipeline.")
+    elif uses_load_store:
+        missing.extend(["SXU_LOAD_VREG", "SXU_STORE_VREG"])
+        notes.append("General VMEM<->VReg movement kernels are not lowered yet.")
+
+    if uses_cmp_select:
+        missing.append("SXU_DISPATCH_VPU")
+        notes.append("Compare/select UOps are present. For ReLU-like cases this likely maps to a VPU epilogue.")
+
+    if op_counts.get("CMPLT", 0) == 4 and op_counts.get("WHERE", 0) == 4:
+        notes.append("The UOp pattern matches a lane-wise ReLU/select epilogue.")
+
+    if uses_group:
+        notes.append("GROUP indicates multi-store/vector pack behavior that the TinyTPU backend does not currently lower.")
+
+    if not missing:
+        missing.append("unknown lowering gap")
+        notes.append("Inspect the op counts and UOps for a new lowering rule.")
+
+    diag["missing_instructions"] = sorted(set(missing))
+    diag["notes"].extend(notes)
+    return diag
 
 
 # ---------------------------------------------------------------------------
