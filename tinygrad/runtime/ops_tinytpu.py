@@ -328,17 +328,11 @@ def _build_vpu_binary_bundle(lhs_i32: np.ndarray, rhs_i32: np.ndarray, num_elems
     lines: list[str] = []
     lines.append("5 0 " + " ".join(str(x) for x in tile(lhs_i32)))
     lines.append("5 1 " + " ".join(str(x) for x in tile(rhs_i32)))
-    # Dummy zero MXU tile. The current TensorCore runtime completes reliably once
-    # the controller has reached Done, so VPU-only programs append a no-op MXU.
-    lines.append("0 0 " + " ".join("0" for _ in range(_ROWS * _COLS)))
-    lines.append("1 1 " + " ".join("0" for _ in range(_ROWS)))
     # LOAD VMEM[0]->v0, LOAD VMEM[1]->v1, VPU op v0/v1->v2, STORE v2->VMEM[2]
     lines.append("2 0 0 0 0 0 0 0 0 0")
     lines.append("2 0 1 1 0 0 0 0 0 0")
     lines.append(f"2 2 0 2 0 {vpu_op} 1 0 0 0")
     lines.append("2 1 2 0 2 0 0 0 0 0")
-    lines.append("2 3 0 0 0 0 0 0 1 1")
-    lines.append("2 4 0 0 0 0 0 0 0 0")
     lines.append("2 5 0 0 0 0 0 0 0 0")
     lines.append("6 2")
     lines.append("4")
@@ -351,14 +345,10 @@ def _build_vpu_unary_bundle(src_i32: np.ndarray, num_elems: int, vpu_op: int) ->
 
     lines: list[str] = []
     lines.append("5 0 " + " ".join(str(int(x)) for x in padded))
-    lines.append("0 0 " + " ".join("0" for _ in range(_ROWS * _COLS)))
-    lines.append("1 1 " + " ".join("0" for _ in range(_ROWS)))
     # LOAD VMEM[0]->v0, VPU unary op v0->v1, STORE v1->VMEM[2]
     lines.append("2 0 0 0 0 0 0 0 0 0")
     lines.append(f"2 2 0 1 0 {vpu_op} 0 0 0 0")
     lines.append("2 1 2 0 1 0 0 0 0 0")
-    lines.append("2 3 0 0 0 0 0 0 1 1")
-    lines.append("2 4 0 0 0 0 0 0 0 0")
     lines.append("2 5 0 0 0 0 0 0 0 0")
     lines.append("6 2")
     lines.append("4")
