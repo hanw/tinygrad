@@ -183,6 +183,8 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         scalar_const_binary_ops = [name for name in scalar_const_binary_ops if name in {"CMPLT", "CMPNE"}]
     else:
         scalar_const_binary_ops = [name for name in scalar_const_binary_ops if name in {"ADD", "MUL", "MAX", "SUB", "SHL", "SHR"}]
+    if len(scalar_const_binary_ops) > 1:
+        scalar_const_binary_ops = [max(scalar_const_binary_ops, key=lambda n: op_counts.get(n, 0))]
     scalar_const = _find_scalar_const_binary(uops, scalar_const_binary_ops[0]) if len(scalar_const_binary_ops) == 1 else None
     reverse_sub_const = _find_reverse_sub_const(uops)
     eq_scalar_const = _find_eq_scalar_const(uops)
