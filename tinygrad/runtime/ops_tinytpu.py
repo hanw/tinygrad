@@ -24,6 +24,7 @@ from tinygrad.helpers import Target
 _ROWS   = 4
 _COLS   = 4
 _BYTES_PER_ELEM = 4           # Int#(32) = 4 bytes
+_TILE_ELEMS = _ROWS * _COLS   # 16 elements per VMEM tile
 _VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6, "SUB": 7, "CMPEQ": 8}
 _VPU_BOOL_OPS = {_VPU_OPS["CMPLT"], _VPU_OPS["CMPNE"], _VPU_OPS["CMPEQ"]}
 
@@ -201,7 +202,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     elif len(params) == 2 and op_counts.get("CMPLT", 0) > 0 and op_counts.get("WHERE", 0) > 0:
         out_size = param_sizes.get(0)
         src_size = param_sizes.get(1)
-        if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size <= 16:
+        if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size:
             diag.update({
                 "supported": True,
                 "kind": "vpu_unary",
@@ -220,7 +221,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
           (op_counts.get("STORE", 0) == 4 or op_counts.get("LOAD", 0) == 1)):
         out_size = param_sizes.get(0)
         src_size = param_sizes.get(1)
-        if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size <= 16:
+        if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size:
             diag.update({
                 "supported": True,
                 "kind": "vpu_binary",
@@ -242,7 +243,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         op_name = scalar_const_binary_ops[0]
         out_size = param_sizes.get(0)
         src_size = param_sizes.get(1)
-        if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size <= 16:
+        if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size:
             diag.update({
                 "supported": True,
                 "kind": "vpu_binary",
@@ -263,7 +264,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
           (op_counts.get("STORE", 0) == 4 or op_counts.get("LOAD", 0) == 1)):
         out_size = param_sizes.get(0)
         src_size = param_sizes.get(1)
-        if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size <= 16:
+        if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size:
             diag.update({
                 "supported": True,
                 "kind": "vpu_binary",
@@ -284,7 +285,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
           (op_counts.get("STORE", 0) == 4 or op_counts.get("LOAD", 0) in {0, 2})):
         out_size = param_sizes.get(0)
         input_args = [arg for arg in sorted(param_sizes) if arg != 0]
-        if out_size is not None and len(input_args) == 2 and 0 < out_size <= 16 and all(param_sizes[arg] == out_size for arg in input_args):
+        if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] == out_size for arg in input_args):
             diag.update({
                 "supported": True,
                 "kind": "vpu_binary",
@@ -307,7 +308,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
           any(u.op is Ops.MUL and _contains_const_int(u, -1) for u in uops)):
         out_size = param_sizes.get(0)
         input_args = [arg for arg in sorted(param_sizes) if arg != 0]
-        if out_size is not None and len(input_args) == 2 and 0 < out_size <= 16 and all(param_sizes[arg] == out_size for arg in input_args):
+        if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] == out_size for arg in input_args):
             diag.update({
                 "supported": True,
                 "kind": "vpu_binary",
@@ -328,7 +329,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         op_name = (matched_single_binary_ops if is_single_binary else matched_grouped_binary_ops)[0]
         out_size = param_sizes.get(0)
         input_args = [arg for arg in sorted(param_sizes) if arg != 0]
-        if out_size is not None and len(input_args) == 2 and 0 < out_size <= 16 and all(param_sizes[arg] == out_size for arg in input_args):
+        if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] == out_size for arg in input_args):
             diag.update({
                 "supported": True,
                 "kind": "vpu_binary",
@@ -754,20 +755,30 @@ class TinyTPUProgram:
                 rhs_i32 = np.full(num_elems, int(prog["rhs_const"]), dtype="<i4")
             if lhs_i32.size != num_elems or rhs_i32.size != num_elems:
                 raise RuntimeError(f"TinyTPU VPU binary op expected {num_elems} elements, got lhs={lhs_i32.size} rhs={rhs_i32.size}")
-            out_elem_bytes = 1 if int(prog["vpu_op"]) in _VPU_BOOL_OPS else _BYTES_PER_ELEM
+            is_bool = int(prog["vpu_op"]) in _VPU_BOOL_OPS
+            out_elem_bytes = 1 if is_bool else _BYTES_PER_ELEM
             if len(out_buf) < num_elems * out_elem_bytes:
                 raise RuntimeError(f"TinyTPU output buffer too small for VPU binary op elements={num_elems}")
             sim = _sim_path()
-            stdout = _run_bundle(sim, _build_vpu_binary_bundle(lhs_i32, rhs_i32, num_elems, int(prog["vpu_op"])))
-            result = _parse_vmem_output(stdout)
-            if result is None:
-                raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
-            if int(prog["vpu_op"]) in _VPU_BOOL_OPS:
-                out_bool = np.array(result[:num_elems], dtype=np.bool_)
-                out_buf[: len(out_bool)] = out_bool.tobytes()
-            else:
-                out_i32 = np.array(result[:num_elems], dtype="<i4")
-                out_buf[: len(out_i32) * _BYTES_PER_ELEM] = out_i32.tobytes()
+            vpu_op = int(prog["vpu_op"])
+            out_offset = 0
+            for chunk_start in range(0, num_elems, _TILE_ELEMS):
+                chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
+                chunk_size = chunk_end - chunk_start
+                lhs_chunk = lhs_i32[chunk_start:chunk_end]
+                rhs_chunk = rhs_i32[chunk_start:chunk_end]
+                stdout = _run_bundle(sim, _build_vpu_binary_bundle(lhs_chunk, rhs_chunk, chunk_size, vpu_op))
+                result = _parse_vmem_output(stdout)
+                if result is None:
+                    raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
+                if is_bool:
+                    chunk_out = np.array(result[:chunk_size], dtype=np.bool_)
+                    out_buf[out_offset : out_offset + len(chunk_out)] = chunk_out.tobytes()
+                    out_offset += len(chunk_out)
+                else:
+                    chunk_out = np.array(result[:chunk_size], dtype="<i4")
+                    out_buf[out_offset : out_offset + len(chunk_out) * _BYTES_PER_ELEM] = chunk_out.tobytes()
+                    out_offset += len(chunk_out) * _BYTES_PER_ELEM
             return 1e-3
 
         if prog.get("op") == "VPU_UNARY":
@@ -780,12 +791,20 @@ class TinyTPUProgram:
             if len(out_buf) < out_elems * _BYTES_PER_ELEM:
                 raise RuntimeError(f"TinyTPU output buffer too small for VPU unary op elements={out_elems}")
             sim = _sim_path()
-            stdout = _run_bundle(sim, _build_vpu_unary_bundle(src_i32, num_elems, int(prog["vpu_op"])))
-            result = _parse_vmem_output(stdout)
-            if result is None:
-                raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
-            out_i32 = np.array(result[:out_elems], dtype="<i4")
-            out_buf[: len(out_i32) * _BYTES_PER_ELEM] = out_i32.tobytes()
+            vpu_op = int(prog["vpu_op"])
+            out_offset = 0
+            for chunk_start in range(0, num_elems, _TILE_ELEMS):
+                chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
+                chunk_size = chunk_end - chunk_start
+                out_chunk_size = min(out_elems - (chunk_start if out_elems == num_elems else 0), chunk_size)
+                src_chunk = src_i32[chunk_start:chunk_end]
+                stdout = _run_bundle(sim, _build_vpu_unary_bundle(src_chunk, chunk_size, vpu_op))
+                result = _parse_vmem_output(stdout)
+                if result is None:
+                    raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
+                chunk_out = np.array(result[:out_chunk_size], dtype="<i4")
+                out_buf[out_offset : out_offset + len(chunk_out) * _BYTES_PER_ELEM] = chunk_out.tobytes()
+                out_offset += len(chunk_out) * _BYTES_PER_ELEM
             return 1e-3
 
         out_buf    = bufs[prog["out"]]
