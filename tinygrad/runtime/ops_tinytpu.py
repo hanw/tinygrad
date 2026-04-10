@@ -89,6 +89,13 @@ class TinyTPURenderer(Renderer):
                                    "lhs": diag["lhs_arg"],
                                    "rhs": diag["rhs_arg"],
                                    "num_elems": diag["num_elems"]})
+            if diag["kind"] == "vpu_unary":
+                return json.dumps({"op": "VPU_UNARY",
+                                   "vpu_op": diag["vpu_op"],
+                                   "out": diag["out_arg"],
+                                   "src": diag["src_arg"],
+                                   "num_elems": diag["num_elems"],
+                                   "out_elems": diag["out_elems"]})
         return json.dumps({
             "op": "UNSUPPORTED",
             "reason": diag["reason"],
@@ -114,8 +121,10 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         "notes": [],
         "op_counts": dict(sorted(op_counts.items())),
         "out_arg": None, "act_arg": None, "weight_arg": None,
+        "src_arg": None,
         "lhs_arg": None, "rhs_arg": None,
         "num_elems": None,
+        "out_elems": None,
         "vpu_op": None,
         "num_vecs": None,
         "num_k_tiles": None,
@@ -138,7 +147,25 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
 
     binary_vpu_ops = {"ADD": 0, "MUL": 1, "MAX": 3}
     matched_binary_ops = [name for name in binary_vpu_ops if op_counts.get(name, 0) == 1]
-    if len(params) == 3 and len(matched_binary_ops) == 1 and op_counts.get("LOAD", 0) == 2 and op_counts.get("STORE", 0) == 1:
+    if len(params) == 2 and op_counts.get("CMPLT", 0) > 0 and op_counts.get("WHERE", 0) > 0:
+        out_size = param_sizes.get(0)
+        src_size = param_sizes.get(1)
+        if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size <= 16:
+            diag.update({
+                "supported": True,
+                "kind": "vpu_unary",
+                "reason": "supported vpu relu",
+                "out_arg": 0,
+                "src_arg": 1,
+                "num_elems": src_size,
+                "out_elems": out_size,
+                "vpu_op": 2,
+            })
+            return diag
+        diag["reason"] = f"unsupported vpu relu sizes {dict(sorted(param_sizes.items()))}"
+        diag["notes"].append("Current TinyTPU VPU RELU lowering handles one int32 VMEM tile with 1..16 elements.")
+        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
+    elif len(params) == 3 and len(matched_binary_ops) == 1 and op_counts.get("LOAD", 0) == 2 and op_counts.get("STORE", 0) == 1:
         op_name = matched_binary_ops[0]
         out_size = param_sizes.get(0)
         input_args = [arg for arg in sorted(param_sizes) if arg != 0]
@@ -287,6 +314,26 @@ def _build_vpu_binary_bundle(lhs_i32: np.ndarray, rhs_i32: np.ndarray, num_elems
     lines.append("2 0 1 1 0 0 0 0 0 0")
     lines.append(f"2 2 0 2 0 {vpu_op} 1 0 0 0")
     lines.append("2 1 2 0 2 0 0 0 0 0")
+    lines.append("2 3 0 0 0 0 0 0 1 1")
+    lines.append("2 4 0 0 0 0 0 0 0 0")
+    lines.append("2 5 0 0 0 0 0 0 0 0")
+    lines.append("6 2")
+    lines.append("4")
+    return "\n".join(lines) + "\n"
+
+
+def _build_vpu_unary_bundle(src_i32: np.ndarray, num_elems: int, vpu_op: int) -> str:
+    padded = np.zeros(_ROWS * _COLS, dtype=np.int32)
+    padded[:num_elems] = src_i32[:num_elems]
+
+    lines: list[str] = []
+    lines.append("5 0 " + " ".join(str(int(x)) for x in padded))
+    lines.append("0 0 " + " ".join("0" for _ in range(_ROWS * _COLS)))
+    lines.append("1 1 " + " ".join("0" for _ in range(_ROWS)))
+    # LOAD VMEM[0]->v0, VPU unary op v0->v1, STORE v1->VMEM[2]
+    lines.append("2 0 0 0 0 0 0 0 0 0")
+    lines.append(f"2 2 0 1 0 {vpu_op} 0 0 0 0")
+    lines.append("2 1 2 0 1 0 0 0 0 0")
     lines.append("2 3 0 0 0 0 0 0 1 1")
     lines.append("2 4 0 0 0 0 0 0 0 0")
     lines.append("2 5 0 0 0 0 0 0 0 0")
@@ -477,7 +524,7 @@ class TinyTPUProgram:
                  wait: bool = False,
                  **kwargs) -> float | None:
         prog = self.prog
-        if prog.get("op") not in {"GEMM4x4", "VPU_BINARY"}:
+        if prog.get("op") not in {"GEMM4x4", "VPU_BINARY", "VPU_UNARY"}:
             raise NotImplementedError(_unsupported_message(prog))
 
         if prog.get("op") == "VPU_BINARY":
@@ -495,6 +542,24 @@ class TinyTPUProgram:
             if result is None:
                 raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
             out_i32 = np.array(result[:num_elems], dtype="<i4")
+            out_buf[: len(out_i32) * _BYTES_PER_ELEM] = out_i32.tobytes()
+            return 1e-3
+
+        if prog.get("op") == "VPU_UNARY":
+            out_buf = bufs[prog["out"]]
+            src_i32 = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<i4")
+            num_elems = int(prog["num_elems"])
+            out_elems = int(prog["out_elems"])
+            if src_i32.size != num_elems:
+                raise RuntimeError(f"TinyTPU VPU unary op expected {num_elems} elements, got src={src_i32.size}")
+            if len(out_buf) < out_elems * _BYTES_PER_ELEM:
+                raise RuntimeError(f"TinyTPU output buffer too small for VPU unary op elements={out_elems}")
+            sim = _sim_path()
+            stdout = _run_bundle(sim, _build_vpu_unary_bundle(src_i32, num_elems, int(prog["vpu_op"])))
+            result = _parse_vmem_output(stdout)
+            if result is None:
+                raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
+            out_i32 = np.array(result[:out_elems], dtype="<i4")
             out_buf[: len(out_i32) * _BYTES_PER_ELEM] = out_i32.tobytes()
             return 1e-3
 
