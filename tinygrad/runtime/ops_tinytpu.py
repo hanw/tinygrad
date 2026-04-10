@@ -191,7 +191,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     # tile, while smaller tiles materialize explicit LOAD UOps.
     _has_bool_logic_op = op_counts.get("AND", 0) > 0 or op_counts.get("OR", 0) > 0 or op_counts.get("XOR", 0) > 0
     _has_complex_op = any(op_counts.get(x, 0) for x in ("IDIV", "MOD", "SHL", "SHR", "RECIP"))
-    is_single_binary = len(params) == 3 and len(matched_single_binary_ops) == 1 and op_counts.get("LOAD", 0) in {0, 2} and op_counts.get("STORE", 0) == 1
+    is_single_binary = len(params) == 3 and len(matched_single_binary_ops) == 1 and op_counts.get("LOAD", 0) in {0, 2} and op_counts.get("STORE", 0) == 1 and not _has_bool_logic_op
     is_grouped_binary = len(params) == 3 and len(matched_grouped_binary_ops) == 1 and op_counts.get("STORE", 0) == 4 and op_counts.get("GROUP", 0) == 1 and not _has_bool_logic_op
     if len(params) == 2 and op_counts.get("STORE", 0) == 1 and op_counts.get("ADD", 0) > 0 and param_sizes.get(0) == 1:
         out_size = param_sizes.get(0)
@@ -387,7 +387,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["reason"] = f"unsupported vpu {op_name.lower()} sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append(f"Current TinyTPU VPU {op_name} lowering handles one int32 VMEM tile with 1..16 elements.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif len(params) == 3 and op_counts.get("AND", 0) > 0 and op_counts.get("STORE", 0) >= 1:
+    elif len(params) == 3 and op_counts.get("AND", 0) > 0 and in_is_bool and op_counts.get("STORE", 0) >= 1:
         out_size = param_sizes.get(0)
         input_args = [arg for arg in sorted(param_sizes) if arg != 0]
         if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] == out_size for arg in input_args):
@@ -407,7 +407,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
             return diag
         diag["reason"] = f"unsupported vpu and sizes {dict(sorted(param_sizes.items()))}"
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif len(params) == 3 and op_counts.get("XOR", 0) > 0 and op_counts.get("STORE", 0) >= 1:
+    elif len(params) == 3 and op_counts.get("XOR", 0) > 0 and in_is_bool and op_counts.get("STORE", 0) >= 1:
         out_size = param_sizes.get(0)
         input_args = [arg for arg in sorted(param_sizes) if arg != 0]
         if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] == out_size for arg in input_args):
@@ -427,7 +427,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
             return diag
         diag["reason"] = f"unsupported vpu xor sizes {dict(sorted(param_sizes.items()))}"
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif len(params) == 3 and op_counts.get("OR", 0) > 0 and op_counts.get("STORE", 0) >= 1:
+    elif len(params) == 3 and op_counts.get("OR", 0) > 0 and in_is_bool and op_counts.get("STORE", 0) >= 1:
         out_size = param_sizes.get(0)
         input_args = [arg for arg in sorted(param_sizes) if arg != 0]
         if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] == out_size for arg in input_args):
