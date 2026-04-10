@@ -25,7 +25,7 @@ _ROWS   = 4
 _COLS   = 4
 _BYTES_PER_ELEM = 4           # Int#(32) = 4 bytes
 _TILE_ELEMS = _ROWS * _COLS   # 16 elements per VMEM tile
-_VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6, "SUB": 7, "CMPEQ": 8, "MAX_REDUCE": 9, "SHL": 10, "SHR": 11}
+_VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6, "SUB": 7, "CMPEQ": 8, "MAX_REDUCE": 9, "SHL": 10, "SHR": 11, "MIN": 12}
 _VPU_BOOL_OPS = {_VPU_OPS["CMPLT"], _VPU_OPS["CMPNE"], _VPU_OPS["CMPEQ"]}
 
 def _sim_path() -> str:
@@ -389,6 +389,25 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
             return diag
         diag["reason"] = f"unsupported vpu {op_name.lower()} sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append(f"Current TinyTPU VPU {op_name} lowering handles one int32 VMEM tile with 1..16 elements.")
+        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
+    elif len(params) == 3 and op_counts.get("XOR", 0) > 0 and op_counts.get("MAX", 0) > 0 and not in_is_bool:
+        out_size = param_sizes.get(0)
+        input_args = [arg for arg in sorted(param_sizes) if arg != 0]
+        if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] == out_size for arg in input_args):
+            diag.update({
+                "supported": True,
+                "kind": "vpu_binary",
+                "reason": "supported vpu min (via minimum decomposition)",
+                "out_arg": 0,
+                "lhs_arg": input_args[0],
+                "lhs_const": None,
+                "rhs_arg": input_args[1],
+                "rhs_const": None,
+                "num_elems": out_size,
+                "vpu_op": binary_vpu_ops["MIN"],
+            })
+            return diag
+        diag["reason"] = f"unsupported vpu min sizes {dict(sorted(param_sizes.items()))}"
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
     elif len(params) == 3 and op_counts.get("AND", 0) > 0 and in_is_bool and op_counts.get("STORE", 0) >= 1:
         out_size = param_sizes.get(0)
