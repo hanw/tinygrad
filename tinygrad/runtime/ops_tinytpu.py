@@ -94,7 +94,8 @@ class TinyTPURenderer(Renderer):
                                                   "rhs": diag["rhs_arg"],
                                                   "rhs_const": diag["rhs_const"],
                                                   "num_elems": diag["num_elems"],
-                                                  "bool_out": diag.get("bool_out", False)}))
+                                                  "bool_out": diag.get("bool_out", False),
+                                                  "bool_in": diag.get("bool_in", False)}))
             if diag["kind"] == "vpu_unary":
                 return _dump_lowering(json.dumps({"op": "VPU_UNARY",
                                                   "vpu_op": diag["vpu_op"],
@@ -175,6 +176,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     matched_single_binary_ops = [name for name in binary_vpu_ops if op_counts.get(name, 0) in {1, 4}]
     matched_grouped_binary_ops = [("CMPNE" if op_counts.get("CMPNE", 0) else "CMPLT" if op_counts.get("CMPLT", 0) else "MAX" if op_counts.get("MAX", 0) else "MUL" if op_counts.get("MUL", 0) > 1 else "ADD")] if any(op_counts.get(name, 0) for name in binary_vpu_ops) else []
     out_is_bool = any(p.arg == 0 and "bool" in str(p.dtype) for p in params)
+    in_is_bool = any(p.arg != 0 and "bool" in str(p.dtype) for p in params)
     scalar_const_binary_ops = [name for name in binary_vpu_ops
                                if op_counts.get(name, 0) in {1, 4} and _find_scalar_const_binary(uops, name) is not None]
     if out_is_bool:
@@ -268,6 +270,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
                 "rhs_const": scalar_const,
                 "num_elems": src_size,
                 "vpu_op": binary_vpu_ops[op_name],
+                "bool_in": in_is_bool,
             })
             return diag
         diag["reason"] = f"unsupported vpu {op_name.lower()} const sizes {dict(sorted(param_sizes.items()))}"
@@ -871,7 +874,7 @@ class TinyTPUProgram:
         if prog.get("op") == "VPU_BINARY":
             out_buf = bufs[prog["out"]]
             num_elems = int(prog["num_elems"])
-            bool_inputs = prog.get("bool_out", False)
+            bool_inputs = prog.get("bool_in", False) or prog.get("bool_out", False)
             if prog.get("lhs_const") is None:
                 lhs_raw = np.frombuffer(bytes(bufs[prog["lhs"]]), dtype=np.bool_ if bool_inputs else "<i4")
                 lhs_i32 = lhs_raw.astype(np.int32) if bool_inputs else lhs_raw
