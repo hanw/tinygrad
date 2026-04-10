@@ -101,6 +101,13 @@ class TinyTPURenderer(Renderer):
                                                   "src": diag["src_arg"],
                                                   "num_elems": diag["num_elems"],
                                                   "out_elems": diag["out_elems"]}))
+            if diag["kind"] == "vpu_where":
+                return _dump_lowering(json.dumps({"op": "VPU_WHERE",
+                                                  "out": diag["out_arg"],
+                                                  "cond": diag["cond_arg"],
+                                                  "lhs": diag["lhs_arg"],
+                                                  "rhs": diag["rhs_arg"],
+                                                  "num_elems": diag["num_elems"]}))
         return _dump_lowering(json.dumps({
             "op": "UNSUPPORTED",
             "reason": diag["reason"],
@@ -346,6 +353,24 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["reason"] = f"unsupported vpu {op_name.lower()} sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append(f"Current TinyTPU VPU {op_name} lowering handles one int32 VMEM tile with 1..16 elements.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
+    elif len(params) == 4 and op_counts.get("WHERE", 0) > 0 and not is_gemm:
+        out_size = param_sizes.get(0)
+        input_args = [arg for arg in sorted(param_sizes) if arg != 0]
+        if out_size is not None and len(input_args) == 3 and 0 < out_size and all(param_sizes[arg] == out_size for arg in input_args):
+            diag.update({
+                "supported": True,
+                "kind": "vpu_where",
+                "reason": "supported vpu where",
+                "out_arg": 0,
+                "cond_arg": input_args[0],
+                "lhs_arg": input_args[1],
+                "rhs_arg": input_args[2],
+                "num_elems": out_size,
+            })
+            return diag
+        diag["reason"] = f"unsupported vpu where sizes {dict(sorted(param_sizes.items()))}"
+        diag["notes"].append("Current TinyTPU VPU WHERE lowering handles int32 VMEM tiles.")
+        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
     elif len(params) == 3 and is_gemm and has_store:
         sizes = sorted(param_sizes.values())
         candidate_weights = [arg for arg, sz in param_sizes.items() if sz >= 16 and sz % 16 == 0]
@@ -557,6 +582,41 @@ def _build_vpu_unary_bundle(src_i32: np.ndarray, num_elems: int, vpu_op: int) ->
     return "\n".join(lines) + "\n"
 
 
+def _build_vpu_where_bundle(cond_i32: np.ndarray, lhs_i32: np.ndarray, rhs_i32: np.ndarray, num_elems: int) -> str:
+    """WHERE(cond, lhs, rhs) = cond*lhs + (1-cond)*rhs via multi-instruction VPU bundle."""
+    def tile(vals: np.ndarray) -> list[int]:
+        padded = np.zeros(_ROWS * _COLS, dtype=np.int32)
+        padded[:num_elems] = vals[:num_elems]
+        return [int(x) for x in padded]
+
+    ones = [1] * _ROWS * _COLS
+    lines: list[str] = []
+    # VMEM[0]=cond, VMEM[1]=lhs, VMEM[2]=rhs, VMEM[3]=ones
+    lines.append("5 0 " + " ".join(str(x) for x in tile(cond_i32)))
+    lines.append("5 1 " + " ".join(str(x) for x in tile(lhs_i32)))
+    lines.append("5 2 " + " ".join(str(x) for x in tile(rhs_i32)))
+    lines.append("5 3 " + " ".join(str(x) for x in ones))
+    # LOAD cond->v0, lhs->v1, rhs->v2, ones->v3
+    lines.append("2 0 0 0 0 0 0 0 0 0")   # LOAD VMEM[0]->v0
+    lines.append("2 0 1 1 0 0 0 0 0 0")   # LOAD VMEM[1]->v1
+    lines.append("2 0 2 2 0 0 0 0 0 0")   # LOAD VMEM[2]->v2
+    lines.append("2 0 3 3 0 0 0 0 0 0")   # LOAD VMEM[3]->v3
+    # v4 = cond * lhs (MUL v0, v1 -> v4)
+    lines.append(f"2 2 0 4 0 {_VPU_OPS['MUL']} 1 0 0 0")
+    # v5 = 1 - cond (SUB v3, v0 -> v5)
+    lines.append(f"2 2 0 5 3 {_VPU_OPS['SUB']} 0 0 0 0")
+    # v6 = (1-cond) * rhs (MUL v5, v2 -> v6)
+    lines.append(f"2 2 0 6 5 {_VPU_OPS['MUL']} 2 0 0 0")
+    # v7 = cond*lhs + (1-cond)*rhs (ADD v4, v6 -> v7)
+    lines.append(f"2 2 0 7 4 {_VPU_OPS['ADD']} 6 0 0 0")
+    # STORE v7 -> VMEM[4]
+    lines.append("2 1 4 0 7 0 0 0 0 0")
+    lines.append("2 5 0 0 0 0 0 0 0 0")   # HALT
+    lines.append("6 4")   # output VMEM[4]
+    lines.append("4")     # END
+    return "\n".join(lines) + "\n"
+
+
 def _parse_sim_output(stdout: str) -> list[int] | None:
     """Extract mxu_result from BSV sim stdout.  Returns None if not found."""
     for line in stdout.splitlines():
@@ -739,7 +799,7 @@ class TinyTPUProgram:
                  wait: bool = False,
                  **kwargs) -> float | None:
         prog = self.prog
-        if prog.get("op") not in {"GEMM4x4", "VPU_BINARY", "VPU_UNARY"}:
+        if prog.get("op") not in {"GEMM4x4", "VPU_BINARY", "VPU_UNARY", "VPU_WHERE"}:
             raise NotImplementedError(_unsupported_message(prog))
 
         if prog.get("op") == "VPU_BINARY":
@@ -779,6 +839,31 @@ class TinyTPUProgram:
                     chunk_out = np.array(result[:chunk_size], dtype="<i4")
                     out_buf[out_offset : out_offset + len(chunk_out) * _BYTES_PER_ELEM] = chunk_out.tobytes()
                     out_offset += len(chunk_out) * _BYTES_PER_ELEM
+            return 1e-3
+
+        if prog.get("op") == "VPU_WHERE":
+            out_buf = bufs[prog["out"]]
+            num_elems = int(prog["num_elems"])
+            cond_raw = np.frombuffer(bytes(bufs[prog["cond"]]), dtype=np.bool_)
+            lhs_i32 = np.frombuffer(bytes(bufs[prog["lhs"]]), dtype="<i4")
+            rhs_i32 = np.frombuffer(bytes(bufs[prog["rhs"]]), dtype="<i4")
+            cond_i32 = cond_raw[:num_elems].astype(np.int32)
+            if len(out_buf) < num_elems * _BYTES_PER_ELEM:
+                raise RuntimeError(f"TinyTPU output buffer too small for VPU WHERE elements={num_elems}")
+            sim = _sim_path()
+            out_offset = 0
+            for chunk_start in range(0, num_elems, _TILE_ELEMS):
+                chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
+                chunk_size = chunk_end - chunk_start
+                stdout = _run_bundle(sim, _build_vpu_where_bundle(
+                    cond_i32[chunk_start:chunk_end], lhs_i32[chunk_start:chunk_end],
+                    rhs_i32[chunk_start:chunk_end], chunk_size))
+                result = _parse_vmem_output(stdout)
+                if result is None:
+                    raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
+                chunk_out = np.array(result[:chunk_size], dtype="<i4")
+                out_buf[out_offset : out_offset + len(chunk_out) * _BYTES_PER_ELEM] = chunk_out.tobytes()
+                out_offset += len(chunk_out) * _BYTES_PER_ELEM
             return 1e-3
 
         if prog.get("op") == "VPU_UNARY":
