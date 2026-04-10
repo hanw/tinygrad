@@ -263,6 +263,27 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["reason"] = f"unsupported vpu min_reduce sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append("Current TinyTPU VPU MIN_REDUCE lowering handles int32 min reduction to scalar.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
+    elif (len(params) == 2 and op_counts.get("XOR", 0) > 0 and op_counts.get("MAX", 0) > 0
+          and not in_is_bool and op_counts.get("STORE", 0) >= 1):
+        out_size = param_sizes.get(0)
+        src_size = param_sizes.get(1)
+        min_const = _find_min_scalar_const(uops)
+        if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size and min_const is not None:
+            diag.update({
+                "supported": True,
+                "kind": "vpu_binary",
+                "reason": "supported vpu min const",
+                "out_arg": 0,
+                "lhs_arg": 1,
+                "lhs_const": None,
+                "rhs_arg": None,
+                "rhs_const": min_const,
+                "num_elems": src_size,
+                "vpu_op": binary_vpu_ops["MIN"],
+            })
+            return diag
+        diag["reason"] = f"unsupported vpu min const sizes {dict(sorted(param_sizes.items()))}"
+        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
     elif (len(params) == 2 and op_counts.get("CMPLT", 0) > 0 and op_counts.get("WHERE", 0) > 0
           and not _has_complex_op
           and op_counts.get("WHERE", 0) == op_counts.get("CMPLT", 0)
@@ -593,6 +614,18 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     diag["missing_instructions"] = sorted(set(missing))
     diag["notes"].extend(notes)
     return diag
+
+
+def _find_min_scalar_const(uops:list[UOp]) -> int | None:
+    """Extract the scalar constant from minimum(x, c) = ~max(~x, ~c) decomposition.
+    Structure: XOR(MAX(XOR(x, -1), CONST(~c)), -1). The CONST child of MAX is ~c."""
+    for u in uops:
+        if u.op is Ops.MAX:
+            xor_srcs = [s for s in u.src if s.op is Ops.XOR]
+            const_srcs = [s for s in u.src if s.op is Ops.CONST and not isinstance(s.arg, bool)]
+            if len(xor_srcs) >= 1 and len(const_srcs) == 1:
+                return ~int(const_srcs[0].arg)  # ~(~c) = c
+    return None
 
 
 def _find_scalar_const_binary(uops:list[UOp], op_name:str) -> int | None:
