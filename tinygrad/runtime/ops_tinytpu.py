@@ -241,7 +241,8 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
     elif (len(params) == 2 and op_counts.get("CMPLT", 0) > 0 and op_counts.get("WHERE", 0) > 0
           and not _has_complex_op
-          and op_counts.get("WHERE", 0) == op_counts.get("CMPLT", 0)):
+          and op_counts.get("WHERE", 0) == op_counts.get("CMPLT", 0)
+          and op_counts.get("WHERE", 0) <= op_counts.get("STORE", 0)):
         out_size = param_sizes.get(0)
         src_size = param_sizes.get(1)
         if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size:
