@@ -25,7 +25,7 @@ _ROWS   = 4
 _COLS   = 4
 _BYTES_PER_ELEM = 4           # Int#(32) = 4 bytes
 _TILE_ELEMS = _ROWS * _COLS   # 16 elements per VMEM tile
-_VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6, "SUB": 7, "CMPEQ": 8, "MAX_REDUCE": 9}
+_VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6, "SUB": 7, "CMPEQ": 8, "MAX_REDUCE": 9, "SHL": 10, "SHR": 11}
 _VPU_BOOL_OPS = {_VPU_OPS["CMPLT"], _VPU_OPS["CMPNE"], _VPU_OPS["CMPEQ"]}
 
 def _sim_path() -> str:
@@ -182,7 +182,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     if out_is_bool:
         scalar_const_binary_ops = [name for name in scalar_const_binary_ops if name in {"CMPLT", "CMPNE"}]
     else:
-        scalar_const_binary_ops = [name for name in scalar_const_binary_ops if name in {"ADD", "MUL", "MAX", "SUB"}]
+        scalar_const_binary_ops = [name for name in scalar_const_binary_ops if name in {"ADD", "MUL", "MAX", "SUB", "SHL", "SHR"}]
     scalar_const = _find_scalar_const_binary(uops, scalar_const_binary_ops[0]) if len(scalar_const_binary_ops) == 1 else None
     reverse_sub_const = _find_reverse_sub_const(uops)
     eq_scalar_const = _find_eq_scalar_const(uops)
@@ -190,7 +190,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     # tinygrad may leave pointer reads as INDEX nodes for a fully upcast 16-lane
     # tile, while smaller tiles materialize explicit LOAD UOps.
     _has_bool_logic_op = op_counts.get("AND", 0) > 0 or op_counts.get("OR", 0) > 0 or op_counts.get("XOR", 0) > 0
-    _has_complex_op = any(op_counts.get(x, 0) for x in ("IDIV", "MOD", "SHL", "SHR", "RECIP"))
+    _has_complex_op = any(op_counts.get(x, 0) for x in ("IDIV", "MOD", "RECIP"))
     is_single_binary = len(params) == 3 and len(matched_single_binary_ops) == 1 and op_counts.get("LOAD", 0) in {0, 2} and op_counts.get("STORE", 0) == 1 and not _has_bool_logic_op
     is_grouped_binary = len(params) == 3 and len(matched_grouped_binary_ops) == 1 and op_counts.get("STORE", 0) == 4 and op_counts.get("GROUP", 0) == 1 and not _has_bool_logic_op
     if len(params) == 2 and op_counts.get("STORE", 0) == 1 and op_counts.get("ADD", 0) > 0 and param_sizes.get(0) == 1:
