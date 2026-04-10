@@ -147,7 +147,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
 
     binary_vpu_ops = {"ADD": 0, "MUL": 1, "MAX": 3}
     matched_single_binary_ops = [name for name in binary_vpu_ops if op_counts.get(name, 0) in {1, 4}]
-    matched_grouped_binary_ops = [("MAX" if op_counts.get("MAX", 0) else "ADD" if op_counts.get("ADD", 0) else "MUL")] if any(op_counts.get(name, 0) for name in binary_vpu_ops) else []
+    matched_grouped_binary_ops = [("MAX" if op_counts.get("MAX", 0) else "MUL" if op_counts.get("MUL", 0) > 1 else "ADD")] if any(op_counts.get(name, 0) for name in binary_vpu_ops) else []
     # tinygrad may leave pointer reads as INDEX nodes for a fully upcast 16-lane
     # tile, while smaller tiles materialize explicit LOAD UOps.
     is_single_binary = len(params) == 3 and len(matched_single_binary_ops) == 1 and op_counts.get("LOAD", 0) in {0, 2} and op_counts.get("STORE", 0) == 1
