@@ -241,6 +241,8 @@ def _parse_sim_output(stdout: str) -> list[int] | None:
         line = line.strip()
         if line.startswith("mxu_result "):
             vals = line.split()[1:]
+            if len(vals) != _COLS:
+                raise ValueError(f"mxu_result expects {_COLS} values, got {len(vals)}")
             try:
                 return [int(x) for x in vals]
             except ValueError as exc:
