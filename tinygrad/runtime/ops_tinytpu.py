@@ -153,7 +153,13 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     binary_vpu_ops = _VPU_OPS
     matched_single_binary_ops = [name for name in binary_vpu_ops if op_counts.get(name, 0) in {1, 4}]
     matched_grouped_binary_ops = [("CMPNE" if op_counts.get("CMPNE", 0) else "CMPLT" if op_counts.get("CMPLT", 0) else "MAX" if op_counts.get("MAX", 0) else "MUL" if op_counts.get("MUL", 0) > 1 else "ADD")] if any(op_counts.get(name, 0) for name in binary_vpu_ops) else []
-    scalar_const_binary_ops = [name for name in binary_vpu_ops if op_counts.get(name, 0) == 1]
+    out_is_bool = any(p.arg == 0 and "bool" in str(p.dtype) for p in params)
+    scalar_const_binary_ops = [name for name in binary_vpu_ops
+                               if op_counts.get(name, 0) in {1, 4} and _find_scalar_const_binary(uops, name) is not None]
+    if out_is_bool:
+        scalar_const_binary_ops = [name for name in scalar_const_binary_ops if name in {"CMPLT", "CMPNE"}]
+    else:
+        scalar_const_binary_ops = [name for name in scalar_const_binary_ops if name in {"ADD", "MUL", "MAX", "SUB"}]
     scalar_const = _find_scalar_const_binary(uops, scalar_const_binary_ops[0]) if len(scalar_const_binary_ops) == 1 else None
     reverse_sub_const = _find_reverse_sub_const(uops)
     eq_scalar_const = _find_eq_scalar_const(uops)
@@ -198,7 +204,8 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["reason"] = f"unsupported vpu relu sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append("Current TinyTPU VPU RELU lowering handles one int32 VMEM tile with 1..16 elements.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif len(params) == 2 and reverse_sub_const is not None and op_counts.get("LOAD", 0) == 1 and op_counts.get("STORE", 0) == 1:
+    elif (len(params) == 2 and reverse_sub_const is not None and op_counts.get("STORE", 0) in {1, 4} and
+          (op_counts.get("STORE", 0) == 4 or op_counts.get("LOAD", 0) == 1)):
         out_size = param_sizes.get(0)
         src_size = param_sizes.get(1)
         if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size <= 16:
@@ -218,7 +225,8 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["reason"] = f"unsupported vpu reverse sub const sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append("Current TinyTPU VPU reverse SUB constant lowering handles one int32 VMEM tile with 1..16 elements.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif len(params) == 2 and len(scalar_const_binary_ops) == 1 and scalar_const is not None and op_counts.get("LOAD", 0) == 1 and op_counts.get("STORE", 0) == 1:
+    elif (len(params) == 2 and len(scalar_const_binary_ops) == 1 and scalar_const is not None and op_counts.get("STORE", 0) in {1, 4} and
+          (op_counts.get("STORE", 0) == 4 or op_counts.get("LOAD", 0) == 1)):
         op_name = scalar_const_binary_ops[0]
         out_size = param_sizes.get(0)
         src_size = param_sizes.get(1)
@@ -239,7 +247,8 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["reason"] = f"unsupported vpu {op_name.lower()} const sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append(f"Current TinyTPU VPU {op_name} constant lowering handles one int32 VMEM tile with 1..16 elements.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif len(params) == 2 and eq_scalar_const is not None and op_counts.get("LOAD", 0) == 1 and op_counts.get("STORE", 0) == 1:
+    elif (len(params) == 2 and eq_scalar_const is not None and op_counts.get("STORE", 0) in {1, 4} and
+          (op_counts.get("STORE", 0) == 4 or op_counts.get("LOAD", 0) == 1)):
         out_size = param_sizes.get(0)
         src_size = param_sizes.get(1)
         if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size <= 16:
