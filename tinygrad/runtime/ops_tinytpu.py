@@ -240,7 +240,12 @@ def _parse_sim_output(stdout: str) -> list[int] | None:
     for line in stdout.splitlines():
         line = line.strip()
         if line.startswith("mxu_result "):
-            return [int(x) for x in line.split()[1:]]
+            vals = line.split()[1:]
+            try:
+                return [int(x) for x in vals]
+            except ValueError as exc:
+                bad = next((x for x in vals if not x.lstrip("-").isdigit()), vals[0])
+                raise ValueError(f"invalid mxu_result integer {bad!r}") from exc
     return None
 
 
