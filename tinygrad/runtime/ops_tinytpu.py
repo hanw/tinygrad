@@ -147,9 +147,9 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["missing_instructions"] = ["SXU_DISPATCH_VPU", "SXU_LOAD_VREG", "SXU_STORE_VREG"]
         return diag
 
-    binary_vpu_ops = {"ADD": 0, "MUL": 1, "MAX": 3}
+    binary_vpu_ops = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5}
     matched_single_binary_ops = [name for name in binary_vpu_ops if op_counts.get(name, 0) in {1, 4}]
-    matched_grouped_binary_ops = [("MAX" if op_counts.get("MAX", 0) else "MUL" if op_counts.get("MUL", 0) > 1 else "ADD")] if any(op_counts.get(name, 0) for name in binary_vpu_ops) else []
+    matched_grouped_binary_ops = [("CMPLT" if op_counts.get("CMPLT", 0) else "MAX" if op_counts.get("MAX", 0) else "MUL" if op_counts.get("MUL", 0) > 1 else "ADD")] if any(op_counts.get(name, 0) for name in binary_vpu_ops) else []
     scalar_const_binary_ops = [name for name in binary_vpu_ops if op_counts.get(name, 0) == 1]
     scalar_const = _find_scalar_const_binary(uops, scalar_const_binary_ops[0]) if len(scalar_const_binary_ops) == 1 else None
     # tinygrad may leave pointer reads as INDEX nodes for a fully upcast 16-lane
@@ -586,15 +586,20 @@ class TinyTPUProgram:
                 rhs_i32 = np.full(num_elems, int(prog["rhs_const"]), dtype="<i4")
             if lhs_i32.size != num_elems or rhs_i32.size != num_elems:
                 raise RuntimeError(f"TinyTPU VPU binary op expected {num_elems} elements, got lhs={lhs_i32.size} rhs={rhs_i32.size}")
-            if len(out_buf) < num_elems * _BYTES_PER_ELEM:
+            out_elem_bytes = 1 if int(prog["vpu_op"]) == 5 else _BYTES_PER_ELEM
+            if len(out_buf) < num_elems * out_elem_bytes:
                 raise RuntimeError(f"TinyTPU output buffer too small for VPU binary op elements={num_elems}")
             sim = _sim_path()
             stdout = _run_bundle(sim, _build_vpu_binary_bundle(lhs_i32, rhs_i32, num_elems, int(prog["vpu_op"])))
             result = _parse_vmem_output(stdout)
             if result is None:
                 raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
-            out_i32 = np.array(result[:num_elems], dtype="<i4")
-            out_buf[: len(out_i32) * _BYTES_PER_ELEM] = out_i32.tobytes()
+            if int(prog["vpu_op"]) == 5:
+                out_bool = np.array(result[:num_elems], dtype=np.bool_)
+                out_buf[: len(out_bool)] = out_bool.tobytes()
+            else:
+                out_i32 = np.array(result[:num_elems], dtype="<i4")
+                out_buf[: len(out_i32) * _BYTES_PER_ELEM] = out_i32.tobytes()
             return 1e-3
 
         if prog.get("op") == "VPU_UNARY":
