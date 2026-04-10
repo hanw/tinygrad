@@ -190,6 +190,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     # tinygrad may leave pointer reads as INDEX nodes for a fully upcast 16-lane
     # tile, while smaller tiles materialize explicit LOAD UOps.
     _has_bool_logic_op = op_counts.get("AND", 0) > 0 or op_counts.get("OR", 0) > 0 or op_counts.get("XOR", 0) > 0
+    _has_complex_op = any(op_counts.get(x, 0) for x in ("IDIV", "MOD", "SHL", "SHR", "RECIP"))
     is_single_binary = len(params) == 3 and len(matched_single_binary_ops) == 1 and op_counts.get("LOAD", 0) in {0, 2} and op_counts.get("STORE", 0) == 1
     is_grouped_binary = len(params) == 3 and len(matched_grouped_binary_ops) == 1 and op_counts.get("STORE", 0) == 4 and op_counts.get("GROUP", 0) == 1 and not _has_bool_logic_op
     if len(params) == 2 and op_counts.get("STORE", 0) == 1 and op_counts.get("ADD", 0) > 0 and param_sizes.get(0) == 1:
@@ -236,7 +237,9 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["reason"] = f"unsupported vpu max_reduce sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append("Current TinyTPU VPU MAX_REDUCE lowering handles int32 max reduction to scalar.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif len(params) == 2 and op_counts.get("CMPLT", 0) > 0 and op_counts.get("WHERE", 0) > 0:
+    elif (len(params) == 2 and op_counts.get("CMPLT", 0) > 0 and op_counts.get("WHERE", 0) > 0
+          and not _has_complex_op
+          and op_counts.get("WHERE", 0) == op_counts.get("CMPLT", 0)):
         out_size = param_sizes.get(0)
         src_size = param_sizes.get(1)
         if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size:
@@ -254,7 +257,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["reason"] = f"unsupported vpu relu sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append("Current TinyTPU VPU RELU lowering handles one int32 VMEM tile with 1..16 elements.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif (len(params) == 2 and reverse_sub_const is not None and op_counts.get("STORE", 0) in {1, 4} and
+    elif (len(params) == 2 and reverse_sub_const is not None and not _has_complex_op and op_counts.get("STORE", 0) in {1, 4} and
           (op_counts.get("STORE", 0) == 4 or op_counts.get("LOAD", 0) == 1)):
         out_size = param_sizes.get(0)
         src_size = param_sizes.get(1)
@@ -275,7 +278,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["reason"] = f"unsupported vpu reverse sub const sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append("Current TinyTPU VPU reverse SUB constant lowering handles one int32 VMEM tile with 1..16 elements.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif (len(params) == 2 and len(scalar_const_binary_ops) == 1 and scalar_const is not None and op_counts.get("STORE", 0) in {1, 4} and
+    elif (len(params) == 2 and len(scalar_const_binary_ops) == 1 and scalar_const is not None and not _has_complex_op and op_counts.get("STORE", 0) in {1, 4} and
           (op_counts.get("STORE", 0) == 4 or op_counts.get("LOAD", 0) == 1)):
         op_name = scalar_const_binary_ops[0]
         out_size = param_sizes.get(0)
@@ -298,7 +301,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["reason"] = f"unsupported vpu {op_name.lower()} const sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append(f"Current TinyTPU VPU {op_name} constant lowering handles one int32 VMEM tile with 1..16 elements.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif (len(params) == 2 and eq_scalar_const is not None and op_counts.get("STORE", 0) in {1, 4} and
+    elif (len(params) == 2 and eq_scalar_const is not None and not _has_complex_op and op_counts.get("STORE", 0) in {1, 4} and
           (op_counts.get("STORE", 0) == 4 or op_counts.get("LOAD", 0) == 1)):
         out_size = param_sizes.get(0)
         src_size = param_sizes.get(1)
