@@ -74,13 +74,20 @@ class TinyTPURenderer(Renderer):
     def render(self, uops: list[UOp]) -> str:  # type: ignore[override]
         diag = analyze_tinytpu_uops(uops)
         if diag["supported"]:
-            return json.dumps({"op": "GEMM4x4",
-                               "out": diag["out_arg"],
-                               "act": diag["act_arg"],
-                               "weight": diag["weight_arg"],
-                               "num_vecs": diag["num_vecs"],
-                               "num_k_tiles": diag["num_k_tiles"],
-                               "num_weight_tiles": diag["num_weight_tiles"]})
+            if diag["kind"] == "gemm":
+                return json.dumps({"op": "GEMM4x4",
+                                   "out": diag["out_arg"],
+                                   "act": diag["act_arg"],
+                                   "weight": diag["weight_arg"],
+                                   "num_vecs": diag["num_vecs"],
+                                   "num_k_tiles": diag["num_k_tiles"],
+                                   "num_weight_tiles": diag["num_weight_tiles"]})
+            if diag["kind"] == "vpu_add":
+                return json.dumps({"op": "VPU_ADD",
+                                   "out": diag["out_arg"],
+                                   "lhs": diag["lhs_arg"],
+                                   "rhs": diag["rhs_arg"],
+                                   "num_elems": diag["num_elems"]})
         return json.dumps({
             "op": "UNSUPPORTED",
             "reason": diag["reason"],
@@ -100,11 +107,14 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
 
     diag = {
         "supported": False,
+        "kind": None,
         "reason": "",
         "missing_instructions": [],
         "notes": [],
         "op_counts": dict(sorted(op_counts.items())),
         "out_arg": None, "act_arg": None, "weight_arg": None,
+        "lhs_arg": None, "rhs_arg": None,
+        "num_elems": None,
         "num_vecs": None,
         "num_k_tiles": None,
         "num_weight_tiles": None,
@@ -143,6 +153,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
                 num_vecs, num_k_tiles, inferred_n_tiles = tiling
                 diag.update({
                     "supported": True,
+                    "kind": "gemm",
                     "reason": "supported gemm4x4",
                     "out_arg": out_arg,
                     "act_arg": act_arg,
@@ -170,6 +181,23 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
                 weight_size = by_size[1][1]
                 diag["notes"].append(_tiling_failure_note(out_size, act_size, weight_size))
             diag["notes"].append("No buffer looked like a valid 4x4-tiled weight matrix.")
+    elif len(params) == 3 and op_counts.get("ADD", 0) == 1 and op_counts.get("LOAD", 0) == 2 and op_counts.get("STORE", 0) == 1:
+        out_size = param_sizes.get(0)
+        input_args = [arg for arg in sorted(param_sizes) if arg != 0]
+        if out_size is not None and len(input_args) == 2 and 0 < out_size <= 16 and all(param_sizes[arg] == out_size for arg in input_args):
+            diag.update({
+                "supported": True,
+                "kind": "vpu_add",
+                "reason": "supported vpu add",
+                "out_arg": 0,
+                "lhs_arg": input_args[0],
+                "rhs_arg": input_args[1],
+                "num_elems": out_size,
+            })
+            return diag
+        diag["reason"] = f"unsupported vpu add sizes {dict(sorted(param_sizes.items()))}"
+        diag["notes"].append("Current TinyTPU VPU ADD lowering handles one int32 VMEM tile with 1..16 elements.")
+        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
     else:
         diag["reason"] = f"params={len(params)} gemm={is_gemm}"
 
@@ -235,6 +263,32 @@ def _build_gemm_bundle(weight_i8: np.ndarray, act_i8: np.ndarray) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _build_vpu_add_bundle(lhs_i32: np.ndarray, rhs_i32: np.ndarray, num_elems: int) -> str:
+    def tile(vals: np.ndarray) -> list[int]:
+        padded = np.zeros(_ROWS * _COLS, dtype=np.int32)
+        padded[:num_elems] = vals[:num_elems]
+        return [int(x) for x in padded]
+
+    lines: list[str] = []
+    lines.append("5 0 " + " ".join(str(x) for x in tile(lhs_i32)))
+    lines.append("5 1 " + " ".join(str(x) for x in tile(rhs_i32)))
+    # Dummy zero MXU tile. The current TensorCore runtime completes reliably once
+    # the controller has reached Done, so VPU-only programs append a no-op MXU.
+    lines.append("0 0 " + " ".join("0" for _ in range(_ROWS * _COLS)))
+    lines.append("1 1 " + " ".join("0" for _ in range(_ROWS)))
+    # LOAD VMEM[0]->v0, LOAD VMEM[1]->v1, ADD v0+v1->v2, STORE v2->VMEM[2]
+    lines.append("2 0 0 0 0 0 0 0 0 0")
+    lines.append("2 0 1 1 0 0 0 0 0 0")
+    lines.append("2 2 0 2 0 0 1 0 0 0")
+    lines.append("2 1 2 0 2 0 0 0 0 0")
+    lines.append("2 3 0 0 0 0 0 0 1 1")
+    lines.append("2 4 0 0 0 0 0 0 0 0")
+    lines.append("2 5 0 0 0 0 0 0 0 0")
+    lines.append("6 2")
+    lines.append("4")
+    return "\n".join(lines) + "\n"
+
+
 def _parse_sim_output(stdout: str) -> list[int] | None:
     """Extract mxu_result from BSV sim stdout.  Returns None if not found."""
     for line in stdout.splitlines():
@@ -248,6 +302,21 @@ def _parse_sim_output(stdout: str) -> list[int] | None:
             except ValueError as exc:
                 bad = next((x for x in vals if not x.lstrip("-").isdigit()), vals[0])
                 raise ValueError(f"invalid mxu_result integer {bad!r}") from exc
+    return None
+
+
+def _parse_vmem_output(stdout: str) -> list[int] | None:
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("vmem_result "):
+            vals = line.split()[1:]
+            if len(vals) != _ROWS * _COLS:
+                raise ValueError(f"vmem_result expects {_ROWS * _COLS} values, got {len(vals)}")
+            try:
+                return [int(x) for x in vals]
+            except ValueError as exc:
+                bad = next((x for x in vals if not x.lstrip("-").isdigit()), vals[0])
+                raise ValueError(f"invalid vmem_result integer {bad!r}") from exc
     return None
 
 
@@ -288,6 +357,37 @@ def _run_gemm_vec(sim: str, weight_i8: np.ndarray, act_i8: np.ndarray) -> list[i
             f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
         )
     return result
+
+
+def _run_bundle(sim: str, bundle_text: str) -> str:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        f.write(bundle_text)
+        bundle_path = f.name
+
+    try:
+        env = {**os.environ, "TINYTPU_BUNDLE": bundle_path}
+        proc = subprocess.run([sim], env=env, capture_output=True, text=True, timeout=30)
+    finally:
+        os.unlink(bundle_path)
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"TinyTPU sim exited {proc.returncode}\n"
+            f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
+        )
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("FAIL:") or line.startswith("ERROR:"):
+            raise RuntimeError(
+                f"TinyTPU simulator reported failure: {line}\n"
+                f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
+            )
+    if "status ok" not in {line.strip() for line in proc.stdout.splitlines()}:
+        raise RuntimeError(
+            f"TinyTPU simulator did not report `status ok`\n"
+            f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
+        )
+    return proc.stdout
 
 
 def _infer_tiling(out_size: int | None, act_size: int | None, weight_size: int) -> tuple[int, int, int] | None:
@@ -371,8 +471,26 @@ class TinyTPUProgram:
                  wait: bool = False,
                  **kwargs) -> float | None:
         prog = self.prog
-        if prog.get("op") != "GEMM4x4":
+        if prog.get("op") not in {"GEMM4x4", "VPU_ADD"}:
             raise NotImplementedError(_unsupported_message(prog))
+
+        if prog.get("op") == "VPU_ADD":
+            out_buf = bufs[prog["out"]]
+            lhs_i32 = np.frombuffer(bytes(bufs[prog["lhs"]]), dtype="<i4")
+            rhs_i32 = np.frombuffer(bytes(bufs[prog["rhs"]]), dtype="<i4")
+            num_elems = int(prog["num_elems"])
+            if lhs_i32.size != num_elems or rhs_i32.size != num_elems:
+                raise RuntimeError(f"TinyTPU VPU_ADD expected {num_elems} elements, got lhs={lhs_i32.size} rhs={rhs_i32.size}")
+            if len(out_buf) < num_elems * _BYTES_PER_ELEM:
+                raise RuntimeError(f"TinyTPU output buffer too small for VPU_ADD elements={num_elems}")
+            sim = _sim_path()
+            stdout = _run_bundle(sim, _build_vpu_add_bundle(lhs_i32, rhs_i32, num_elems))
+            result = _parse_vmem_output(stdout)
+            if result is None:
+                raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
+            out_i32 = np.array(result[:num_elems], dtype="<i4")
+            out_buf[: len(out_i32) * _BYTES_PER_ELEM] = out_i32.tobytes()
+            return 1e-3
 
         out_buf    = bufs[prog["out"]]
         act_buf    = bufs[prog["act"]]
