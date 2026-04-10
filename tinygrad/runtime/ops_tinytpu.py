@@ -275,6 +275,11 @@ def _run_gemm_vec(sim: str, weight_i8: np.ndarray, act_i8: np.ndarray) -> list[i
                 f"TinyTPU simulator reported failure: {line}\n"
                 f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
             )
+    if "status ok" not in {line.strip() for line in proc.stdout.splitlines()}:
+        raise RuntimeError(
+            f"TinyTPU simulator did not report `status ok`\n"
+            f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
+        )
 
     result = _parse_sim_output(proc.stdout)
     if result is None:
