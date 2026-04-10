@@ -374,6 +374,26 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
             return diag
         diag["reason"] = f"unsupported vpu and sizes {dict(sorted(param_sizes.items()))}"
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
+    elif len(params) == 3 and op_counts.get("XOR", 0) > 0 and op_counts.get("STORE", 0) in {1, 4}:
+        out_size = param_sizes.get(0)
+        input_args = [arg for arg in sorted(param_sizes) if arg != 0]
+        if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] == out_size for arg in input_args):
+            diag.update({
+                "supported": True,
+                "kind": "vpu_binary",
+                "reason": "supported vpu xor (via cmpne)",
+                "out_arg": 0,
+                "lhs_arg": input_args[0],
+                "lhs_const": None,
+                "rhs_arg": input_args[1],
+                "rhs_const": None,
+                "num_elems": out_size,
+                "vpu_op": binary_vpu_ops["CMPNE"],
+                "bool_out": True,
+            })
+            return diag
+        diag["reason"] = f"unsupported vpu xor sizes {dict(sorted(param_sizes.items()))}"
+        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
     elif len(params) == 3 and op_counts.get("OR", 0) > 0 and op_counts.get("STORE", 0) in {1, 4}:
         out_size = param_sizes.get(0)
         input_args = [arg for arg in sorted(param_sizes) if arg != 0]
