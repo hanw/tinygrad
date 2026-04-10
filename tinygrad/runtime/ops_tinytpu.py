@@ -147,7 +147,25 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
 
     binary_vpu_ops = {"ADD": 0, "MUL": 1, "MAX": 3}
     matched_binary_ops = [name for name in binary_vpu_ops if op_counts.get(name, 0) == 1]
-    if len(params) == 2 and op_counts.get("CMPLT", 0) > 0 and op_counts.get("WHERE", 0) > 0:
+    if len(params) == 2 and op_counts.get("ADD", 0) == 3 and op_counts.get("LOAD", 0) == 4 and op_counts.get("STORE", 0) == 1:
+        out_size = param_sizes.get(0)
+        src_size = param_sizes.get(1)
+        if out_size == 1 and src_size == 4:
+            diag.update({
+                "supported": True,
+                "kind": "vpu_unary",
+                "reason": "supported vpu sum_reduce",
+                "out_arg": 0,
+                "src_arg": 1,
+                "num_elems": src_size,
+                "out_elems": out_size,
+                "vpu_op": 4,
+            })
+            return diag
+        diag["reason"] = f"unsupported vpu sum_reduce sizes {dict(sorted(param_sizes.items()))}"
+        diag["notes"].append("Current TinyTPU VPU SUM_REDUCE lowering handles a 4-element int32 row reduced to one scalar.")
+        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
+    elif len(params) == 2 and op_counts.get("CMPLT", 0) > 0 and op_counts.get("WHERE", 0) > 0:
         out_size = param_sizes.get(0)
         src_size = param_sizes.get(1)
         if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size <= 16:
