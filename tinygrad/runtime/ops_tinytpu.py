@@ -353,7 +353,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["reason"] = f"unsupported vpu {op_name.lower()} sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append(f"Current TinyTPU VPU {op_name} lowering handles one int32 VMEM tile with 1..16 elements.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif len(params) == 4 and op_counts.get("WHERE", 0) > 0 and not is_gemm:
+    elif len(params) == 4 and op_counts.get("WHERE", 0) > 0:
         out_size = param_sizes.get(0)
         input_args = [arg for arg in sorted(param_sizes) if arg != 0]
         if out_size is not None and len(input_args) == 3 and 0 < out_size and all(param_sizes[arg] == out_size for arg in input_args):
