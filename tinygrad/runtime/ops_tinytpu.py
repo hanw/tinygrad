@@ -238,6 +238,7 @@ def _build_gemm_bundle(weight_i8: np.ndarray, act_i8: np.ndarray) -> str:
 def _parse_sim_output(stdout: str) -> list[int] | None:
     """Extract mxu_result from BSV sim stdout.  Returns None if not found."""
     for line in stdout.splitlines():
+        line = line.strip()
         if line.startswith("mxu_result "):
             return [int(x) for x in line.split()[1:]]
     return None
