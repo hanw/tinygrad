@@ -147,7 +147,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["missing_instructions"] = ["SXU_DISPATCH_VPU", "SXU_LOAD_VREG", "SXU_STORE_VREG"]
         return diag
 
-    binary_vpu_ops = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6}
+    binary_vpu_ops = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6, "SUB": 7}
     matched_single_binary_ops = [name for name in binary_vpu_ops if op_counts.get(name, 0) in {1, 4}]
     matched_grouped_binary_ops = [("CMPNE" if op_counts.get("CMPNE", 0) else "CMPLT" if op_counts.get("CMPLT", 0) else "MAX" if op_counts.get("MAX", 0) else "MUL" if op_counts.get("MUL", 0) > 1 else "ADD")] if any(op_counts.get(name, 0) for name in binary_vpu_ops) else []
     scalar_const_binary_ops = [name for name in binary_vpu_ops if op_counts.get(name, 0) == 1]
@@ -211,6 +211,27 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
             return diag
         diag["reason"] = f"unsupported vpu {op_name.lower()} const sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append(f"Current TinyTPU VPU {op_name} constant lowering handles one int32 VMEM tile with 1..16 elements.")
+        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
+    elif (len(params) == 3 and op_counts.get("ADD", 0) == 1 and op_counts.get("MUL", 0) == 1 and
+          op_counts.get("STORE", 0) == 1 and op_counts.get("LOAD", 0) in {0, 2} and
+          any(u.op is Ops.MUL and any(s.op is Ops.CONST and int(s.arg) == -1 for s in u.src) for u in uops)):
+        out_size = param_sizes.get(0)
+        input_args = [arg for arg in sorted(param_sizes) if arg != 0]
+        if out_size is not None and len(input_args) == 2 and 0 < out_size <= 16 and all(param_sizes[arg] == out_size for arg in input_args):
+            diag.update({
+                "supported": True,
+                "kind": "vpu_binary",
+                "reason": "supported vpu sub",
+                "out_arg": 0,
+                "lhs_arg": input_args[0],
+                "rhs_arg": input_args[1],
+                "rhs_const": None,
+                "num_elems": out_size,
+                "vpu_op": binary_vpu_ops["SUB"],
+            })
+            return diag
+        diag["reason"] = f"unsupported vpu sub sizes {dict(sorted(param_sizes.items()))}"
+        diag["notes"].append("Current TinyTPU VPU SUB lowering handles one int32 VMEM tile with 1..16 elements.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
     elif is_single_binary or is_grouped_binary:
         op_name = (matched_single_binary_ops if is_single_binary else matched_grouped_binary_ops)[0]
