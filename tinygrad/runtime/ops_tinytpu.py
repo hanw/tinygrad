@@ -25,7 +25,7 @@ _ROWS   = 4
 _COLS   = 4
 _BYTES_PER_ELEM = 4           # Int#(32) = 4 bytes
 _TILE_ELEMS = _ROWS * _COLS   # 16 elements per VMEM tile
-_VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6, "SUB": 7, "CMPEQ": 8, "MAX_REDUCE": 9, "SHL": 10, "SHR": 11, "MIN": 12}
+_VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6, "SUB": 7, "CMPEQ": 8, "MAX_REDUCE": 9, "SHL": 10, "SHR": 11, "MIN": 12, "MIN_REDUCE": 13}
 _VPU_BOOL_OPS = {_VPU_OPS["CMPLT"], _VPU_OPS["CMPNE"], _VPU_OPS["CMPEQ"]}
 
 def _sim_path() -> str:
@@ -217,7 +217,8 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["reason"] = f"unsupported vpu sum_reduce sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append("Current TinyTPU VPU SUM_REDUCE lowering handles int32 sum reduction to scalar.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif len(params) == 2 and op_counts.get("STORE", 0) == 1 and op_counts.get("MAX", 0) > 0 and param_sizes.get(0) == 1:
+    elif (len(params) == 2 and op_counts.get("STORE", 0) == 1 and op_counts.get("MAX", 0) > 0
+          and op_counts.get("XOR", 0) == 0 and param_sizes.get(0) == 1):
         out_size = param_sizes.get(0)
         src_size = param_sizes.get(1)
         num_maxes = op_counts.get("MAX", 0)
@@ -238,6 +239,29 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
             return diag
         diag["reason"] = f"unsupported vpu max_reduce sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append("Current TinyTPU VPU MAX_REDUCE lowering handles int32 max reduction to scalar.")
+        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
+    elif (len(params) == 2 and op_counts.get("STORE", 0) == 1 and op_counts.get("MAX", 0) > 0
+          and op_counts.get("XOR", 0) > 0 and param_sizes.get(0) == 1):
+        out_size = param_sizes.get(0)
+        src_size = param_sizes.get(1)
+        num_maxes = op_counts.get("MAX", 0)
+        num_loads = op_counts.get("LOAD", 0)
+        is_min_tree = (src_size is not None and src_size > 0
+                       and num_maxes == src_size - 1 and num_loads == src_size)
+        if is_min_tree:
+            diag.update({
+                "supported": True,
+                "kind": "vpu_unary",
+                "reason": "supported vpu min_reduce",
+                "out_arg": 0,
+                "src_arg": 1,
+                "num_elems": src_size,
+                "out_elems": out_size,
+                "vpu_op": _VPU_OPS["MIN_REDUCE"],
+            })
+            return diag
+        diag["reason"] = f"unsupported vpu min_reduce sizes {dict(sorted(param_sizes.items()))}"
+        diag["notes"].append("Current TinyTPU VPU MIN_REDUCE lowering handles int32 min reduction to scalar.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
     elif (len(params) == 2 and op_counts.get("CMPLT", 0) > 0 and op_counts.get("WHERE", 0) > 0
           and not _has_complex_op
@@ -998,6 +1022,7 @@ class TinyTPUProgram:
             vpu_op = int(prog["vpu_op"])
             is_sum_reduce = vpu_op == 4 and out_elems == 1
             is_max_reduce = vpu_op == _VPU_OPS["MAX_REDUCE"] and out_elems == 1
+            is_min_reduce = vpu_op == _VPU_OPS["MIN_REDUCE"] and out_elems == 1
             if is_sum_reduce:
                 # Sum reduction: chunk into tiles, sum each via VPU_SUM_REDUCE,
                 # then accumulate partial sums on the host.
@@ -1038,6 +1063,23 @@ class TinyTPUProgram:
                     tile_max = max(row_maxes)
                     running_max = max(running_max, tile_max)
                 out_i32 = np.array([running_max], dtype="<i4")
+                out_buf[: _BYTES_PER_ELEM] = out_i32.tobytes()
+            elif is_min_reduce:
+                running_min = np.int32(2**31 - 1)  # INT32_MAX
+                for chunk_start in range(0, num_elems, _TILE_ELEMS):
+                    chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
+                    chunk_size = chunk_end - chunk_start
+                    src_chunk = src_i32[chunk_start:chunk_end]
+                    padded = np.full(_TILE_ELEMS, 2**31 - 1, dtype=np.int32)
+                    padded[:chunk_size] = src_chunk
+                    stdout = _run_bundle(sim, _build_vpu_unary_bundle(padded, _TILE_ELEMS, vpu_op))
+                    result = _parse_vmem_output(stdout)
+                    if result is None:
+                        raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
+                    row_mins = [np.int32(result[r * _COLS]) for r in range(_ROWS)]
+                    tile_min = min(row_mins)
+                    running_min = min(running_min, tile_min)
+                out_i32 = np.array([running_min], dtype="<i4")
                 out_buf[: _BYTES_PER_ELEM] = out_i32.tobytes()
             else:
                 out_offset = 0
