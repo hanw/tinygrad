@@ -77,36 +77,48 @@ class TinyTPURenderer(Renderer):
         diag = analyze_tinytpu_uops(uops)
         if diag["supported"]:
             if diag["kind"] == "gemm":
-                return json.dumps({"op": "GEMM4x4",
-                                   "out": diag["out_arg"],
-                                   "act": diag["act_arg"],
-                                   "weight": diag["weight_arg"],
-                                   "num_vecs": diag["num_vecs"],
-                                   "num_k_tiles": diag["num_k_tiles"],
-                                   "num_weight_tiles": diag["num_weight_tiles"]})
+                return _dump_lowering(json.dumps({"op": "GEMM4x4",
+                                                  "out": diag["out_arg"],
+                                                  "act": diag["act_arg"],
+                                                  "weight": diag["weight_arg"],
+                                                  "num_vecs": diag["num_vecs"],
+                                                  "num_k_tiles": diag["num_k_tiles"],
+                                                  "num_weight_tiles": diag["num_weight_tiles"]}))
             if diag["kind"] == "vpu_binary":
-                return json.dumps({"op": "VPU_BINARY",
-                                   "vpu_op": diag["vpu_op"],
-                                   "out": diag["out_arg"],
-                                   "lhs": diag["lhs_arg"],
-                                   "lhs_const": diag["lhs_const"],
-                                   "rhs": diag["rhs_arg"],
-                                   "rhs_const": diag["rhs_const"],
-                                   "num_elems": diag["num_elems"]})
+                return _dump_lowering(json.dumps({"op": "VPU_BINARY",
+                                                  "vpu_op": diag["vpu_op"],
+                                                  "out": diag["out_arg"],
+                                                  "lhs": diag["lhs_arg"],
+                                                  "lhs_const": diag["lhs_const"],
+                                                  "rhs": diag["rhs_arg"],
+                                                  "rhs_const": diag["rhs_const"],
+                                                  "num_elems": diag["num_elems"]}))
             if diag["kind"] == "vpu_unary":
-                return json.dumps({"op": "VPU_UNARY",
-                                   "vpu_op": diag["vpu_op"],
-                                   "out": diag["out_arg"],
-                                   "src": diag["src_arg"],
-                                   "num_elems": diag["num_elems"],
-                                   "out_elems": diag["out_elems"]})
-        return json.dumps({
+                return _dump_lowering(json.dumps({"op": "VPU_UNARY",
+                                                  "vpu_op": diag["vpu_op"],
+                                                  "out": diag["out_arg"],
+                                                  "src": diag["src_arg"],
+                                                  "num_elems": diag["num_elems"],
+                                                  "out_elems": diag["out_elems"]}))
+        return _dump_lowering(json.dumps({
             "op": "UNSUPPORTED",
             "reason": diag["reason"],
             "missing_instructions": diag["missing_instructions"],
             "notes": diag["notes"],
             "op_counts": diag["op_counts"],
-        })
+        }))
+
+
+def _dump_lowering(desc:str) -> str:
+    target = os.environ.get("TINYTPU_DUMP_LOWERING")
+    if not target:
+        return desc
+    if target == "1":
+        print(desc)
+    else:
+        with open(target, "a", encoding="utf-8") as f:
+            f.write(desc + "\n")
+    return desc
 
 def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     params = [u for u in uops if u.op is Ops.PARAM]
