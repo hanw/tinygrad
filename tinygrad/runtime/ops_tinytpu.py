@@ -247,6 +247,11 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     is_single_binary = len(params) == 3 and len(matched_single_binary_ops) == 1 and op_counts.get("LOAD", 0) in {0, 2} and op_counts.get("STORE", 0) == 1 and not _has_bool_logic_op
     _has_fused_cmp = op_counts.get("CMPLT", 0) > 0 and op_counts.get("WHERE", 0) > 0
     is_grouped_binary = len(params) == 3 and len(matched_grouped_binary_ops) == 1 and op_counts.get("STORE", 0) == 4 and op_counts.get("GROUP", 0) == 1 and not _has_bool_logic_op and not _has_fused_cmp
+    # 2-param grouped scalar-const: RANGE+GROUP vectorised unary-like op.
+    # MUL=5 (4 elem + 1 stride) or ADD/SUB/MAX with count not in {1,4}.
+    _is_grouped_sc = (len(params) == 2 and op_counts.get("GROUP", 0) == 1
+                      and op_counts.get("STORE", 0) == 4 and op_counts.get("LOAD", 0) == 4
+                      and op_counts.get("RANGE", 0) == 1 and not _has_bool_logic_op)
     _is_rowwise = (len(params) == 2
                    and op_counts.get("RANGE", 0) == 1
                    and op_counts.get("MUL", 0) == 1
@@ -694,6 +699,32 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["reason"] = f"unsupported vpu sub sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append("Current TinyTPU VPU SUB lowering handles one int32 VMEM tile with 1..16 elements.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
+    elif _is_grouped_sc and len(matched_grouped_binary_ops) == 1:
+        # 2-param grouped scalar-const: e.g. x*-1 (neg), x*2, x+5 for 2D/large tensors.
+        op_name = matched_grouped_binary_ops[0]
+        out_size = param_sizes.get(0)
+        src_size = param_sizes.get(1)
+        gsc = _find_grouped_elementwise_const(uops, op_name)
+        if out_size is not None and src_size is not None and out_size == src_size and 0 < out_size and gsc is not None:
+            diag.update({
+                "supported": True,
+                "kind": "vpu_binary",
+                "reason": f"supported grouped-scalar-const vpu {op_name.lower()}",
+                "out_arg": 0,
+                "lhs_arg": 1,
+                "lhs_const": None,
+                "rhs_arg": None,
+                "rhs_const": gsc,
+                "lhs_broadcast": False,
+                "rhs_broadcast": False,
+                "num_elems": out_size,
+                "vpu_op": binary_vpu_ops[op_name],
+                "bool_out": False,
+                "bool_in": False,
+            })
+            return diag
+        diag["reason"] = f"unsupported grouped-scalar-const {op_name} sizes {dict(sorted(param_sizes.items()))}"
+        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
     elif is_single_binary or is_grouped_binary:
         op_name = (matched_single_binary_ops if is_single_binary else matched_grouped_binary_ops)[0]
         out_size = param_sizes.get(0)
@@ -955,8 +986,26 @@ def _find_scalar_const_binary(uops:list[UOp], op_name:str) -> int | None:
         consts = [s for s in u.src if s.op is Ops.CONST]
         non_consts = [s for s in u.src if s.op is not Ops.CONST]
         if len(consts) == 1 and len(non_consts) == 1:
+            # Skip address-stride computations (RANGE × stride) in grouped kernels
+            if non_consts[0].op is Ops.RANGE:
+                continue
             return int(consts[0].arg)
     return None
+
+
+def _find_grouped_elementwise_const(uops:list[UOp], op_name:str) -> int | None:
+    """For GROUP-vectorised 2-param kernels: find the scalar const in element-wise
+    ops whose non-const source is a LOAD result, skipping address computations."""
+    load_ids = {id(u) for u in uops if u.op.name == "LOAD"}
+    for u in uops:
+        if u.op.name != op_name:
+            continue
+        consts = [s for s in u.src if s.op is Ops.CONST]
+        non_consts = [s for s in u.src if s.op is not Ops.CONST]
+        if len(consts) == 1 and len(non_consts) == 1 and id(non_consts[0]) in load_ids:
+            return int(consts[0].arg)
+    return None
+
 
 
 def _const_arg(u:UOp) -> int | bool | None:
