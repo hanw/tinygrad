@@ -468,7 +468,10 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
         # Record which param is lhs vs rhs for data plan
         src_params = [lhs_param, rhs_param]
     elif len(src_params) == 1:
-        # Unary op (not relu)
+        # Unary op (not relu) — only handle WHERE/CMPLT patterns that the old path can do
+        # Don't try to handle complex patterns like clip (WHERE+CMPLT+const) here
+        if op_counts.get("WHERE", 0) > 0 or op_counts.get("CMPLT", 0) > 0:
+            return None
         vpu_name = None
         for u in alu_uops:
             name = _ALU_MAP.get(u.op)
