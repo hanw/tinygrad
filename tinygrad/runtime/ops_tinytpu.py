@@ -112,6 +112,8 @@ class TinyTPURenderer(Renderer):
     }
 
     def render(self, uops: list[UOp]) -> str:  # type: ignore[override]
+        if (sxu_desc := _render_sxu_program(uops)) is not None:
+            return _dump_lowering(json.dumps(sxu_desc))
         if (wmma_desc := _render_wmma_descriptor(uops)) is not None:
             return _dump_lowering(json.dumps(wmma_desc))
         diag = analyze_tinytpu_uops(uops)
@@ -201,6 +203,194 @@ def _render_wmma_descriptor(uops: list[UOp]) -> dict | None:
         "lowering": "WMMA",
         "epilogue": epilogue,
     }
+
+
+def _render_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render a WMMA kernel as an SXU_PROGRAM descriptor.
+
+    Returns a dict with op="SXU_PROGRAM", pre-built SXU instructions, and a
+    data_plan that maps buffer param indices to WMEM/AMEM/VMEM addresses.
+    The runtime fills in actual data at call time.
+
+    Returns None if the kernel is not a WMMA kernel.
+    """
+    wmmas = [u for u in uops if u.op is Ops.WMMA]
+    if not wmmas:
+        return None
+
+    wmma = wmmas[0]
+
+    # Extract param mappings (same logic as _render_wmma_descriptor)
+    out_params = {_find_unique_param_arg(store.src[0]) for store in uops if store.op is Ops.STORE}
+    out_params.discard(None)
+    src0_param = _find_unique_param_arg(wmma.src[0])
+    src1_param = _find_unique_param_arg(wmma.src[1])
+    if len(out_params) != 1 or src0_param is None or src1_param is None:
+        return None  # fall back to old path
+
+    out_arg = next(iter(out_params))
+    act_arg, weight_arg = src0_param, src1_param
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if out_arg not in params or act_arg not in params or weight_arg not in params:
+        return None
+
+    out_size = params[out_arg].dtype.size
+    act_size = params[act_arg].dtype.size
+    weight_size = params[weight_arg].dtype.size
+    if (tiling := _infer_tiling(out_size, act_size, weight_size)) is None:
+        return None
+
+    num_vecs, num_k_tiles, num_weight_tiles = tiling
+    out_cols = num_weight_tiles * _COLS
+    k_cols = num_k_tiles * _ROWS
+
+    # Detect epilogue (bias add, relu)
+    epilogue, epilogue_error = _extract_wmma_epilogue(uops, params, out_arg, act_arg, weight_arg, out_size, out_cols)
+    if epilogue_error is not None:
+        return None
+
+    has_bias = any(step["op"] == "ADD" for step in epilogue)
+    has_relu = any(step["op"] == "RELU" for step in epilogue)
+    bias_arg = None
+    bias_mode = None
+    if has_bias:
+        bias_step = next(s for s in epilogue if s["op"] == "ADD")
+        bias_arg = bias_step["arg"]
+        bias_mode = bias_step["mode"]
+
+    # Build data_plan: describe which buffers map to which memory addresses
+    data_plan: list[dict] = []
+
+    # Weight tiles → WMEM: address = k * num_weight_tiles + tile_idx
+    total_weight_tiles = num_k_tiles * num_weight_tiles
+    data_plan.append({
+        "type": "WMEM",
+        "addr": 0,
+        "param": weight_arg,
+        "offset": 0,
+        "count": total_weight_tiles * _ROWS * _COLS,
+        "dtype": "int8",
+        "layout": "weight_tiles",
+        "num_k_tiles": num_k_tiles,
+        "num_weight_tiles": num_weight_tiles,
+    })
+
+    # Activation rows → AMEM: address = row * num_k_tiles + k
+    data_plan.append({
+        "type": "AMEM",
+        "addr": 0,
+        "param": act_arg,
+        "offset": 0,
+        "count": num_vecs * k_cols,
+        "dtype": "int8",
+        "layout": "act_tiles",
+        "num_vecs": num_vecs,
+        "num_k_tiles": num_k_tiles,
+    })
+
+    # Bias → VMEM (if present)
+    bias_vmem_base = 0
+    if has_bias:
+        bias_size = params[bias_arg].dtype.size
+        data_plan.append({
+            "type": "VMEM",
+            "addr": bias_vmem_base,
+            "param": bias_arg,
+            "offset": 0,
+            "count": bias_size,
+            "dtype": "int32",
+            "layout": "bias",
+            "mode": bias_mode,
+            "num_weight_tiles": num_weight_tiles,
+        })
+
+    # Generate SXU instructions
+    instructions = _generate_gemm_sxu_instructions(
+        num_vecs, num_k_tiles, num_weight_tiles,
+        has_bias=has_bias, bias_vmem_base=bias_vmem_base,
+        has_relu=has_relu,
+    )
+
+    # Output VMEM addresses
+    out_vmem_base = num_weight_tiles if has_bias else 0
+    outputs: list[dict] = []
+    for row in range(num_vecs):
+        for tile_idx in range(num_weight_tiles):
+            out_addr = out_vmem_base + row * num_weight_tiles + tile_idx
+            outputs.append({
+                "addr": out_addr,
+                "param": out_arg,
+                "offset": (row * out_cols + tile_idx * _COLS),
+                "count": _COLS,
+            })
+
+    return {
+        "op": "SXU_PROGRAM",
+        "instructions": instructions,
+        "data_plan": data_plan,
+        "outputs": outputs,
+        "num_output_tiles": num_vecs * num_weight_tiles,
+        "num_vecs": num_vecs,
+        "num_k_tiles": num_k_tiles,
+        "num_weight_tiles": num_weight_tiles,
+        "out": out_arg,
+    }
+
+
+def _generate_gemm_sxu_instructions(num_vecs: int, num_k_tiles: int, num_weight_tiles: int,
+                                     *, has_bias: bool = False, bias_vmem_base: int = 0,
+                                     has_relu: bool = False) -> list[str]:
+    """Generate SXU instruction strings for a GEMM kernel.
+
+    These are the same instructions that _build_full_gemm_bundle generates,
+    but without any data records -- just the SXU program lines.
+    """
+    out_vmem_base = num_weight_tiles if has_bias else 0
+    prog_lines: list[str] = []
+
+    for row in range(num_vecs):
+        for tile_idx in range(num_weight_tiles):
+            # MXU dispatches for K-tile accumulation
+            for k in range(num_k_tiles):
+                wmem_addr = k * num_weight_tiles + tile_idx
+                amem_addr = row * num_k_tiles + k
+                vreg_k = k
+                prog_lines.append(_mxu(wmem_addr, amem_addr, 1))
+                prog_lines.append(_wait_mxu())
+                prog_lines.append(_load_mxu_result(vreg_k))
+
+            # Accumulate K-tiles
+            if num_k_tiles == 1:
+                cur = 0
+            else:
+                acc = num_k_tiles
+                prog_lines.append(_vpu(acc, 0, _VPU_OPS["ADD"], 1))
+                cur = acc
+                for k in range(2, num_k_tiles):
+                    nxt = cur + 1
+                    prog_lines.append(_vpu(nxt, cur, _VPU_OPS["ADD"], k))
+                    cur = nxt
+
+            # Bias epilogue
+            if has_bias:
+                bias_vreg = cur + 1
+                prog_lines.append(_load(bias_vreg, bias_vmem_base + tile_idx))
+                result_vreg = bias_vreg + 1
+                prog_lines.append(_vpu(result_vreg, cur, _VPU_OPS["ADD"], bias_vreg))
+                cur = result_vreg
+
+            # ReLU epilogue
+            if has_relu:
+                nxt = cur + 1
+                prog_lines.append(_vpu(nxt, cur, 2))  # VPU_RELU opcode
+                cur = nxt
+
+            # Store result
+            out_addr = out_vmem_base + row * num_weight_tiles + tile_idx
+            prog_lines.append(_store(out_addr, cur))
+
+    prog_lines.append(_halt())
+    return prog_lines
 
 
 def _find_unique_param_arg(u: UOp) -> int | None:
@@ -1695,7 +1885,7 @@ def _unsupported_message(prog: dict) -> str:
 # ---------------------------------------------------------------------------
 # Program — drives the BSV simulator
 # ---------------------------------------------------------------------------
-_SUPPORTED_OPS = {"GEMM4x4", "VPU_BINARY", "VPU_UNARY", "VPU_WHERE", "VPU_PROGRAM", "VPU_ROWSUM", "VPU_ROWBC_BINARY", "HOST_ROWREDUCE", "HOST_COLREDUCE", "HOST_BINARY", "HOST_UNARY"}
+_SUPPORTED_OPS = {"GEMM4x4", "SXU_PROGRAM", "VPU_BINARY", "VPU_UNARY", "VPU_WHERE", "VPU_PROGRAM", "VPU_ROWSUM", "VPU_ROWBC_BINARY", "HOST_ROWREDUCE", "HOST_COLREDUCE", "HOST_BINARY", "HOST_UNARY"}
 
 class TinyTPUProgram:
     def __init__(self, name: str, lib: bytes, *args, **kwargs):
@@ -1991,6 +2181,106 @@ class TinyTPUProgram:
             all_row_results.extend(tile_result[r * _COLS] for r in range(tile_nrows))
         row_sums = np.array(all_row_results, dtype=np.int32)
         out_buf[:num_rows * _BYTES_PER_ELEM] = row_sums.tobytes()
+        return 1e-3
+
+    def _exec_sxu_program(self, bufs):
+        prog = self.prog
+        data_plan = prog["data_plan"]
+        instructions = prog["instructions"]
+        outputs = prog["outputs"]
+        num_vecs = int(prog["num_vecs"])
+        num_k_tiles = int(prog["num_k_tiles"])
+        num_weight_tiles = int(prog["num_weight_tiles"])
+        out_cols = num_weight_tiles * _COLS
+        k_cols = num_k_tiles * _ROWS
+
+        # Build bundle from data_plan + instructions + outputs
+        data_lines: list[str] = []
+
+        for entry in data_plan:
+            mem_type = entry["type"]
+            param_idx = int(entry["param"])
+            buf_data = bufs[param_idx]
+
+            if mem_type == "WMEM":
+                # Weight tiles: read as int32, validate int8 range, reshape into tiles
+                weight_i32 = np.frombuffer(bytes(buf_data), dtype="<i4")
+                _require_int8_range("weight", weight_i32)
+                weight_i8 = weight_i32.astype(np.int8)
+                nk = entry["num_k_tiles"]
+                nwt = entry["num_weight_tiles"]
+                weight_matrix = weight_i8.reshape(nk * _ROWS, nwt * _COLS)
+                for k in range(nk):
+                    for t in range(nwt):
+                        w_tile = weight_matrix[k * _ROWS : (k + 1) * _ROWS,
+                                               t * _COLS : (t + 1) * _COLS]
+                        wmem_addr = k * nwt + t
+                        data_lines.append(_wmem(wmem_addr, [int(x) for x in w_tile.flatten()]))
+
+            elif mem_type == "AMEM":
+                # Activation tiles: read as int32, validate int8 range, reshape into vectors
+                act_i32 = np.frombuffer(bytes(buf_data), dtype="<i4")
+                _require_int8_range("activation", act_i32)
+                act_i8 = act_i32.astype(np.int8)
+                nv = entry["num_vecs"]
+                nk = entry["num_k_tiles"]
+                act_rows = act_i8.reshape(nv, nk * _ROWS)
+                for row in range(nv):
+                    for k in range(nk):
+                        a_tile = act_rows[row, k * _ROWS : (k + 1) * _ROWS]
+                        amem_addr = row * nk + k
+                        data_lines.append(_amem(amem_addr, [int(x) for x in a_tile]))
+
+            elif mem_type == "VMEM":
+                # Bias or other VMEM data
+                vmem_i32 = np.frombuffer(bytes(buf_data), dtype="<i4")
+                base_addr = int(entry["addr"])
+                mode = entry.get("mode", "FULL")
+                nwt = entry.get("num_weight_tiles", 1)
+                if mode == "ROW_BROADCAST":
+                    for t in range(nwt):
+                        bias_tile = [0] * _TILE_ELEMS
+                        for i in range(_COLS):
+                            bias_tile[i] = int(vmem_i32[t * _COLS + i])
+                        data_lines.append(_vmem(base_addr + t, bias_tile))
+                elif mode == "FULL":
+                    # Full bias: one tile per (row, weight_tile) -- but for now
+                    # treat like row-broadcast since that's what GEMM epilogue expects
+                    for t in range(nwt):
+                        bias_tile = [0] * _TILE_ELEMS
+                        for i in range(_COLS):
+                            if t * _COLS + i < vmem_i32.size:
+                                bias_tile[i] = int(vmem_i32[t * _COLS + i])
+                        data_lines.append(_vmem(base_addr + t, bias_tile))
+
+        # Output records
+        output_lines: list[str] = []
+        for out_entry in outputs:
+            output_lines.append(_output_vmem(int(out_entry["addr"])))
+        output_lines.append(_end())
+
+        bundle_text = _bundle(*(data_lines + instructions + output_lines))
+
+        # Run sim
+        stdout = self._run(bundle_text)
+        vmem_results = _parse_multi_vmem_output(stdout)
+
+        expected_tiles = int(prog["num_output_tiles"])
+        if len(vmem_results) != expected_tiles:
+            raise RuntimeError(
+                f"TinyTPU SXU_PROGRAM expected {expected_tiles} vmem_result lines, "
+                f"got {len(vmem_results)}\nstdout: {stdout[:500]}")
+
+        # Write results to output buffer
+        out_buf = bufs[int(prog["out"])]
+        out_i32 = np.empty(num_vecs * out_cols, dtype="<i4")
+        for idx, out_entry in enumerate(outputs):
+            tile_data = vmem_results[idx]
+            offset = int(out_entry["offset"])
+            count = int(out_entry["count"])
+            out_i32[offset : offset + count] = tile_data[:count]
+
+        out_buf[: len(out_i32) * _BYTES_PER_ELEM] = out_i32.tobytes()
         return 1e-3
 
     def _exec_gemm4x4(self, bufs):
