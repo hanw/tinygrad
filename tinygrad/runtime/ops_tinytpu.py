@@ -193,14 +193,6 @@ def _render_wmma_descriptor(uops: list[UOp]) -> dict | None:
         return None
 
     wmma = wmmas[0]
-    if len(wmmas) != 1:
-        return {
-            "op": "UNSUPPORTED",
-            "reason": f"expected a single WMMA op, found {len(wmmas)}",
-            "missing_instructions": ["multi-wmma lowering"],
-            "notes": ["TinyTPU currently lowers one WMMA kernel body at a time."],
-            "op_counts": dict(sorted(Counter(u.op.name for u in uops).items())),
-        }
 
     out_params = {_find_unique_param_arg(store.src[0]) for store in uops if store.op is Ops.STORE}
     out_params.discard(None)
@@ -278,7 +270,7 @@ def _extract_wmma_epilogue(uops: list[UOp], params: dict[int, UOp], out_arg: int
     extra_params = sorted(k for k in params if k not in {out_arg, act_arg, weight_arg})
     epilogue: list[dict] = []
 
-    if op_counts.get("ADD", 0):
+    if op_counts.get("ADD", 0) and len(extra_params) > 0:
         if len(extra_params) != 1:
             return [], f"wmma add epilogue expected one extra param, found {len(extra_params)}"
         bias_arg = extra_params[0]
