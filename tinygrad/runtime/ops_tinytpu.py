@@ -1149,73 +1149,102 @@ def _arg_needs_broadcast(arg: int | None, param_sizes: dict[int, int], out_size:
 
 
 # ---------------------------------------------------------------------------
+# Compact TASM helpers for bundle construction
+# ---------------------------------------------------------------------------
+# These produce the wire-format integer lines consumed by TbTinyTPURuntime.
+# See doc/tinytpu_asm.md for the full TASM specification.
+
+def _vmem(addr: int, vals: list[int]) -> str:
+    return "5 " + str(addr) + " " + " ".join(str(v) for v in vals)
+
+def _wmem(addr: int, vals: list[int]) -> str:
+    return "0 " + str(addr) + " " + " ".join(str(v) for v in vals)
+
+def _amem(addr: int, vals: list[int]) -> str:
+    return "1 " + str(addr) + " " + " ".join(str(v) for v in vals)
+
+def _load(vd: int, vmem_src: int) -> str:
+    return f"2 0 {vmem_src} {vd} 0 0 0 0 0 0"
+
+def _store(vmem_dst: int, vs: int) -> str:
+    return f"2 1 {vmem_dst} 0 {vs} 0 0 0 0 0"
+
+def _vpu(vd: int, va: int, op: int, vb: int = 0) -> str:
+    return f"2 2 0 {vd} {va} {op} {vb} 0 0 0"
+
+def _broadcast(vn: int, lane: int = 0) -> str:
+    return f"2 3 0 {vn} {vn} 0 {lane} 0 0 0"
+
+def _mxu(wbase: int, abase: int, tiles: int) -> str:
+    return f"2 4 0 0 0 0 0 {wbase} {abase} {tiles}"
+
+def _wait_mxu() -> str: return "2 5 0 0 0 0 0 0 0 0"
+def _halt()     -> str: return "2 6 0 0 0 0 0 0 0 0"
+def _output_mxu()           -> str: return "3 1"
+def _output_vmem(addr: int) -> str: return f"6 {addr}"
+def _end()      -> str: return "4"
+
+def _bundle(*lines: str) -> str:
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
 # Helpers: build text bundle, parse BSV sim output
 # ---------------------------------------------------------------------------
 def _build_gemm_bundle(weight_i8: np.ndarray, act_i8: np.ndarray) -> str:
-    """
-    weight_i8 : int8 array, shape (4, 4), row-major
-    act_i8    : int8 array, shape (4,)
-    Returns the numeric text bundle that TbTinyTPURuntime reads.
-    """
-    lines: list[str] = []
-    # Record 0: WEIGHT_TILE at SRAM addr 0 — 16 values row-major
-    w_flat = weight_i8.flatten()
-    lines.append("0 0 " + " ".join(str(int(x)) for x in w_flat))
-    # Record 1: ACT_TILE at SRAM addr 1 — 4 values
-    lines.append("1 1 " + " ".join(str(int(x)) for x in act_i8))
-    # Record 2: SXU_DISPATCH_MXU (opcode=3): wBase=0 aBase=1 tLen=1
-    lines.append(f"2 {_SXU_OPS['DISPATCH_MXU']} 0 0 0 0 0 0 1 1")
-    # Record 2: SXU_WAIT_MXU (opcode=4)
-    lines.append(f"2 {_SXU_OPS['WAIT_MXU']} 0 0 0 0 0 0 0 0")
-    # Record 2: SXU_HALT (opcode=5)
-    lines.append(f"2 {_SXU_OPS['HALT']} 0 0 0 0 0 0 0 0")
-    # Record 3: OUTPUT_MXU = 1
-    lines.append("3 1")
-    # Record 4: END
-    lines.append("4")
-    return "\n".join(lines) + "\n"
+    """WMEM[0]=weight, AMEM[1]=act, MXU WMEM[0]/AMEM[1]/tiles=1, OUTPUT_MXU."""
+    return _bundle(
+        _wmem(0, [int(x) for x in weight_i8.flatten()]),  # WMEM[0] = weight tile
+        _amem(1, [int(x) for x in act_i8]),               # AMEM[1] = activation
+        _mxu(0, 1, 1),   # MXU WMEM[0], AMEM[1], tiles=1
+        _wait_mxu(),      # WAIT_MXU
+        _halt(),          # HALT
+        _output_mxu(),    # OUTPUT_MXU
+        _end(),           # END
+    )
 
 
 def _build_vpu_binary_bundle(lhs_i32: np.ndarray, rhs_i32: np.ndarray, num_elems: int, vpu_op: int,
                              lhs_broadcast: bool = False, rhs_broadcast: bool = False) -> str:
+    """VMEM[0]=lhs, VMEM[1]=rhs, VPU v2=OP(v0,v1), OUTPUT_VMEM VMEM[2]."""
     def tile(vals: np.ndarray) -> list[int]:
         padded = np.zeros(_ROWS * _COLS, dtype=np.int32)
         padded[:num_elems] = vals[:num_elems]
         return [int(x) for x in padded]
 
-    lines: list[str] = []
-    lines.append("5 0 " + " ".join(str(x) for x in tile(lhs_i32)))
-    lines.append("5 1 " + " ".join(str(x) for x in tile(rhs_i32)))
-    # LOAD VMEM[0]->v0, optional XLU broadcast, LOAD VMEM[1]->v1,
-    # optional XLU broadcast, VPU op v0/v1->v2, STORE v2->VMEM[2]
-    lines.append(f"2 {_SXU_OPS['LOAD_VREG']} 0 0 0 0 0 0 0 0")
+    lines = [
+        _vmem(0, tile(lhs_i32)),   # VMEM[0] = lhs tile
+        _vmem(1, tile(rhs_i32)),   # VMEM[1] = rhs tile
+        _load(0, 0),               # LOAD v0, VMEM[0]
+    ]
     if lhs_broadcast:
-        lines.append(f"2 {_SXU_OPS['DISPATCH_XLU_BROADCAST']} 0 0 0 0 0 0 0 0")
-    lines.append(f"2 {_SXU_OPS['LOAD_VREG']} 1 1 0 0 0 0 0 0")
+        lines.append(_broadcast(0))              # BROADCAST v0
+    lines.append(_load(1, 1))                    # LOAD v1, VMEM[1]
     if rhs_broadcast:
-        lines.append(f"2 {_SXU_OPS['DISPATCH_XLU_BROADCAST']} 0 1 1 0 0 0 0 0")
-    lines.append(f"2 {_SXU_OPS['DISPATCH_VPU']} 0 2 0 {vpu_op} 1 0 0 0")
-    lines.append(f"2 {_SXU_OPS['STORE_VREG']} 2 0 2 0 0 0 0 0")
-    lines.append(f"2 {_SXU_OPS['HALT']} 0 0 0 0 0 0 0 0")
-    lines.append("6 2")
-    lines.append("4")
-    return "\n".join(lines) + "\n"
+        lines.append(_broadcast(1))              # BROADCAST v1
+    lines += [
+        _vpu(2, 0, vpu_op, 1),  # VPU v2 = OP(v0, v1)
+        _store(2, 2),            # STORE VMEM[2], v2
+        _halt(),                 # HALT
+        _output_vmem(2),         # OUTPUT_VMEM VMEM[2]
+        _end(),                  # END
+    ]
+    return _bundle(*lines)
 
 
 def _build_vpu_unary_bundle(src_i32: np.ndarray, num_elems: int, vpu_op: int) -> str:
+    """VMEM[0]=src, VPU v1=OP(v0), OUTPUT_VMEM VMEM[2]."""
     padded = np.zeros(_ROWS * _COLS, dtype=np.int32)
     padded[:num_elems] = src_i32[:num_elems]
-
-    lines: list[str] = []
-    lines.append("5 0 " + " ".join(str(int(x)) for x in padded))
-    # LOAD VMEM[0]->v0, VPU unary op v0->v1, STORE v1->VMEM[2]
-    lines.append(f"2 {_SXU_OPS['LOAD_VREG']} 0 0 0 0 0 0 0 0")
-    lines.append(f"2 {_SXU_OPS['DISPATCH_VPU']} 0 1 0 {vpu_op} 0 0 0 0")
-    lines.append(f"2 {_SXU_OPS['STORE_VREG']} 2 0 1 0 0 0 0 0")
-    lines.append(f"2 {_SXU_OPS['HALT']} 0 0 0 0 0 0 0 0")
-    lines.append("6 2")
-    lines.append("4")
-    return "\n".join(lines) + "\n"
+    return _bundle(
+        _vmem(0, [int(x) for x in padded]),  # VMEM[0] = src tile
+        _load(0, 0),                          # LOAD v0, VMEM[0]
+        _vpu(1, 0, vpu_op),                   # VPU v1 = OP(v0)  [unary: vb=0]
+        _store(2, 1),                         # STORE VMEM[2], v1
+        _halt(),                              # HALT
+        _output_vmem(2),                      # OUTPUT_VMEM VMEM[2]
+        _end(),                               # END
+    )
 
 
 def _build_vpu_where_bundle(cond_i32: np.ndarray, lhs_i32: np.ndarray, rhs_i32: np.ndarray, num_elems: int) -> str:
