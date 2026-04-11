@@ -254,7 +254,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
                    and op_counts.get("STORE", 0) == 1
                    and param_sizes.get(1) is not None
                    and param_sizes.get(0) is not None
-                   and 1 < param_sizes.get(0, 0) <= _ROWS
+                   and 1 < param_sizes.get(0, 0)
                    and param_sizes.get(1) == param_sizes.get(0, 0) * _COLS)
     if _is_rowwise:
         nrows = param_sizes[0]
@@ -1620,23 +1620,27 @@ class TinyTPUProgram:
             src_i32  = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<i4")
             num_rows = int(prog["num_rows"])
             num_cols = int(prog["num_cols"])
-            if src_i32.size != num_rows * num_cols:
+            if src_i32.size < num_rows * num_cols:
                 raise RuntimeError(
-                    f"TinyTPU VPU_ROWSUM expected {num_rows*num_cols} elements, "
+                    f"TinyTPU VPU_ROWSUM expected at least {num_rows*num_cols} elements, "
                     f"got {src_i32.size}")
+            src_i32 = src_i32[:num_rows * num_cols]  # trim tinygrad buffer padding
             sim = _sim_path()
-            # Pad to a full _ROWS × _COLS tile for the hardware
-            padded = np.zeros(_TILE_ELEMS, dtype=np.int32)
-            padded[:num_rows * num_cols] = src_i32
             row_vpu_op = int(prog.get("vpu_op", 4))  # default 4=SUM_REDUCE
-            stdout = _run_bundle(sim, _build_vpu_unary_bundle(padded, _TILE_ELEMS, row_vpu_op))
-            result = _parse_vmem_output(stdout)
-            if result is None:
-                raise RuntimeError(
-                    f"TinyTPU VPU_ROWSUM: sim produced no vmem_result\nstdout: {stdout}")
-            # SUM_REDUCE broadcasts row-sum to all 4 lanes; take lane 0 of each row
-            row_sums = np.array(
-                [result[r * _COLS] for r in range(num_rows)], dtype=np.int32)
+            # Run VPU in _ROWS-row tiles; extract lane-0 per row across all tiles.
+            all_row_results: list[int] = []
+            for tile_start in range(0, num_rows, _ROWS):
+                tile_end = min(tile_start + _ROWS, num_rows)
+                tile_nrows = tile_end - tile_start
+                tile_padded = np.zeros(_TILE_ELEMS, dtype=np.int32)
+                tile_padded[:tile_nrows * num_cols] = src_i32[tile_start * num_cols:tile_end * num_cols]
+                tile_stdout = _run_bundle(sim, _build_vpu_unary_bundle(tile_padded, _TILE_ELEMS, row_vpu_op))
+                tile_result = _parse_vmem_output(tile_stdout)
+                if tile_result is None:
+                    raise RuntimeError(
+                        f"TinyTPU VPU_ROWSUM tile {tile_start}: no vmem_result\nstdout: {tile_stdout}")
+                all_row_results.extend(tile_result[r * _COLS] for r in range(tile_nrows))
+            row_sums = np.array(all_row_results, dtype=np.int32)
             out_buf[:num_rows * _BYTES_PER_ELEM] = row_sums.tobytes()
             return 1e-3
 
