@@ -382,7 +382,10 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
     if len(set(src_sizes)) > 1 or (src_sizes and src_sizes[0] != out_size):
         return None
     alu_uops = [u for u in uops if u.op in _ALU_MAP]
-    is_relu = op_counts.get("WHERE", 0) > 0 and op_counts.get("CMPLT", 0) > 0
+    # RELU: WHERE+CMPLT with exactly 2 params total (out + src), no other ALU ops
+    is_relu = (op_counts.get("WHERE", 0) > 0 and op_counts.get("CMPLT", 0) > 0
+               and len(params) == 2 and len(src_params) == 1
+               and not any(op_counts.get(k.name, 0) > 0 for k in [Ops.ADD, Ops.MUL, Ops.MAX]))
 
     # Detect SUB pattern: MUL(x, -1) + ADD → emit VPU SUB
     is_neg_add = (op_counts.get("MUL", 0) > 0 and op_counts.get("ADD", 0) > 0
@@ -395,6 +398,11 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
     # Don't handle bool-typed params yet (bool AND/OR/XOR need dtype-aware marshaling)
     if any(not isinstance(p.dtype, PtrDType) or p.dtype.base.itemsize == 1 for p in params.values()):
         return None
+    # Don't handle scalar-const binary ops (e.g. NOT = XOR(x, -1)) — constant isn't a buffer
+    if len(src_params) == 1 and not is_relu and alu_op_types > 0:
+        # Check if it's a true unary (relu handled above) or a const-binary
+        if any(op_counts.get(k.name, 0) > 0 for k in [Ops.XOR, Ops.AND, Ops.OR, Ops.SHL, Ops.SHR]):
+            return None
 
     # Build the VPU instruction sequence for ONE tile
     tile_instrs: list[str] = []
