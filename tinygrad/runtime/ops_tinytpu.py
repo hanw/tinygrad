@@ -28,7 +28,7 @@ _TILE_ELEMS = _ROWS * _COLS   # 16 elements per VMEM tile
 _VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6, "SUB": 7, "CMPEQ": 8, "MAX_REDUCE": 9, "SHL": 10, "SHR": 11, "MIN": 12, "MIN_REDUCE": 13, "DIV": 14, "AND": 15, "OR": 16, "XOR": 17,
              "FADD": 18, "FMUL": 19, "FSUB": 20, "FMAX": 21, "FCMPLT": 22, "FRECIP": 23, "I2F": 24, "F2I": 25, "NOT": 26, "SELECT": 27, "COPY": 28}
 _VPU_BOOL_OPS = {_VPU_OPS["CMPLT"], _VPU_OPS["CMPNE"], _VPU_OPS["CMPEQ"]}
-_SXU_OPS = {"LOAD_VREG": 0, "STORE_VREG": 1, "DISPATCH_VPU": 2, "DISPATCH_XLU_BROADCAST": 3, "DISPATCH_MXU": 4, "WAIT_MXU": 5, "LOAD_MXU_RESULT": 6, "HALT": 7}
+_SXU_OPS = {"LOAD_VREG": 0, "STORE_VREG": 1, "DISPATCH_VPU": 2, "DISPATCH_XLU_BROADCAST": 3, "DISPATCH_MXU": 4, "WAIT_MXU": 5, "LOAD_MXU_RESULT": 6, "HALT": 7, "DISPATCH_SELECT": 8}
 
 _ALU_OPS = {Ops.ADD: "ADD", Ops.MUL: "MUL", Ops.SUB: "SUB", Ops.MAX: "MAX",
             Ops.CMPLT: "CMPLT", Ops.CMPNE: "CMPNE", Ops.CMPEQ: "CMPEQ",
@@ -773,7 +773,6 @@ def _render_where_sxu_program(uops: list[UOp]) -> dict | None:
     if cond_arg is None or lhs_arg is None or rhs_arg is None:
         return None
 
-    COPY_OP, SELECT_OP = _VPU_OPS["COPY"], _VPU_OPS["SELECT"]
     num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
     addrs_per_tile = 4  # cond, lhs, rhs, out
 
@@ -798,9 +797,8 @@ def _render_where_sxu_program(uops: list[UOp]) -> dict | None:
             _load(0, base),         # v0 = cond
             _load(1, base + 1),     # v1 = lhs (true values)
             _load(2, base + 2),     # v2 = rhs (false values)
-            _vpu(3, 2, COPY_OP),    # v3 = rhs, sets resultReg = rhs
-            _vpu(4, 0, SELECT_OP, 1),  # v4 = (cond!=0) ? lhs : resultReg(rhs)
-            _store(out_vmem, 4),
+            _select(3, 0, 1, 2),    # v3 = (cond!=0) ? lhs : rhs
+            _store(out_vmem, 3),
         ]
         outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
 
@@ -808,6 +806,7 @@ def _render_where_sxu_program(uops: list[UOp]) -> dict | None:
 
     return {
         "op": "SXU_PROGRAM",
+        "primitive": "SELECT",
         "instructions": all_instrs,
         "data_plan": data_plan,
         "outputs": outputs,
@@ -1974,6 +1973,9 @@ def _store(vmem_dst: int, vs: int) -> str:
 
 def _vpu(vd: int, va: int, op: int, vb: int = 0) -> str:
     return f"2 2 0 {vd} {va} {op} {vb} 0 0 0"
+
+def _select(vd: int, cond: int, lhs: int, rhs: int) -> str:
+    return f"2 8 0 {vd} {cond} 0 {lhs} {rhs} 0 0"
 
 def _broadcast(vn: int, lane: int = 0) -> str:
     return f"2 3 0 {vn} {vn} 0 {lane} 0 0 0"
