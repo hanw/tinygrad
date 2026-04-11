@@ -60,14 +60,12 @@ class TinytpuAllocator(Allocator["TinytpuDevice"]):
 
 
 # ---------------------------------------------------------------------------
-# Compiler — validates JSON descriptor, passes through as bytes
+# Compiler — JSON descriptor pass-through (bundle building happens at
+# call time because it needs buffer data). Future: move bundle building
+# here once we have a buffer-independent program format.
 # ---------------------------------------------------------------------------
 class TinyTPUCompiler(Compiler):
-    def compile(self, src: str) -> bytes:
-        prog = json.loads(src)
-        if prog.get("op") == "UNSUPPORTED":
-            pass  # let the runtime raise NotImplementedError with the full diagnostic
-        return src.encode()
+    pass
 
 
 # ---------------------------------------------------------------------------
