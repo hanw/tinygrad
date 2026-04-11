@@ -803,9 +803,9 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
     has_bool_out = isinstance(params[out_arg].dtype, PtrDType) and params[out_arg].dtype.base.itemsize == 1
 
     # Detect SUB pattern: MUL(x, -1) + ADD → emit VPU SUB
-    # Must be exactly MUL+ADD with 2 src params (not XOR+MAX MIN decomposition)
-    is_neg_add = (len(src_params) == 2 and alu_op_types == 2
-                  and op_counts.get("MUL", 0) > 0 and op_counts.get("ADD", 0) > 0
+    # Works for both tensor-tensor (2 params) and scalar-const reverse sub (1 param)
+    is_neg_add = (alu_op_types == 2
+                  and set(_ALU_MAP[u.op] for u in alu_uops) == {"MUL", "ADD"}
                   and any(u.op is Ops.CONST and u.arg == -1 for u in uops))
 
     # Only handle single-ALU-op kernels (not multi-op patterns like abs=MUL+MAX)
@@ -867,25 +867,44 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
         src_params = [lhs_param, rhs_param]
     elif len(src_params) == 1:
         # 1 source param: either unary RELU (handled above), or scalar-const binary
-        # Find the ALU op from data-path UOps only
-        vpu_name = None
-        alu_op_enum = None
-        for op_enum, name in _ALU_MAP.items():
-            if any(u.op is op_enum for u in alu_uops):
-                alu_op_enum = op_enum
-                vpu_name = name
-                break
-        if vpu_name is None:
-            return None
-
-        # Find the constant value from the UOp graph
-        const_val = _find_alu_const(alu_uops, alu_op_enum)
-        if const_val is None:
-            return None
+        if is_neg_add:
+            # Scalar-const reverse sub: const - x = ADD(MUL(x, -1), const)
+            vpu_name = "SUB"
+            alu_op_enum = Ops.ADD
+            # The constant is the non-(-1) CONST source of the ADD
+            add_uops = [u for u in alu_uops if u.op is Ops.ADD]
+            const_val = None
+            for u in add_uops:
+                for s in u.src:
+                    if s.op is Ops.CONST and s.arg != -1 and not isinstance(s.arg, bool):
+                        const_val = s.arg
+                        break
+                if const_val is not None: break
+            if const_val is None:
+                return None
+        else:
+            # Find the ALU op from data-path UOps only
+            vpu_name = None
+            alu_op_enum = None
+            for op_enum, name in _ALU_MAP.items():
+                if any(u.op is op_enum for u in alu_uops):
+                    alu_op_enum = op_enum
+                    vpu_name = name
+                    break
+            if vpu_name is None:
+                return None
+            # Find the constant value from the UOp graph
+            const_val = _find_alu_const(alu_uops, alu_op_enum)
+            if const_val is None:
+                return None
 
         # Determine operand order: is src the lhs or rhs?
-        alu_uop = next(u for u in alu_uops if u.op is alu_op_enum)
-        src_is_lhs = _find_unique_param_arg(alu_uop.src[0]) is not None
+        if is_neg_add:
+            # Reverse sub: const - x → SUB(const, x), const is lhs
+            src_is_lhs = False
+        else:
+            alu_uop = next(u for u in alu_uops if u.op is alu_op_enum)
+            src_is_lhs = _find_unique_param_arg(alu_uop.src[0]) is not None
 
         tile_vpu_op = _VPU_OPS[vpu_name]
         is_bool_out_flag = is_bool_out_flag or vpu_name in {"CMPLT", "CMPNE", "CMPEQ"}
