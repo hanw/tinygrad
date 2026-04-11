@@ -1250,59 +1250,23 @@ def _dump_lowering(desc:str) -> str:
     return desc
 
 def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
+    """Slim legacy analyzer — only handles VPU_BINARY, VPU_PROGRAM, VPU_ROWBC_BINARY patterns
+    not yet migrated to SXU_PROGRAM (scalar-const DIV/MIN/MOD, row-broadcast binary)."""
     params = [u for u in uops if u.op is Ops.PARAM]
     op_counts = Counter(u.op.name for u in uops)
-    has_mulacc = any(u.op is Ops.MULACC for u in uops)
-    has_mul = any(u.op is Ops.MUL for u in uops)
-    has_range = any(u.op is Ops.RANGE for u in uops)
-    has_store = any(u.op is Ops.STORE for u in uops)
-    is_gemm = has_mulacc or (len(params) == 3 and has_mul and has_range and has_store)
 
     diag = {
-        "supported": False,
-        "kind": None,
-        "reason": "",
-        "missing_instructions": [],
-        "notes": [],
-        "op_counts": dict(sorted(op_counts.items())),
-        "out_arg": None, "act_arg": None, "weight_arg": None,
-        "src_arg": None,
-        "lhs_arg": None, "lhs_const": None, "rhs_arg": None,
-        "rhs_const": None,
-        "num_elems": None,
-        "out_elems": None,
-        "vpu_op": None,
-        "inputs": None,
-        "steps": None,
-        "output_reg": None,
-        "host_op": None,
-        "host_dtype": None,
-        "lhs_broadcast": False,
-        "rhs_broadcast": False,
-        "num_vecs": None,
-        "num_k_tiles": None,
-        "num_weight_tiles": None,
+        "supported": False, "kind": None, "reason": "", "notes": [],
+        "out_arg": None, "lhs_arg": None, "lhs_const": None, "rhs_arg": None, "rhs_const": None,
+        "num_elems": None, "vpu_op": None, "inputs": None, "steps": None, "output_reg": None,
+        "lhs_broadcast": False, "rhs_broadcast": False,
     }
 
     param_sizes: dict[int, int] = {}
     for p in params:
         if not isinstance(p.dtype, PtrDType):
-            diag["reason"] = "non-ptr param"
-            diag["notes"].append("TinyTPU kernels currently expect pointer-backed buffers only.")
             return diag
         param_sizes[p.arg] = p.dtype.size
-
-    if len(param_sizes) == 1 and has_range and has_store and op_counts.get("GROUP", 0) == 1 and op_counts.get("MUL", 0) > 0:
-        diag["reason"] = "zero-sized gemm"
-        diag["notes"].append("Zero-sized GEMM buffers are not lowered through the current TinyTPU path.")
-        diag["missing_instructions"] = ["SXU_DISPATCH_VPU", "SXU_LOAD_VREG", "SXU_STORE_VREG"]
-        return diag
-
-    if is_gemm and (len(param_sizes) == 1 or (param_sizes and all(sz == 0 for sz in param_sizes.values()))):
-        diag["reason"] = "zero-sized gemm"
-        diag["notes"].append("Zero-sized GEMM buffers are not lowered through the current TinyTPU path.")
-        diag["missing_instructions"] = ["SXU_DISPATCH_VPU", "SXU_LOAD_VREG", "SXU_STORE_VREG"]
-        return diag
 
     binary_vpu_ops = _VPU_OPS
     matched_single_binary_ops = [name for name in binary_vpu_ops if op_counts.get(name, 0) in {1, 4}]
@@ -1838,40 +1802,6 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
             return diag
         diag["reason"] = f"unsupported vpu or sizes {dict(sorted(param_sizes.items()))}"
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    else:
-        diag["reason"] = f"params={len(params)} gemm={is_gemm}"
-
-    missing: list[str] = []
-    notes: list[str] = []
-    uses_load_store = op_counts.get("LOAD", 0) > 0 or op_counts.get("STORE", 0) > 0
-    uses_cmp_select = op_counts.get("CMPLT", 0) > 0 or op_counts.get("WHERE", 0) > 0
-    uses_group = op_counts.get("GROUP", 0) > 0
-    multi_store = op_counts.get("STORE", 0) > 1
-
-    if is_gemm and (uses_cmp_select or multi_store or uses_group):
-        missing.extend(["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"])
-        notes.append("This looks like a fused MXU kernel with a pointwise epilogue. TinyTPU only lowers the bare GEMM today.")
-        notes.append("To support this, the compiler needs to split or lower the epilogue and provide a path from MXU results into the VPU/VMEM pipeline.")
-    elif uses_load_store:
-        missing.extend(["SXU_LOAD_VREG", "SXU_STORE_VREG"])
-        notes.append("General VMEM<->VReg movement kernels are not lowered yet.")
-
-    if uses_cmp_select:
-        missing.append("SXU_DISPATCH_VPU")
-        notes.append("Compare/select UOps are present. For ReLU-like cases this likely maps to a VPU epilogue.")
-
-    if op_counts.get("CMPLT", 0) == 4 and op_counts.get("WHERE", 0) == 4:
-        notes.append("The UOp pattern matches a lane-wise ReLU/select epilogue.")
-
-    if uses_group:
-        notes.append("GROUP indicates multi-store/vector pack behavior that the TinyTPU backend does not currently lower.")
-
-    if not missing:
-        missing.append("unknown lowering gap")
-        notes.append("Inspect the op counts and UOps for a new lowering rule.")
-
-    diag["missing_instructions"] = sorted(set(missing))
-    diag["notes"].extend(notes)
     return diag
 
 
