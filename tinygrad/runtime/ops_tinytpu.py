@@ -25,8 +25,9 @@ _ROWS   = 4
 _COLS   = 4
 _BYTES_PER_ELEM = 4           # Int#(32) = 4 bytes
 _TILE_ELEMS = _ROWS * _COLS   # 16 elements per VMEM tile
-_VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6, "SUB": 7, "CMPEQ": 8, "MAX_REDUCE": 9, "SHL": 10, "SHR": 11, "MIN": 12, "MIN_REDUCE": 13}
+_VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6, "SUB": 7, "CMPEQ": 8, "MAX_REDUCE": 9, "SHL": 10, "SHR": 11, "MIN": 12, "MIN_REDUCE": 13, "DIV": 14, "AND": 15, "OR": 16, "XOR": 17}
 _VPU_BOOL_OPS = {_VPU_OPS["CMPLT"], _VPU_OPS["CMPNE"], _VPU_OPS["CMPEQ"]}
+_SXU_OPS = {"LOAD_VREG": 0, "STORE_VREG": 1, "DISPATCH_VPU": 2, "DISPATCH_XLU_BROADCAST": 3, "DISPATCH_MXU": 4, "WAIT_MXU": 5, "HALT": 6}
 
 def _sim_path() -> str:
     if (p := os.environ.get("TINYTPU_SIM")):
@@ -91,8 +92,10 @@ class TinyTPURenderer(Renderer):
                                                   "out": diag["out_arg"],
                                                   "lhs": diag["lhs_arg"],
                                                   "lhs_const": diag["lhs_const"],
+                                                  "lhs_broadcast": diag.get("lhs_broadcast", False),
                                                   "rhs": diag["rhs_arg"],
                                                   "rhs_const": diag["rhs_const"],
+                                                  "rhs_broadcast": diag.get("rhs_broadcast", False),
                                                   "num_elems": diag["num_elems"],
                                                   "bool_out": diag.get("bool_out", False),
                                                   "bool_in": diag.get("bool_in", False)}))
@@ -109,6 +112,35 @@ class TinyTPURenderer(Renderer):
                                                   "cond": diag["cond_arg"],
                                                   "lhs": diag["lhs_arg"],
                                                   "rhs": diag["rhs_arg"],
+                                                  "num_elems": diag["num_elems"]}))
+            if diag["kind"] == "vpu_rowsum":
+                return _dump_lowering(json.dumps({"op": "VPU_ROWSUM",
+                                                  "out": diag["out_arg"],
+                                                  "src": diag["src_arg"],
+                                                  "num_rows": diag["num_rows"],
+                                                  "num_cols": diag["num_cols"]}))
+            if diag["kind"] == "vpu_program":
+                return _dump_lowering(json.dumps({"op": "VPU_PROGRAM",
+                                                  "out": diag["out_arg"],
+                                                  "num_elems": diag["num_elems"],
+                                                  "inputs": diag["inputs"],
+                                                  "steps": diag["steps"],
+                                                  "output_reg": diag["output_reg"]}))
+            if diag["kind"] == "host_binary":
+                return _dump_lowering(json.dumps({"op": "HOST_BINARY",
+                                                  "host_op": diag["host_op"],
+                                                  "out": diag["out_arg"],
+                                                  "lhs": diag["lhs_arg"],
+                                                  "lhs_const": diag["lhs_const"],
+                                                  "rhs": diag["rhs_arg"],
+                                                  "rhs_const": diag["rhs_const"],
+                                                  "num_elems": diag["num_elems"]}))
+            if diag["kind"] == "host_unary":
+                return _dump_lowering(json.dumps({"op": "HOST_UNARY",
+                                                  "host_op": diag["host_op"],
+                                                  "dtype": diag["host_dtype"],
+                                                  "out": diag["out_arg"],
+                                                  "src": diag["src_arg"],
                                                   "num_elems": diag["num_elems"]}))
         return _dump_lowering(json.dumps({
             "op": "UNSUPPORTED",
@@ -137,7 +169,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     has_mul = any(u.op is Ops.MUL for u in uops)
     has_range = any(u.op is Ops.RANGE for u in uops)
     has_store = any(u.op is Ops.STORE for u in uops)
-    is_gemm = has_mulacc or (has_mul and has_range)
+    is_gemm = has_mulacc or (len(params) == 3 and has_mul and has_range and has_store)
 
     diag = {
         "supported": False,
@@ -153,6 +185,13 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         "num_elems": None,
         "out_elems": None,
         "vpu_op": None,
+        "inputs": None,
+        "steps": None,
+        "output_reg": None,
+        "host_op": None,
+        "host_dtype": None,
+        "lhs_broadcast": False,
+        "rhs_broadcast": False,
         "num_vecs": None,
         "num_k_tiles": None,
         "num_weight_tiles": None,
@@ -165,6 +204,12 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
             diag["notes"].append("TinyTPU kernels currently expect pointer-backed buffers only.")
             return diag
         param_sizes[p.arg] = p.dtype.size
+
+    if len(param_sizes) == 1 and has_range and has_store and op_counts.get("GROUP", 0) == 1 and op_counts.get("MUL", 0) > 0:
+        diag["reason"] = "zero-sized gemm"
+        diag["notes"].append("Zero-sized GEMM buffers are not lowered through the current TinyTPU path.")
+        diag["missing_instructions"] = ["SXU_DISPATCH_VPU", "SXU_LOAD_VREG", "SXU_STORE_VREG"]
+        return diag
 
     if is_gemm and (len(param_sizes) == 1 or (param_sizes and all(sz == 0 for sz in param_sizes.values()))):
         diag["reason"] = "zero-sized gemm"
@@ -180,15 +225,20 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     scalar_const_binary_ops = [name for name in binary_vpu_ops
                                if op_counts.get(name, 0) in {1, 4} and _find_scalar_const_binary(uops, name) is not None]
     if out_is_bool:
-        scalar_const_binary_ops = [name for name in scalar_const_binary_ops if name in {"CMPLT", "CMPNE"}]
+        scalar_const_binary_ops = [name for name in scalar_const_binary_ops if name in {"CMPLT", "CMPNE", "XOR"}]
     else:
-        scalar_const_binary_ops = [name for name in scalar_const_binary_ops if name in {"ADD", "MUL", "MAX", "SUB", "SHL", "SHR"}]
+        scalar_const_binary_ops = [name for name in scalar_const_binary_ops if name in {"ADD", "MUL", "MAX", "SUB", "SHL", "SHR", "XOR"}]
+    if out_is_bool and "XOR" in scalar_const_binary_ops and _find_scalar_const_binary(uops, "XOR") == 1:
+        scalar_const_binary_ops = ["XOR"]
     if len(scalar_const_binary_ops) > 1:
         scalar_const_binary_ops = [max(scalar_const_binary_ops, key=lambda n: op_counts.get(n, 0))]
     scalar_const = _find_scalar_const_binary(uops, scalar_const_binary_ops[0]) if len(scalar_const_binary_ops) == 1 else None
     reverse_sub_const = _find_reverse_sub_const(uops)
     eq_scalar_const = _find_eq_scalar_const(uops)
     is_eq_from_cmpne = _has_eq_from_cmpne(uops)
+    clip_consts = _find_clip_consts(uops)
+    bool_cast = _find_bool_to_int_cast(uops)
+    divmod_pattern = _classify_divmod_pattern(uops)
     # tinygrad may leave pointer reads as INDEX nodes for a fully upcast 16-lane
     # tile, while smaller tiles materialize explicit LOAD UOps.
     _has_bool_logic_op = op_counts.get("AND", 0) > 0 or op_counts.get("OR", 0) > 0 or op_counts.get("XOR", 0) > 0
@@ -196,6 +246,26 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     is_single_binary = len(params) == 3 and len(matched_single_binary_ops) == 1 and op_counts.get("LOAD", 0) in {0, 2} and op_counts.get("STORE", 0) == 1 and not _has_bool_logic_op
     _has_fused_cmp = op_counts.get("CMPLT", 0) > 0 and op_counts.get("WHERE", 0) > 0
     is_grouped_binary = len(params) == 3 and len(matched_grouped_binary_ops) == 1 and op_counts.get("STORE", 0) == 4 and op_counts.get("GROUP", 0) == 1 and not _has_bool_logic_op and not _has_fused_cmp
+    if (len(params) == 2
+            and op_counts.get("RANGE", 0) == 1
+            and op_counts.get("MUL", 0) == 1
+            and op_counts.get("LOAD", 0) == 4
+            and op_counts.get("STORE", 0) == 1
+            and param_sizes.get(1) is not None
+            and param_sizes.get(0) is not None
+            and 1 < param_sizes.get(0, 0) <= _ROWS
+            and param_sizes.get(1) == param_sizes.get(0, 0) * _COLS):
+        nrows = param_sizes[0]
+        diag.update({
+            "supported": True,
+            "kind": "vpu_rowsum",
+            "reason": f"supported row-wise sum {nrows}x{_COLS}",
+            "out_arg": 0,
+            "src_arg": 1,
+            "num_rows": nrows,
+            "num_cols": _COLS,
+        })
+        return diag
     if len(params) == 2 and op_counts.get("STORE", 0) == 1 and op_counts.get("ADD", 0) > 0 and param_sizes.get(0) == 1:
         out_size = param_sizes.get(0)
         src_size = param_sizes.get(1)
@@ -306,6 +376,157 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["reason"] = f"unsupported vpu relu sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append("Current TinyTPU VPU RELU lowering handles one int32 VMEM tile with 1..16 elements.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
+    elif len(params) in {2, 3} and divmod_pattern is not None and divmod_pattern[0] == "IDIV":
+        _, rhs_const = divmod_pattern
+        out_size, input_args = _resolve_binary_io(param_sizes)
+        if out_size is not None and len(input_args) >= 1 and 0 < out_size and all(param_sizes[arg] in {1, out_size} for arg in input_args):
+            diag.update({
+                "supported": True,
+                "kind": "vpu_binary",
+                "reason": "supported vpu div",
+                "out_arg": 0,
+                "lhs_arg": input_args[0],
+                "lhs_const": None,
+                "rhs_arg": input_args[1] if len(input_args) > 1 else None,
+                "rhs_const": rhs_const,
+                "lhs_broadcast": _arg_needs_broadcast(input_args[0], param_sizes, out_size),
+                "rhs_broadcast": _arg_needs_broadcast(input_args[1], param_sizes, out_size) if len(input_args) > 1 else False,
+                "num_elems": out_size,
+                "vpu_op": binary_vpu_ops["DIV"],
+            })
+            return diag
+        diag["reason"] = f"unsupported vpu div sizes {dict(sorted(param_sizes.items()))}"
+        diag["notes"].append("Current TinyTPU VPU DIV lowering handles int32 elementwise outputs with optional scalar broadcasting.")
+        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
+    elif len(params) in {2, 3} and divmod_pattern is not None and divmod_pattern[0] == "MOD":
+        _, rhs_const = divmod_pattern
+        out_size, input_args = _resolve_binary_io(param_sizes)
+        if out_size is not None and len(input_args) >= 1 and 0 < out_size and all(param_sizes[arg] in {1, out_size} for arg in input_args):
+            inputs = [{"arg": input_args[0], "bool": False, "broadcast": _arg_needs_broadcast(input_args[0], param_sizes, out_size)}]
+            rhs_ref: int
+            if rhs_const is not None:
+                inputs.append({"const": rhs_const})
+                rhs_ref = 1
+            else:
+                inputs.append({"arg": input_args[1], "bool": False, "broadcast": _arg_needs_broadcast(input_args[1], param_sizes, out_size)})
+                rhs_ref = 1
+            diag.update({
+                "supported": True,
+                "kind": "vpu_program",
+                "reason": "supported mod via div/mul/sub bundle",
+                "out_arg": 0,
+                "num_elems": out_size,
+                "inputs": inputs,
+                "steps": [
+                    {"op": binary_vpu_ops["DIV"], "lhs": 0, "rhs": rhs_ref, "dst": 2},
+                    {"op": binary_vpu_ops["MUL"], "lhs": 2, "rhs": rhs_ref, "dst": 3},
+                    {"op": binary_vpu_ops["SUB"], "lhs": 0, "rhs": 3, "dst": 4},
+                ],
+                "output_reg": 4,
+            })
+            return diag
+        diag["reason"] = f"unsupported mod sizes {dict(sorted(param_sizes.items()))}"
+        diag["notes"].append("Current TinyTPU MOD lowering handles int32 elementwise outputs with optional scalar broadcasting.")
+        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
+    elif len(params) == 2 and bool_cast:
+        out_size = param_sizes.get(0)
+        src_size = param_sizes.get(1)
+        if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size:
+            diag.update({
+                "supported": True,
+                "kind": "vpu_binary",
+                "reason": "supported bool to int32 cast",
+                "out_arg": 0,
+                "lhs_arg": 1,
+                "lhs_const": None,
+                "rhs_arg": None,
+                "rhs_const": 1,
+                "lhs_broadcast": False,
+                "rhs_broadcast": False,
+                "num_elems": src_size,
+                "vpu_op": binary_vpu_ops["MUL"],
+                "bool_in": True,
+            })
+            return diag
+        diag["reason"] = f"unsupported bool to int32 cast sizes {dict(sorted(param_sizes.items()))}"
+        diag["notes"].append("Current TinyTPU bool->int32 cast lowering handles one bool VMEM tile with 1..16 elements.")
+        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
+    elif len(params) == 2 and clip_consts is not None and op_counts.get("STORE", 0) in {1, 4}:
+        lo_const, hi_const = clip_consts
+        out_size = param_sizes.get(0)
+        src_size = param_sizes.get(1)
+        if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size:
+            diag.update({
+                "supported": True,
+                "kind": "vpu_program",
+                "reason": "supported clip via min/max bundle",
+                "out_arg": 0,
+                "num_elems": src_size,
+                "inputs": [
+                    {"arg": 1, "bool": False, "broadcast": False},
+                    {"const": hi_const},
+                    {"const": lo_const},
+                ],
+                "steps": [
+                    {"op": binary_vpu_ops["MIN"], "lhs": 0, "rhs": 1, "dst": 3},
+                    {"op": binary_vpu_ops["MAX"], "lhs": 3, "rhs": 2, "dst": 4},
+                ],
+                "output_reg": 4,
+            })
+            return diag
+        diag["reason"] = f"unsupported clip sizes {dict(sorted(param_sizes.items()))}"
+        diag["notes"].append("Current TinyTPU clip lowering handles one int32 VMEM tile with 1..16 elements.")
+        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
+    elif (len(params) == 2 and not _has_complex_op and op_counts.get("MUL", 0) > 0 and op_counts.get("CMPLT", 0) > 0 and
+          op_counts.get("CMPNE", 0) > 0 and op_counts.get("WHERE", 0) >= 2 and op_counts.get("STORE", 0) in {1, 4}):
+        out_size = param_sizes.get(0)
+        src_size = param_sizes.get(1)
+        if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size:
+            diag.update({
+                "supported": True,
+                "kind": "vpu_program",
+                "reason": "supported abs via sub/max bundle",
+                "out_arg": 0,
+                "num_elems": src_size,
+                "inputs": [
+                    {"arg": 1, "bool": False, "broadcast": False},
+                    {"const": 0},
+                ],
+                "steps": [
+                    {"op": binary_vpu_ops["SUB"], "lhs": 1, "rhs": 0, "dst": 2},
+                    {"op": binary_vpu_ops["MAX"], "lhs": 0, "rhs": 2, "dst": 3},
+                ],
+                "output_reg": 3,
+            })
+            return diag
+        diag["reason"] = f"unsupported abs sizes {dict(sorted(param_sizes.items()))}"
+        diag["notes"].append("Current TinyTPU abs lowering handles one int32 VMEM tile with 1..16 elements.")
+        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
+    elif (len(params) == 3 and op_counts.get("ADD", 0) > 0 and op_counts.get("CMPLT", 0) > 0 and
+          op_counts.get("WHERE", 0) > 0 and op_counts.get("STORE", 0) in {1, 4}):
+        out_size = param_sizes.get(0)
+        input_args = [arg for arg in sorted(param_sizes) if arg != 0]
+        if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] in {1, out_size} for arg in input_args):
+            diag.update({
+                "supported": True,
+                "kind": "vpu_program",
+                "reason": "supported fused add relu",
+                "out_arg": 0,
+                "num_elems": out_size,
+                "inputs": [
+                    {"arg": input_args[0], "bool": False, "broadcast": _arg_needs_broadcast(input_args[0], param_sizes, out_size)},
+                    {"arg": input_args[1], "bool": False, "broadcast": _arg_needs_broadcast(input_args[1], param_sizes, out_size)},
+                ],
+                "steps": [
+                    {"op": binary_vpu_ops["ADD"], "lhs": 0, "rhs": 1, "dst": 2},
+                    {"op": 2, "lhs": 2, "dst": 3},
+                ],
+                "output_reg": 3,
+            })
+            return diag
+        diag["reason"] = f"unsupported fused add relu sizes {dict(sorted(param_sizes.items()))}"
+        diag["notes"].append("Current TinyTPU fused ADD+RELU lowering handles one int32 VMEM tile with 1..16 elements.")
+        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
     elif (len(params) == 2 and reverse_sub_const is not None and not _has_complex_op and op_counts.get("STORE", 0) in {1, 4} and
           (op_counts.get("STORE", 0) == 4 or op_counts.get("LOAD", 0) == 1)):
         out_size = param_sizes.get(0)
@@ -320,6 +541,8 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
                 "lhs_const": reverse_sub_const,
                 "rhs_arg": 1,
                 "rhs_const": None,
+                "lhs_broadcast": False,
+                "rhs_broadcast": False,
                 "num_elems": src_size,
                 "vpu_op": binary_vpu_ops["SUB"],
             })
@@ -327,12 +550,39 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["reason"] = f"unsupported vpu reverse sub const sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append("Current TinyTPU VPU reverse SUB constant lowering handles one int32 VMEM tile with 1..16 elements.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
+    elif (len(params) == 2 and in_is_bool and op_counts.get("XOR", 0) > 0 and _find_scalar_const_binary(uops, "XOR") == 1 and
+          not _has_complex_op and op_counts.get("STORE", 0) in {1, 4} and
+          (op_counts.get("STORE", 0) == 4 or op_counts.get("LOAD", 0) == 1)):
+        out_size = param_sizes.get(0)
+        src_size = param_sizes.get(1)
+        if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size:
+            diag.update({
+                "supported": True,
+                "kind": "vpu_binary",
+                "reason": "supported vpu not",
+                "out_arg": 0,
+                "lhs_arg": 1,
+                "lhs_const": None,
+                "rhs_arg": None,
+                "rhs_const": 1,
+                "lhs_broadcast": False,
+                "rhs_broadcast": False,
+                "num_elems": src_size,
+                "vpu_op": binary_vpu_ops["XOR"],
+                "bool_in": True,
+                "bool_out": True,
+            })
+            return diag
+        diag["reason"] = f"unsupported vpu not sizes {dict(sorted(param_sizes.items()))}"
+        diag["notes"].append("Current TinyTPU VPU NOT lowering handles one bool VMEM tile with 1..16 elements.")
+        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
     elif (len(params) == 2 and len(scalar_const_binary_ops) == 1 and scalar_const is not None and not _has_complex_op and op_counts.get("STORE", 0) in {1, 4} and
           (op_counts.get("STORE", 0) == 4 or op_counts.get("LOAD", 0) == 1)):
         op_name = scalar_const_binary_ops[0]
         out_size = param_sizes.get(0)
         src_size = param_sizes.get(1)
         if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size:
+            bool_out = bool(in_is_bool and op_name == "XOR" and scalar_const == 1)
             diag.update({
                 "supported": True,
                 "kind": "vpu_binary",
@@ -342,9 +592,12 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
                 "lhs_const": None,
                 "rhs_arg": None,
                 "rhs_const": scalar_const,
+                "lhs_broadcast": False,
+                "rhs_broadcast": False,
                 "num_elems": src_size,
                 "vpu_op": binary_vpu_ops[op_name],
                 "bool_in": in_is_bool,
+                "bool_out": bool_out,
             })
             return diag
         diag["reason"] = f"unsupported vpu {op_name.lower()} const sizes {dict(sorted(param_sizes.items()))}"
@@ -364,6 +617,8 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
                 "lhs_const": None,
                 "rhs_arg": None,
                 "rhs_const": eq_scalar_const,
+                "lhs_broadcast": False,
+                "rhs_broadcast": False,
                 "num_elems": src_size,
                 "vpu_op": binary_vpu_ops["CMPEQ"],
             })
@@ -375,7 +630,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
           (op_counts.get("STORE", 0) == 4 or op_counts.get("LOAD", 0) in {0, 2})):
         out_size = param_sizes.get(0)
         input_args = [arg for arg in sorted(param_sizes) if arg != 0]
-        if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] == out_size for arg in input_args):
+        if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] in {1, out_size} for arg in input_args):
             diag.update({
                 "supported": True,
                 "kind": "vpu_binary",
@@ -385,6 +640,8 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
                 "lhs_const": None,
                 "rhs_arg": input_args[1],
                 "rhs_const": None,
+                "lhs_broadcast": _arg_needs_broadcast(input_args[0], param_sizes, out_size),
+                "rhs_broadcast": _arg_needs_broadcast(input_args[1], param_sizes, out_size),
                 "num_elems": out_size,
                 "vpu_op": binary_vpu_ops["CMPEQ"],
             })
@@ -398,7 +655,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
           any(u.op is Ops.MUL and _contains_const_int(u, -1) for u in uops)):
         out_size = param_sizes.get(0)
         input_args = [arg for arg in sorted(param_sizes) if arg != 0]
-        if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] == out_size for arg in input_args):
+        if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] in {1, out_size} for arg in input_args):
             diag.update({
                 "supported": True,
                 "kind": "vpu_binary",
@@ -408,6 +665,8 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
                 "lhs_const": None,
                 "rhs_arg": input_args[1],
                 "rhs_const": None,
+                "lhs_broadcast": _arg_needs_broadcast(input_args[0], param_sizes, out_size),
+                "rhs_broadcast": _arg_needs_broadcast(input_args[1], param_sizes, out_size),
                 "num_elems": out_size,
                 "vpu_op": binary_vpu_ops["SUB"],
             })
@@ -419,7 +678,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         op_name = (matched_single_binary_ops if is_single_binary else matched_grouped_binary_ops)[0]
         out_size = param_sizes.get(0)
         input_args = [arg for arg in sorted(param_sizes) if arg != 0]
-        if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] == out_size for arg in input_args):
+        if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] in {1, out_size} for arg in input_args):
             diag.update({
                 "supported": True,
                 "kind": "vpu_binary",
@@ -429,6 +688,8 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
                 "lhs_const": None,
                 "rhs_arg": input_args[1],
                 "rhs_const": None,
+                "lhs_broadcast": _arg_needs_broadcast(input_args[0], param_sizes, out_size),
+                "rhs_broadcast": _arg_needs_broadcast(input_args[1], param_sizes, out_size),
                 "num_elems": out_size,
                 "vpu_op": binary_vpu_ops[op_name],
             })
@@ -439,7 +700,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     elif len(params) == 3 and op_counts.get("XOR", 0) > 0 and op_counts.get("MAX", 0) > 0 and not in_is_bool:
         out_size = param_sizes.get(0)
         input_args = [arg for arg in sorted(param_sizes) if arg != 0]
-        if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] == out_size for arg in input_args):
+        if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] in {1, out_size} for arg in input_args):
             diag.update({
                 "supported": True,
                 "kind": "vpu_binary",
@@ -449,6 +710,8 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
                 "lhs_const": None,
                 "rhs_arg": input_args[1],
                 "rhs_const": None,
+                "lhs_broadcast": _arg_needs_broadcast(input_args[0], param_sizes, out_size),
+                "rhs_broadcast": _arg_needs_broadcast(input_args[1], param_sizes, out_size),
                 "num_elems": out_size,
                 "vpu_op": binary_vpu_ops["MIN"],
             })
@@ -458,18 +721,20 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     elif len(params) == 3 and op_counts.get("AND", 0) > 0 and in_is_bool and op_counts.get("STORE", 0) >= 1:
         out_size = param_sizes.get(0)
         input_args = [arg for arg in sorted(param_sizes) if arg != 0]
-        if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] == out_size for arg in input_args):
+        if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] in {1, out_size} for arg in input_args):
             diag.update({
                 "supported": True,
                 "kind": "vpu_binary",
-                "reason": "supported vpu and (via mul)",
+                "reason": "supported vpu and",
                 "out_arg": 0,
                 "lhs_arg": input_args[0],
                 "lhs_const": None,
                 "rhs_arg": input_args[1],
                 "rhs_const": None,
+                "lhs_broadcast": _arg_needs_broadcast(input_args[0], param_sizes, out_size),
+                "rhs_broadcast": _arg_needs_broadcast(input_args[1], param_sizes, out_size),
                 "num_elems": out_size,
-                "vpu_op": binary_vpu_ops["MUL"],
+                "vpu_op": binary_vpu_ops["AND"],
                 "bool_out": True,
             })
             return diag
@@ -478,18 +743,20 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     elif len(params) == 3 and op_counts.get("XOR", 0) > 0 and in_is_bool and op_counts.get("STORE", 0) >= 1:
         out_size = param_sizes.get(0)
         input_args = [arg for arg in sorted(param_sizes) if arg != 0]
-        if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] == out_size for arg in input_args):
+        if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] in {1, out_size} for arg in input_args):
             diag.update({
                 "supported": True,
                 "kind": "vpu_binary",
-                "reason": "supported vpu xor (via cmpne)",
+                "reason": "supported vpu xor",
                 "out_arg": 0,
                 "lhs_arg": input_args[0],
                 "lhs_const": None,
                 "rhs_arg": input_args[1],
                 "rhs_const": None,
+                "lhs_broadcast": _arg_needs_broadcast(input_args[0], param_sizes, out_size),
+                "rhs_broadcast": _arg_needs_broadcast(input_args[1], param_sizes, out_size),
                 "num_elems": out_size,
-                "vpu_op": binary_vpu_ops["CMPNE"],
+                "vpu_op": binary_vpu_ops["XOR"],
                 "bool_out": True,
             })
             return diag
@@ -498,18 +765,20 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     elif len(params) == 3 and op_counts.get("OR", 0) > 0 and in_is_bool and op_counts.get("STORE", 0) >= 1:
         out_size = param_sizes.get(0)
         input_args = [arg for arg in sorted(param_sizes) if arg != 0]
-        if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] == out_size for arg in input_args):
+        if out_size is not None and len(input_args) == 2 and 0 < out_size and all(param_sizes[arg] in {1, out_size} for arg in input_args):
             diag.update({
                 "supported": True,
                 "kind": "vpu_binary",
-                "reason": "supported vpu or (via max)",
+                "reason": "supported vpu or",
                 "out_arg": 0,
                 "lhs_arg": input_args[0],
                 "lhs_const": None,
                 "rhs_arg": input_args[1],
                 "rhs_const": None,
+                "lhs_broadcast": _arg_needs_broadcast(input_args[0], param_sizes, out_size),
+                "rhs_broadcast": _arg_needs_broadcast(input_args[1], param_sizes, out_size),
                 "num_elems": out_size,
-                "vpu_op": binary_vpu_ops["MAX"],
+                "vpu_op": binary_vpu_ops["OR"],
                 "bool_out": True,
             })
             return diag
@@ -518,7 +787,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     elif len(params) == 4 and op_counts.get("WHERE", 0) > 0:
         out_size = param_sizes.get(0)
         input_args = [arg for arg in sorted(param_sizes) if arg != 0]
-        if out_size is not None and len(input_args) == 3 and 0 < out_size and all(param_sizes[arg] == out_size for arg in input_args):
+        if out_size is not None and len(input_args) == 3 and 0 < out_size and all(param_sizes[arg] in {1, out_size} for arg in input_args):
             diag.update({
                 "supported": True,
                 "kind": "vpu_where",
@@ -533,6 +802,36 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["reason"] = f"unsupported vpu where sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append("Current TinyTPU VPU WHERE lowering handles int32 VMEM tiles.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
+    elif (len(params) == 2 and op_counts.get("TRUNC", 0) > 0 and "float" in str(params[0].dtype) and "float" in str(params[1].dtype)):
+        out_size = param_sizes.get(0)
+        src_size = param_sizes.get(1)
+        if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size:
+            diag.update({
+                "supported": True,
+                "kind": "host_unary",
+                "reason": "supported host trunc fallback",
+                "host_op": "TRUNC",
+                "host_dtype": "float32",
+                "out_arg": 0,
+                "src_arg": 1,
+                "num_elems": src_size,
+            })
+            return diag
+    elif (len(params) == 2 and op_counts.get("RECIPROCAL", 0) > 0 and "float" in str(params[0].dtype) and "float" in str(params[1].dtype)):
+        out_size = param_sizes.get(0)
+        src_size = param_sizes.get(1)
+        if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size:
+            diag.update({
+                "supported": True,
+                "kind": "host_unary",
+                "reason": "supported host reciprocal fallback",
+                "host_op": "RECIPROCAL",
+                "host_dtype": "float32",
+                "out_arg": 0,
+                "src_arg": 1,
+                "num_elems": src_size,
+            })
+            return diag
     elif len(params) == 3 and is_gemm and has_store:
         sizes = sorted(param_sizes.values())
         candidate_weights = [arg for arg, sz in param_sizes.items() if sz >= 16 and sz % 16 == 0]
@@ -692,6 +991,48 @@ def _find_eq_scalar_const(uops:list[UOp]) -> int | None:
     return None
 
 
+def _find_clip_consts(uops:list[UOp]) -> tuple[int, int] | None:
+    for u in uops:
+        if u.op is not Ops.WHERE:
+            continue
+        outer_cond, outer_true, inner = u.src
+        if outer_cond.op is not Ops.CMPLT or outer_true.op is not Ops.CONST or inner.op is not Ops.WHERE:
+            continue
+        inner_cond, inner_true, inner_false = inner.src
+        if inner_cond.op is not Ops.CMPLT or inner_true.op is not Ops.CONST or inner_false.op not in {Ops.INDEX, Ops.LOAD}:
+            continue
+        hi_cmp_lhs, hi_cmp_rhs = outer_cond.src
+        lo_cmp_lhs, lo_cmp_rhs = inner_cond.src
+        if hi_cmp_lhs.op is Ops.CONST and hi_cmp_rhs is inner and lo_cmp_lhs is inner_false and lo_cmp_rhs.op is Ops.CONST:
+            return int(lo_cmp_rhs.arg), int(hi_cmp_lhs.arg)
+    return None
+
+
+def _find_bool_to_int_cast(uops:list[UOp]) -> bool:
+    return any(u.op is Ops.CAST and "bool" in str(u.src[0].dtype) and "int" in str(u.dtype) for u in uops)
+
+
+def _classify_divmod_pattern(uops:list[UOp]) -> tuple[str, int | None] | None:
+    stores = [u for u in uops if u.op is Ops.STORE]
+    if not stores:
+        return None
+    values = [s.src[1] for s in stores]
+    if any(u.op is Ops.IDIV for u in uops) and all(v.op is Ops.WHERE for v in values):
+        return "IDIV", _find_scalar_const_binary(uops, "IDIV")
+    if any(u.op is Ops.MOD for u in uops) and all(v.op is Ops.ADD for v in values):
+        return "MOD", _find_scalar_const_binary(uops, "MOD")
+    return None
+
+
+def _resolve_binary_io(param_sizes: dict[int, int]) -> tuple[int | None, list[int]]:
+    out_size = param_sizes.get(0)
+    return out_size, [arg for arg in sorted(param_sizes) if arg != 0]
+
+
+def _arg_needs_broadcast(arg: int | None, param_sizes: dict[int, int], out_size: int | None) -> bool:
+    return arg is not None and out_size is not None and out_size > 1 and param_sizes.get(arg) == 1
+
+
 # ---------------------------------------------------------------------------
 # Helpers: build text bundle, parse BSV sim output
 # ---------------------------------------------------------------------------
@@ -708,11 +1049,11 @@ def _build_gemm_bundle(weight_i8: np.ndarray, act_i8: np.ndarray) -> str:
     # Record 1: ACT_TILE at SRAM addr 1 — 4 values
     lines.append("1 1 " + " ".join(str(int(x)) for x in act_i8))
     # Record 2: SXU_DISPATCH_MXU (opcode=3): wBase=0 aBase=1 tLen=1
-    lines.append("2 3 0 0 0 0 0 0 1 1")
+    lines.append(f"2 {_SXU_OPS['DISPATCH_MXU']} 0 0 0 0 0 0 1 1")
     # Record 2: SXU_WAIT_MXU (opcode=4)
-    lines.append("2 4 0 0 0 0 0 0 0 0")
+    lines.append(f"2 {_SXU_OPS['WAIT_MXU']} 0 0 0 0 0 0 0 0")
     # Record 2: SXU_HALT (opcode=5)
-    lines.append("2 5 0 0 0 0 0 0 0 0")
+    lines.append(f"2 {_SXU_OPS['HALT']} 0 0 0 0 0 0 0 0")
     # Record 3: OUTPUT_MXU = 1
     lines.append("3 1")
     # Record 4: END
@@ -720,7 +1061,8 @@ def _build_gemm_bundle(weight_i8: np.ndarray, act_i8: np.ndarray) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _build_vpu_binary_bundle(lhs_i32: np.ndarray, rhs_i32: np.ndarray, num_elems: int, vpu_op: int) -> str:
+def _build_vpu_binary_bundle(lhs_i32: np.ndarray, rhs_i32: np.ndarray, num_elems: int, vpu_op: int,
+                             lhs_broadcast: bool = False, rhs_broadcast: bool = False) -> str:
     def tile(vals: np.ndarray) -> list[int]:
         padded = np.zeros(_ROWS * _COLS, dtype=np.int32)
         padded[:num_elems] = vals[:num_elems]
@@ -729,12 +1071,17 @@ def _build_vpu_binary_bundle(lhs_i32: np.ndarray, rhs_i32: np.ndarray, num_elems
     lines: list[str] = []
     lines.append("5 0 " + " ".join(str(x) for x in tile(lhs_i32)))
     lines.append("5 1 " + " ".join(str(x) for x in tile(rhs_i32)))
-    # LOAD VMEM[0]->v0, LOAD VMEM[1]->v1, VPU op v0/v1->v2, STORE v2->VMEM[2]
-    lines.append("2 0 0 0 0 0 0 0 0 0")
-    lines.append("2 0 1 1 0 0 0 0 0 0")
-    lines.append(f"2 2 0 2 0 {vpu_op} 1 0 0 0")
-    lines.append("2 1 2 0 2 0 0 0 0 0")
-    lines.append("2 5 0 0 0 0 0 0 0 0")
+    # LOAD VMEM[0]->v0, optional XLU broadcast, LOAD VMEM[1]->v1,
+    # optional XLU broadcast, VPU op v0/v1->v2, STORE v2->VMEM[2]
+    lines.append(f"2 {_SXU_OPS['LOAD_VREG']} 0 0 0 0 0 0 0 0")
+    if lhs_broadcast:
+        lines.append(f"2 {_SXU_OPS['DISPATCH_XLU_BROADCAST']} 0 0 0 0 0 0 0 0")
+    lines.append(f"2 {_SXU_OPS['LOAD_VREG']} 1 1 0 0 0 0 0 0")
+    if rhs_broadcast:
+        lines.append(f"2 {_SXU_OPS['DISPATCH_XLU_BROADCAST']} 0 1 1 0 0 0 0 0")
+    lines.append(f"2 {_SXU_OPS['DISPATCH_VPU']} 0 2 0 {vpu_op} 1 0 0 0")
+    lines.append(f"2 {_SXU_OPS['STORE_VREG']} 2 0 2 0 0 0 0 0")
+    lines.append(f"2 {_SXU_OPS['HALT']} 0 0 0 0 0 0 0 0")
     lines.append("6 2")
     lines.append("4")
     return "\n".join(lines) + "\n"
@@ -747,10 +1094,10 @@ def _build_vpu_unary_bundle(src_i32: np.ndarray, num_elems: int, vpu_op: int) ->
     lines: list[str] = []
     lines.append("5 0 " + " ".join(str(int(x)) for x in padded))
     # LOAD VMEM[0]->v0, VPU unary op v0->v1, STORE v1->VMEM[2]
-    lines.append("2 0 0 0 0 0 0 0 0 0")
-    lines.append(f"2 2 0 1 0 {vpu_op} 0 0 0 0")
-    lines.append("2 1 2 0 1 0 0 0 0 0")
-    lines.append("2 5 0 0 0 0 0 0 0 0")
+    lines.append(f"2 {_SXU_OPS['LOAD_VREG']} 0 0 0 0 0 0 0 0")
+    lines.append(f"2 {_SXU_OPS['DISPATCH_VPU']} 0 1 0 {vpu_op} 0 0 0 0")
+    lines.append(f"2 {_SXU_OPS['STORE_VREG']} 2 0 1 0 0 0 0 0")
+    lines.append(f"2 {_SXU_OPS['HALT']} 0 0 0 0 0 0 0 0")
     lines.append("6 2")
     lines.append("4")
     return "\n".join(lines) + "\n"
@@ -771,23 +1118,52 @@ def _build_vpu_where_bundle(cond_i32: np.ndarray, lhs_i32: np.ndarray, rhs_i32: 
     lines.append("5 2 " + " ".join(str(x) for x in tile(rhs_i32)))
     lines.append("5 3 " + " ".join(str(x) for x in ones))
     # LOAD cond->v0, lhs->v1, rhs->v2, ones->v3
-    lines.append("2 0 0 0 0 0 0 0 0 0")   # LOAD VMEM[0]->v0
-    lines.append("2 0 1 1 0 0 0 0 0 0")   # LOAD VMEM[1]->v1
-    lines.append("2 0 2 2 0 0 0 0 0 0")   # LOAD VMEM[2]->v2
-    lines.append("2 0 3 3 0 0 0 0 0 0")   # LOAD VMEM[3]->v3
+    lines.append(f"2 {_SXU_OPS['LOAD_VREG']} 0 0 0 0 0 0 0 0")   # LOAD VMEM[0]->v0
+    lines.append(f"2 {_SXU_OPS['LOAD_VREG']} 1 1 0 0 0 0 0 0")   # LOAD VMEM[1]->v1
+    lines.append(f"2 {_SXU_OPS['LOAD_VREG']} 2 2 0 0 0 0 0 0")   # LOAD VMEM[2]->v2
+    lines.append(f"2 {_SXU_OPS['LOAD_VREG']} 3 3 0 0 0 0 0 0")   # LOAD VMEM[3]->v3
     # v4 = cond * lhs (MUL v0, v1 -> v4)
-    lines.append(f"2 2 0 4 0 {_VPU_OPS['MUL']} 1 0 0 0")
+    lines.append(f"2 {_SXU_OPS['DISPATCH_VPU']} 0 4 0 {_VPU_OPS['MUL']} 1 0 0 0")
     # v5 = 1 - cond (SUB v3, v0 -> v5)
-    lines.append(f"2 2 0 5 3 {_VPU_OPS['SUB']} 0 0 0 0")
+    lines.append(f"2 {_SXU_OPS['DISPATCH_VPU']} 0 5 3 {_VPU_OPS['SUB']} 0 0 0 0")
     # v6 = (1-cond) * rhs (MUL v5, v2 -> v6)
-    lines.append(f"2 2 0 6 5 {_VPU_OPS['MUL']} 2 0 0 0")
+    lines.append(f"2 {_SXU_OPS['DISPATCH_VPU']} 0 6 5 {_VPU_OPS['MUL']} 2 0 0 0")
     # v7 = cond*lhs + (1-cond)*rhs (ADD v4, v6 -> v7)
-    lines.append(f"2 2 0 7 4 {_VPU_OPS['ADD']} 6 0 0 0")
+    lines.append(f"2 {_SXU_OPS['DISPATCH_VPU']} 0 7 4 {_VPU_OPS['ADD']} 6 0 0 0")
     # STORE v7 -> VMEM[4]
-    lines.append("2 1 4 0 7 0 0 0 0 0")
-    lines.append("2 5 0 0 0 0 0 0 0 0")   # HALT
+    lines.append(f"2 {_SXU_OPS['STORE_VREG']} 4 0 7 0 0 0 0 0")
+    lines.append(f"2 {_SXU_OPS['HALT']} 0 0 0 0 0 0 0 0")   # HALT
     lines.append("6 4")   # output VMEM[4]
     lines.append("4")     # END
+    return "\n".join(lines) + "\n"
+
+
+def _build_vpu_program_bundle(inputs: list[np.ndarray], num_elems: int, steps: list[dict], output_reg: int,
+                              input_broadcasts: list[bool] | None = None) -> str:
+    def tile(vals: np.ndarray) -> list[int]:
+        padded = np.zeros(_TILE_ELEMS, dtype=np.int32)
+        padded[:num_elems] = vals[:num_elems]
+        return [int(x) for x in padded]
+
+    lines: list[str] = []
+    if input_broadcasts is None:
+        input_broadcasts = [False] * len(inputs)
+    for idx, vals in enumerate(inputs):
+        lines.append("5 " + str(idx) + " " + " ".join(str(x) for x in tile(vals)))
+    for idx in range(len(inputs)):
+        lines.append(f"2 {_SXU_OPS['LOAD_VREG']} {idx} {idx} 0 0 0 0 0 0")
+        if input_broadcasts[idx]:
+            lines.append(f"2 {_SXU_OPS['DISPATCH_XLU_BROADCAST']} 0 {idx} {idx} 0 0 0 0 0")
+    for step in steps:
+        lhs = int(step["lhs"])
+        dst = int(step["dst"])
+        rhs = int(step.get("rhs", 0))
+        rhs_en = 1 if "rhs" in step else 0
+        lines.append(f"2 {_SXU_OPS['DISPATCH_VPU']} 0 {dst} {lhs} {int(step['op'])} {rhs} {rhs_en} 0 0")
+    lines.append(f"2 {_SXU_OPS['STORE_VREG']} {len(inputs)} 0 {output_reg} 0 0 0 0 0")
+    lines.append(f"2 {_SXU_OPS['HALT']} 0 0 0 0 0 0 0 0")
+    lines.append(f"6 {len(inputs)}")
+    lines.append("4")
     return "\n".join(lines) + "\n"
 
 
@@ -973,7 +1349,7 @@ class TinyTPUProgram:
                  wait: bool = False,
                  **kwargs) -> float | None:
         prog = self.prog
-        if prog.get("op") not in {"GEMM4x4", "VPU_BINARY", "VPU_UNARY", "VPU_WHERE"}:
+        if prog.get("op") not in {"GEMM4x4", "VPU_BINARY", "VPU_UNARY", "VPU_WHERE", "VPU_PROGRAM", "VPU_ROWSUM", "HOST_BINARY", "HOST_UNARY"}:
             raise NotImplementedError(_unsupported_message(prog))
 
         if prog.get("op") == "VPU_BINARY":
@@ -990,7 +1366,9 @@ class TinyTPUProgram:
                 rhs_i32 = rhs_raw.astype(np.int32) if bool_inputs else rhs_raw
             else:
                 rhs_i32 = np.full(num_elems, int(prog["rhs_const"]), dtype="<i4")
-            if lhs_i32.size != num_elems or rhs_i32.size != num_elems:
+            lhs_broadcast = bool(prog.get("lhs_broadcast", False)) and prog.get("lhs_const") is None
+            rhs_broadcast = bool(prog.get("rhs_broadcast", False)) and prog.get("rhs_const") is None
+            if lhs_i32.size not in {1, num_elems} or rhs_i32.size not in {1, num_elems}:
                 raise RuntimeError(f"TinyTPU VPU binary op expected {num_elems} elements, got lhs={lhs_i32.size} rhs={rhs_i32.size}")
             is_bool = int(prog["vpu_op"]) in _VPU_BOOL_OPS or prog.get("bool_out", False)
             out_elem_bytes = 1 if is_bool else _BYTES_PER_ELEM
@@ -1002,9 +1380,10 @@ class TinyTPUProgram:
             for chunk_start in range(0, num_elems, _TILE_ELEMS):
                 chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
                 chunk_size = chunk_end - chunk_start
-                lhs_chunk = lhs_i32[chunk_start:chunk_end]
-                rhs_chunk = rhs_i32[chunk_start:chunk_end]
-                stdout = _run_bundle(sim, _build_vpu_binary_bundle(lhs_chunk, rhs_chunk, chunk_size, vpu_op))
+                lhs_chunk = lhs_i32[:1] if lhs_broadcast else lhs_i32[chunk_start:chunk_end]
+                rhs_chunk = rhs_i32[:1] if rhs_broadcast else rhs_i32[chunk_start:chunk_end]
+                stdout = _run_bundle(sim, _build_vpu_binary_bundle(lhs_chunk, rhs_chunk, chunk_size, vpu_op,
+                                                                   lhs_broadcast=lhs_broadcast, rhs_broadcast=rhs_broadcast))
                 result = _parse_vmem_output(stdout)
                 if result is None:
                     raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
@@ -1041,6 +1420,88 @@ class TinyTPUProgram:
                 chunk_out = np.array(result[:chunk_size], dtype="<i4")
                 out_buf[out_offset : out_offset + len(chunk_out) * _BYTES_PER_ELEM] = chunk_out.tobytes()
                 out_offset += len(chunk_out) * _BYTES_PER_ELEM
+            return 1e-3
+
+        if prog.get("op") == "VPU_PROGRAM":
+            out_buf = bufs[prog["out"]]
+            num_elems = int(prog["num_elems"])
+            if len(out_buf) < num_elems * _BYTES_PER_ELEM:
+                raise RuntimeError(f"TinyTPU output buffer too small for VPU program elements={num_elems}")
+            sim = _sim_path()
+            out_offset = 0
+            for chunk_start in range(0, num_elems, _TILE_ELEMS):
+                chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
+                chunk_size = chunk_end - chunk_start
+                input_tiles: list[np.ndarray] = []
+                input_broadcasts: list[bool] = []
+                for spec in prog["inputs"]:
+                    if "const" in spec:
+                        input_tiles.append(np.full(chunk_size, int(spec["const"]), dtype=np.int32))
+                        input_broadcasts.append(False)
+                        continue
+                    is_bool = bool(spec.get("bool", False))
+                    broadcast = bool(spec.get("broadcast", False))
+                    raw = np.frombuffer(bytes(bufs[int(spec["arg"])]), dtype=np.bool_ if is_bool else "<i4")
+                    if raw.size == 1 and chunk_size > 1 and broadcast:
+                        chunk = raw[:1].astype(np.int32) if is_bool else raw[:1]
+                    else:
+                        chunk = raw[chunk_start:chunk_end].astype(np.int32) if is_bool else raw[chunk_start:chunk_end]
+                        if raw.size == 1 and chunk_size > 1:
+                            scalar = int(raw[0])
+                            chunk = np.full(chunk_size, scalar, dtype=np.int32)
+                    if chunk.size != chunk_size:
+                        if not (broadcast and chunk.size == 1):
+                            raise RuntimeError(f"TinyTPU VPU program input expected {chunk_size} elements, got {chunk.size}")
+                    input_tiles.append(np.asarray(chunk, dtype=np.int32))
+                    input_broadcasts.append(broadcast)
+                stdout = _run_bundle(sim, _build_vpu_program_bundle(input_tiles, chunk_size, prog["steps"], int(prog["output_reg"]),
+                                                                    input_broadcasts=input_broadcasts))
+                result = _parse_vmem_output(stdout)
+                if result is None:
+                    raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
+                chunk_out = np.array(result[:chunk_size], dtype="<i4")
+                out_buf[out_offset : out_offset + len(chunk_out) * _BYTES_PER_ELEM] = chunk_out.tobytes()
+                out_offset += len(chunk_out) * _BYTES_PER_ELEM
+            return 1e-3
+
+        if prog.get("op") == "HOST_BINARY":
+            out_buf = bufs[prog["out"]]
+            num_elems = int(prog["num_elems"])
+            lhs_i32 = np.full(num_elems, int(prog["lhs_const"]), dtype=np.int32) if prog.get("lhs_const") is not None else np.frombuffer(bytes(bufs[prog["lhs"]]), dtype="<i4")
+            rhs_i32 = np.full(num_elems, int(prog["rhs_const"]), dtype=np.int32) if prog.get("rhs_const") is not None else np.frombuffer(bytes(bufs[prog["rhs"]]), dtype="<i4")
+            if lhs_i32.size == 1 and num_elems > 1:
+                lhs_i32 = np.full(num_elems, int(lhs_i32[0]), dtype=np.int32)
+            if rhs_i32.size == 1 and num_elems > 1:
+                rhs_i32 = np.full(num_elems, int(rhs_i32[0]), dtype=np.int32)
+            if lhs_i32.size != num_elems or rhs_i32.size != num_elems:
+                raise RuntimeError(f"TinyTPU host binary op expected {num_elems} elements, got lhs={lhs_i32.size} rhs={rhs_i32.size}")
+            if np.any(rhs_i32 == 0):
+                raise ZeroDivisionError("TinyTPU host division fallback received divisor 0")
+            q = np.trunc(lhs_i32.astype(np.float64) / rhs_i32.astype(np.float64)).astype(np.int32)
+            if prog["host_op"] == "IDIV":
+                out_i32 = q
+            elif prog["host_op"] == "MOD":
+                out_i32 = lhs_i32 - q * rhs_i32
+            else:
+                raise RuntimeError(f"unknown TinyTPU host binary op {prog['host_op']}")
+            out_buf[: len(out_i32) * _BYTES_PER_ELEM] = np.asarray(out_i32, dtype="<i4").tobytes()
+            return 1e-3
+
+        if prog.get("op") == "HOST_UNARY":
+            out_buf = bufs[prog["out"]]
+            num_elems = int(prog["num_elems"])
+            if prog.get("dtype") != "float32":
+                raise RuntimeError(f"unsupported TinyTPU host unary dtype {prog.get('dtype')}")
+            src_f32 = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<f4")
+            if src_f32.size != num_elems:
+                raise RuntimeError(f"TinyTPU host unary op expected {num_elems} elements, got src={src_f32.size}")
+            if prog["host_op"] == "TRUNC":
+                out_f32 = np.trunc(src_f32).astype(np.float32)
+            elif prog["host_op"] == "RECIPROCAL":
+                out_f32 = np.reciprocal(src_f32.astype(np.float32))
+            else:
+                raise RuntimeError(f"unknown TinyTPU host unary op {prog['host_op']}")
+            out_buf[: len(out_f32) * 4] = np.asarray(out_f32, dtype="<f4").tobytes()
             return 1e-3
 
         if prog.get("op") == "VPU_UNARY":
@@ -1129,6 +1590,33 @@ class TinyTPUProgram:
                     chunk_out = np.array(result[:out_chunk_size], dtype="<i4")
                     out_buf[out_offset : out_offset + len(chunk_out) * _BYTES_PER_ELEM] = chunk_out.tobytes()
                     out_offset += len(chunk_out) * _BYTES_PER_ELEM
+            return 1e-3
+
+        if prog.get("op") == "VPU_ROWSUM":
+            # Row-wise sum: for each row of a (nrows × ncols) tile, sum all
+            # columns using VPU_SUM_REDUCE (which broadcasts the row sum to all
+            # lane positions). Extract position 0 of each row from vmem_result.
+            out_buf  = bufs[prog["out"]]
+            src_i32  = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<i4")
+            num_rows = int(prog["num_rows"])
+            num_cols = int(prog["num_cols"])
+            if src_i32.size != num_rows * num_cols:
+                raise RuntimeError(
+                    f"TinyTPU VPU_ROWSUM expected {num_rows*num_cols} elements, "
+                    f"got {src_i32.size}")
+            sim = _sim_path()
+            # Pad to a full _ROWS × _COLS tile for the hardware
+            padded = np.zeros(_TILE_ELEMS, dtype=np.int32)
+            padded[:num_rows * num_cols] = src_i32
+            stdout = _run_bundle(sim, _build_vpu_unary_bundle(padded, _TILE_ELEMS, 4))  # vpu_op=4 SUM_REDUCE
+            result = _parse_vmem_output(stdout)
+            if result is None:
+                raise RuntimeError(
+                    f"TinyTPU VPU_ROWSUM: sim produced no vmem_result\nstdout: {stdout}")
+            # SUM_REDUCE broadcasts row-sum to all 4 lanes; take lane 0 of each row
+            row_sums = np.array(
+                [result[r * _COLS] for r in range(num_rows)], dtype=np.int32)
+            out_buf[:num_rows * _BYTES_PER_ELEM] = row_sums.tobytes()
             return 1e-3
 
         out_buf    = bufs[prog["out"]]
