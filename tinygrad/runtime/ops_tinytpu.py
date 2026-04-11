@@ -853,13 +853,13 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
     src_params = sorted(k for k in params if k != out_arg)
 
     # WHERE kernels: only handle simple RELU (WHERE+CMPLT with 1 src, no other ALU).
-    # RELU has equal WHERE and CMPLT counts matching STORE count; clip doubles them.
+    # Use data-path ALU counts to avoid false positives from index arithmetic.
     has_where = op_counts.get("WHERE", 0) > 0
     store_count = op_counts.get("STORE", 0)
+    data_alu_counts = _data_alu_ops(uops)
     is_relu_candidate = (has_where and len(params) == 2 and len(src_params) == 1
                          and op_counts.get("WHERE", 0) == store_count
-                         and op_counts.get("CMPLT", 0) == store_count
-                         and not any(op_counts.get(k.name, 0) > 0 for k in [Ops.ADD, Ops.MUL, Ops.MAX]))
+                         and not any(data_alu_counts.get(n, 0) > 0 for n in ["ADD", "MUL", "MAX"]))
     if has_where and not is_relu_candidate:
         return None
     # Check param sizes — allow size-1 broadcast (scalar → tile)
@@ -923,9 +923,12 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
 
         # Determine operand order
         if is_neg_add:
-            add_uop = next(u for u in uops if u.op is Ops.ADD and any(s.op is Ops.MUL for s in u.src))
+            # Find data-path ADD that has a data-path MUL as source
+            data_adds = [u for u in alu_uops if u.op is Ops.ADD]
+            data_muls = {u for u in alu_uops if u.op is Ops.MUL}
+            add_uop = next(u for u in data_adds if any(s in data_muls for s in u.src))
             lhs_param = _find_unique_param_arg(add_uop.src[0])
-            mul_uop = next(s for s in add_uop.src if s.op is Ops.MUL)
+            mul_uop = next(s for s in add_uop.src if s in data_muls)
             rhs_param = _find_unique_param_arg(mul_uop)
             if rhs_param is None:
                 for s in mul_uop.src:
