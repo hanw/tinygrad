@@ -28,7 +28,7 @@ _TILE_ELEMS = _ROWS * _COLS   # 16 elements per VMEM tile
 _VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6, "SUB": 7, "CMPEQ": 8, "MAX_REDUCE": 9, "SHL": 10, "SHR": 11, "MIN": 12, "MIN_REDUCE": 13, "DIV": 14, "AND": 15, "OR": 16, "XOR": 17,
              "FADD": 18, "FMUL": 19, "FSUB": 20, "FMAX": 21, "FCMPLT": 22, "FRECIP": 23, "I2F": 24, "F2I": 25, "NOT": 26, "SELECT": 27, "COPY": 28}
 _VPU_BOOL_OPS = {_VPU_OPS["CMPLT"], _VPU_OPS["CMPNE"], _VPU_OPS["CMPEQ"]}
-_SXU_OPS = {"LOAD_VREG": 0, "STORE_VREG": 1, "DISPATCH_VPU": 2, "DISPATCH_XLU_BROADCAST": 3, "DISPATCH_MXU": 4, "WAIT_MXU": 5, "LOAD_MXU_RESULT": 6, "HALT": 7, "DISPATCH_SELECT": 8}
+_SXU_OPS = {"LOAD_VREG": 0, "STORE_VREG": 1, "DISPATCH_VPU": 2, "DISPATCH_XLU_BROADCAST": 3, "DISPATCH_MXU": 4, "WAIT_MXU": 5, "LOAD_MXU_RESULT": 6, "HALT": 7, "DISPATCH_SELECT": 8, "BROADCAST_SCALAR": 9, "BROADCAST_ROW": 10, "BROADCAST_COL": 11}
 
 _ALU_OPS = {Ops.ADD: "ADD", Ops.MUL: "MUL", Ops.SUB: "SUB", Ops.MAX: "MAX",
             Ops.CMPLT: "CMPLT", Ops.CMPNE: "CMPNE", Ops.CMPEQ: "CMPEQ",
@@ -872,35 +872,42 @@ def _render_rowbc_sxu_program(uops: list[UOp]) -> dict | None:
     }]
     instructions: list[str] = []
     outputs: list[dict] = []
-    out_base = 1 + nrows
     vpu_op = _VPU_OPS[op_name]
+    rows_per_tile = _ROWS
+    num_chunks = (nrows + rows_per_tile - 1) // rows_per_tile
+    out_base = 1 + num_chunks
 
-    for row in range(nrows):
-        lhs_addr = 1 + row
-        out_addr = out_base + row
+    for chunk_idx in range(num_chunks):
+        row = chunk_idx * rows_per_tile
+        rows_this_chunk = min(rows_per_tile, nrows - row)
+        lhs_addr = 1 + chunk_idx
+        out_addr = out_base + chunk_idx
         offset = row * ncols
+        chunk_count = rows_this_chunk * ncols
         data_plan.append({
             "type": "VMEM", "addr": lhs_addr, "param": lhs_arg,
-            "offset": offset, "count": ncols, "dtype": "int32",
+            "offset": offset, "count": chunk_count, "dtype": "int32",
         })
         instructions += [
             _load(0, lhs_addr),
             _load(1, rhs_addr),
-            _vpu(2, 0, vpu_op, 1),
-            _store(out_addr, 2),
+            _broadcast_row(2, 1, 0),
+            _vpu(3, 0, vpu_op, 2),
+            _store(out_addr, 3),
         ]
         outputs.append({
             "addr": out_addr, "param": out_arg,
-            "offset": offset, "count": ncols,
+            "offset": offset, "count": chunk_count,
         })
 
     instructions.append(_halt())
     return {
         "op": "SXU_PROGRAM",
+        "primitive": "BROADCAST_ROW",
         "instructions": instructions,
         "data_plan": data_plan,
         "outputs": outputs,
-        "num_output_tiles": nrows,
+        "num_output_tiles": num_chunks,
         "out": out_arg,
         "bool_out": vpu_op in _VPU_BOOL_OPS,
     }
@@ -1976,6 +1983,16 @@ def _vpu(vd: int, va: int, op: int, vb: int = 0) -> str:
 
 def _select(vd: int, cond: int, lhs: int, rhs: int) -> str:
     return f"2 8 0 {vd} {cond} 0 {lhs} {rhs} 0 0"
+
+def _broadcast_scalar(vd: int, vs: int, row: int = 0, col: int = 0) -> str:
+    sel = ((row & 0x3) << 2) | (col & 0x3)
+    return f"2 9 0 {vd} {vs} 0 {sel} 0 0 0"
+
+def _broadcast_row(vd: int, vs: int, row: int = 0) -> str:
+    return f"2 10 0 {vd} {vs} 0 {row} 0 0 0"
+
+def _broadcast_col(vd: int, vs: int, col: int = 0) -> str:
+    return f"2 11 0 {vd} {vs} 0 {col} 0 0 0"
 
 def _broadcast(vn: int, lane: int = 0) -> str:
     return f"2 3 0 {vn} {vn} 0 {lane} 0 0 0"
