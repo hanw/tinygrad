@@ -1425,90 +1425,6 @@ def _bundle(*lines: str) -> str:
 # ---------------------------------------------------------------------------
 # Helpers: build text bundle, parse BSV sim output
 # ---------------------------------------------------------------------------
-def _build_gemm_bundle(weight_i8: np.ndarray, act_i8: np.ndarray) -> str:
-    """WMEM[0]=weight, AMEM[1]=act, MXU WMEM[0]/AMEM[1]/tiles=1, OUTPUT_MXU."""
-    return _bundle(
-        _wmem(0, [int(x) for x in weight_i8.flatten()]),  # WMEM[0] = weight tile
-        _amem(1, [int(x) for x in act_i8]),               # AMEM[1] = activation
-        _mxu(0, 1, 1),   # MXU WMEM[0], AMEM[1], tiles=1
-        _wait_mxu(),      # WAIT_MXU
-        _halt(),          # HALT
-        _output_mxu(),    # OUTPUT_MXU
-        _end(),           # END
-    )
-
-
-def _build_gemm_epilogue_bundle(weight_tiles_i8: list[np.ndarray], act_tiles_i8: list[np.ndarray],
-                                bias_i32: np.ndarray | None = None,
-                                relu: bool = False) -> str:
-    """MXU GEMM with K-tile accumulation and optional bias-add/ReLU epilogue, all in hardware.
-
-    For num_k_tiles K-tiles:
-      1. Preload all weight tiles into WMEM[0..K-1], activation tiles into AMEM[0..K-1]
-      2. For each k: MXU(WMEM[k], AMEM[k], 1) → WAIT → LOAD_MXU_RESULT(v_k)
-      3. VPU ADD to accumulate partial results
-      4. Optional bias add + relu epilogue
-      5. STORE result to VMEM, output via VMEM
-    """
-    num_k = len(weight_tiles_i8)
-    assert len(act_tiles_i8) == num_k
-
-    # Preload data records
-    data_lines: list[str] = []
-    for k in range(num_k):
-        data_lines.append(_wmem(k, [int(x) for x in weight_tiles_i8[k].flatten()]))
-        data_lines.append(_amem(k, [int(x) for x in act_tiles_i8[k]]))
-
-    # Bias preload into VMEM[0] if needed
-    vmem_bias_addr = 0
-    if bias_i32 is not None:
-        bias_tile = [0] * _TILE_ELEMS
-        for i in range(_COLS):
-            bias_tile[i] = int(bias_i32[i])
-        data_lines.append(_vmem(vmem_bias_addr, bias_tile))
-
-    # Program: MXU dispatches + accumulation
-    prog_lines: list[str] = []
-    for k in range(num_k):
-        prog_lines.append(_mxu(k, k, 1))        # MXU WMEM[k], AMEM[k], tiles=1
-        prog_lines.append(_wait_mxu())
-        prog_lines.append(_load_mxu_result(k))   # v_k = MXU result
-
-    # Accumulate K-tile partial results via VPU ADD
-    if num_k == 1:
-        cur_vreg = 0
-    else:
-        # v0 + v1 → v_{num_k}, then + v2 → v_{num_k+1}, etc.
-        acc_vreg = num_k  # first accumulator vreg
-        prog_lines.append(_vpu(acc_vreg, 0, _VPU_OPS["ADD"], 1))  # acc = v0 + v1
-        cur_vreg = acc_vreg
-        for k in range(2, num_k):
-            next_vreg = cur_vreg + 1
-            prog_lines.append(_vpu(next_vreg, cur_vreg, _VPU_OPS["ADD"], k))  # acc += v_k
-            cur_vreg = next_vreg
-
-    # Epilogue: bias add
-    if bias_i32 is not None:
-        bias_vreg = cur_vreg + 1
-        prog_lines.append(_load(bias_vreg, vmem_bias_addr))   # load bias from VMEM
-        result_vreg = bias_vreg + 1
-        prog_lines.append(_vpu(result_vreg, cur_vreg, _VPU_OPS["ADD"], bias_vreg))
-        cur_vreg = result_vreg
-
-    # Epilogue: relu
-    if relu:
-        next_vreg = cur_vreg + 1
-        prog_lines.append(_vpu(next_vreg, cur_vreg, 2))  # VPU_RELU (unary, opcode 2)
-        cur_vreg = next_vreg
-
-    out_vmem = 1 if bias_i32 is not None else 0
-    prog_lines += [
-        _store(out_vmem, cur_vreg),
-        _halt(),
-    ]
-
-    return _bundle(*(data_lines + prog_lines + [_output_vmem(out_vmem), _end()]))
-
 
 def _build_vpu_binary_bundle(lhs_i32: np.ndarray, rhs_i32: np.ndarray, num_elems: int, vpu_op: int,
                              lhs_broadcast: bool = False, rhs_broadcast: bool = False) -> str:
@@ -1615,35 +1531,35 @@ def _build_vpu_program_bundle(inputs: list[np.ndarray], num_elems: int, steps: l
     return _bundle(*lines)
 
 
-def _parse_sim_output(stdout: str) -> list[int] | None:
-    """Extract mxu_result from BSV sim stdout.  Returns None if not found."""
-    for line in stdout.splitlines():
-        line = line.strip()
-        if line.startswith("mxu_result "):
-            vals = line.split()[1:]
-            if len(vals) != _COLS:
-                raise ValueError(f"mxu_result expects {_COLS} values, got {len(vals)}")
-            try:
-                return [int(x) for x in vals]
-            except ValueError as exc:
-                bad = next((x for x in vals if not x.lstrip("-").isdigit()), vals[0])
-                raise ValueError(f"invalid mxu_result integer {bad!r}") from exc
-    return None
+def _parse_result_line(line: str, prefix: str, expected_count: int) -> list[int]:
+    """Parse a single sim output line like 'mxu_result v0 v1 ...' or 'vmem_result v0 v1 ...'."""
+    vals = line.split()[1:]
+    if len(vals) != expected_count:
+        raise ValueError(f"{prefix} expects {expected_count} values, got {len(vals)}")
+    try:
+        return [int(x) for x in vals]
+    except ValueError as exc:
+        bad = next((x for x in vals if not x.lstrip("-").isdigit()), vals[0])
+        raise ValueError(f"invalid {prefix} integer {bad!r}") from exc
 
+def _parse_sim_output(stdout: str) -> list[int] | None:
+    """Extract mxu_result from BSV sim stdout. Returns None if not found."""
+    for line in stdout.splitlines():
+        if line.strip().startswith("mxu_result "):
+            return _parse_result_line(line.strip(), "mxu_result", _COLS)
+    return None
 
 def _parse_vmem_output(stdout: str) -> list[int] | None:
+    """Extract first vmem_result from BSV sim stdout. Returns None if not found."""
     for line in stdout.splitlines():
-        line = line.strip()
-        if line.startswith("vmem_result "):
-            vals = line.split()[1:]
-            if len(vals) != _ROWS * _COLS:
-                raise ValueError(f"vmem_result expects {_ROWS * _COLS} values, got {len(vals)}")
-            try:
-                return [int(x) for x in vals]
-            except ValueError as exc:
-                bad = next((x for x in vals if not x.lstrip("-").isdigit()), vals[0])
-                raise ValueError(f"invalid vmem_result integer {bad!r}") from exc
+        if line.strip().startswith("vmem_result "):
+            return _parse_result_line(line.strip(), "vmem_result", _ROWS * _COLS)
     return None
+
+def _parse_multi_vmem_output(stdout: str) -> list[list[int]]:
+    """Extract all vmem_result lines from BSV sim stdout."""
+    return [_parse_result_line(line.strip(), "vmem_result", _ROWS * _COLS)
+            for line in stdout.splitlines() if line.strip().startswith("vmem_result ")]
 
 
 def _build_full_gemm_bundle(act_rows_i8: np.ndarray, weight_matrix_i8: np.ndarray,
@@ -1741,68 +1657,6 @@ def _build_full_gemm_bundle(act_rows_i8: np.ndarray, weight_matrix_i8: np.ndarra
 
     return _bundle(*(data_lines + prog_lines + output_lines))
 
-
-def _parse_multi_vmem_output(stdout: str) -> list[list[int]]:
-    """Extract all vmem_result lines from BSV sim stdout."""
-    results = []
-    for line in stdout.splitlines():
-        line = line.strip()
-        if line.startswith("vmem_result "):
-            vals = line.split()[1:]
-            if len(vals) != _ROWS * _COLS:
-                raise ValueError(f"vmem_result expects {_ROWS * _COLS} values, got {len(vals)}")
-            results.append([int(x) for x in vals])
-    return results
-
-
-def _run_gemm_vec(sim: str, weight_i8: np.ndarray, act_i8: np.ndarray) -> list[int]:
-    bundle_text = _build_gemm_bundle(weight_i8, act_i8)
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-        f.write(bundle_text)
-        bundle_path = f.name
-
-    try:
-        env = {**os.environ, "TINYTPU_BUNDLE": bundle_path}
-        proc = subprocess.run([sim], env=env, capture_output=True, text=True, timeout=30)
-    finally:
-        os.unlink(bundle_path)
-
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"TinyTPU sim exited {proc.returncode}\n"
-            f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
-        )
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("FAIL:") or line.startswith("ERROR:"):
-            raise RuntimeError(
-                f"TinyTPU simulator reported failure: {line}\n"
-                f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
-            )
-    if "status ok" not in {line.strip() for line in proc.stdout.splitlines()}:
-        raise RuntimeError(
-            f"TinyTPU simulator did not report `status ok`\n"
-            f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
-        )
-
-    result = _parse_sim_output(proc.stdout)
-    if result is None:
-        raise RuntimeError(
-            f"TinyTPU sim produced no mxu_result\n"
-            f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
-        )
-    return result
-
-
-def _run_gemm_epilogue_vec(sim: str, weight_tiles_i8: list[np.ndarray], act_tiles_i8: list[np.ndarray],
-                           bias_i32: np.ndarray | None, relu: bool) -> list[int]:
-    """Run a fused MXU GEMM + K-tile accumulation + epilogue (bias/relu) in hardware, return 4 int32 values."""
-    bundle_text = _build_gemm_epilogue_bundle(weight_tiles_i8, act_tiles_i8, bias_i32=bias_i32, relu=relu)
-    stdout = _run_bundle(sim, bundle_text)
-    vals = _parse_vmem_output(stdout)
-    if vals is None:
-        raise RuntimeError(f"TinyTPU GEMM epilogue: no vmem_result\nstdout: {stdout}")
-    return vals[:_COLS]
 
 
 def _run_bundle(sim: str, bundle_text: str) -> str:
