@@ -219,6 +219,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
     if not wmmas:
         if (where_desc := _render_where_sxu_program(uops)) is not None:
             return where_desc
+        if (multi_desc := _render_multistep_sxu_program(uops)) is not None:
+            return multi_desc
         return _render_elementwise_sxu_program(uops)
 
     wmma = wmmas[0]
@@ -338,6 +340,214 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
         "num_weight_tiles": num_weight_tiles,
         "out": out_arg,
     }
+
+
+def _render_multistep_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render multi-step VPU patterns (abs, clip, MOD, CMPEQ) as SXU_PROGRAM.
+
+    These patterns require 2-3 VPU instructions per tile but use existing VPU opcodes.
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+
+    out_params = set()
+    for s in uops:
+        if s.op is Ops.STORE:
+            p = _find_unique_param_arg(s.src[0])
+            if p is not None: out_params.add(p)
+    if len(out_params) != 1:
+        return None
+    out_arg = next(iter(out_params))
+    out_size = params[out_arg].dtype.size
+    src_params = sorted(k for k in params if k != out_arg)
+
+    # Detect which multi-step pattern this is
+    has_where = op_counts.get("WHERE", 0) > 0
+    has_mul = op_counts.get("MUL", 0) > 0
+    has_max = op_counts.get("MAX", 0) > 0
+    has_cmplt = op_counts.get("CMPLT", 0) > 0
+    has_cmpne = op_counts.get("CMPNE", 0) > 0
+    has_idiv = op_counts.get("IDIV", 0) > 0
+    has_mod = op_counts.get("MOD", 0) > 0
+
+    SUB_OP, MAX_OP, MIN_OP = _VPU_OPS["SUB"], _VPU_OPS["MAX"], _VPU_OPS["MIN"]
+    DIV_OP, MUL_OP, ADD_OP = _VPU_OPS["DIV"], _VPU_OPS["MUL"], _VPU_OPS["ADD"]
+    CMPNE_OP = _VPU_OPS["CMPNE"]
+
+    # --- ABS: 2 params, WHERE+CMPLT+CMPNE+MUL pattern → SUB(0,x), MAX(x, neg) ---
+    if (len(src_params) == 1 and has_where and has_cmplt and has_cmpne and has_mul
+            and not has_idiv and not has_mod):
+        src_arg = src_params[0]
+        num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+        addrs_per_tile = 3  # src, zeros, out
+        all_instrs, data_plan, outputs = [], [], []
+        for tile_idx in range(num_tiles):
+            base = tile_idx * addrs_per_tile
+            offset = tile_idx * _TILE_ELEMS
+            count = min(_TILE_ELEMS, out_size - offset)
+            data_plan.append({"type": "VMEM", "addr": base, "param": src_arg,
+                              "offset": offset, "count": count, "dtype": "int32"})
+            data_plan.append({"type": "VMEM", "addr": base + 1,
+                              "layout": "broadcast_const", "value": 0, "count": count, "dtype": "int32"})
+            out_vmem = base + 2
+            all_instrs += [
+                _load(0, base),        # v0 = src
+                _load(1, base + 1),    # v1 = zeros
+                _vpu(2, 1, SUB_OP, 0), # v2 = 0 - src = -src
+                _vpu(3, 0, MAX_OP, 2), # v3 = max(src, -src) = abs(src)
+                _store(out_vmem, 3),
+            ]
+            outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
+        all_instrs.append(_halt())
+        return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+                "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
+
+    # --- CLIP: 2 params, WHERE+CMPLT (double count vs STORE), constants → MIN(x, hi), MAX(result, lo) ---
+    store_count = op_counts.get("STORE", 0)
+    if (len(src_params) == 1 and has_where and has_cmplt and not has_mul and not has_idiv
+            and op_counts.get("WHERE", 0) > store_count):
+        # Find clip constants from the UOp graph
+        consts = sorted(set(u.arg for u in uops if u.op is Ops.CONST and isinstance(u.arg, int)))
+        # Filter out loop-bound constants (equal to out_size)
+        clip_consts = [c for c in consts if c != out_size]
+        if len(clip_consts) >= 2:
+            lo_const = min(clip_consts)
+            hi_const = max(clip_consts)
+            src_arg = src_params[0]
+            num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+            addrs_per_tile = 4  # src, hi, lo, out
+            all_instrs, data_plan, outputs = [], [], []
+            for tile_idx in range(num_tiles):
+                base = tile_idx * addrs_per_tile
+                offset = tile_idx * _TILE_ELEMS
+                count = min(_TILE_ELEMS, out_size - offset)
+                data_plan.append({"type": "VMEM", "addr": base, "param": src_arg,
+                                  "offset": offset, "count": count, "dtype": "int32"})
+                data_plan.append({"type": "VMEM", "addr": base + 1,
+                                  "layout": "broadcast_const", "value": hi_const, "count": count, "dtype": "int32"})
+                data_plan.append({"type": "VMEM", "addr": base + 2,
+                                  "layout": "broadcast_const", "value": lo_const, "count": count, "dtype": "int32"})
+                out_vmem = base + 3
+                all_instrs += [
+                    _load(0, base),         # v0 = src
+                    _load(1, base + 1),     # v1 = hi
+                    _load(2, base + 2),     # v2 = lo
+                    _vpu(3, 0, MIN_OP, 1),  # v3 = min(src, hi)
+                    _vpu(4, 3, MAX_OP, 2),  # v4 = max(min(src, hi), lo)
+                    _store(out_vmem, 4),
+                ]
+                outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
+            all_instrs.append(_halt())
+            return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+                    "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
+
+    # --- MOD: 3 params, IDIV or MOD present → DIV(x,y), MUL(q,y), SUB(x, product) ---
+    if len(src_params) == 2 and (has_mod or has_idiv) and has_mul:
+        # Find which param is lhs (dividend) and rhs (divisor)
+        # MOD UOp if present, else look at IDIV
+        if has_mod:
+            mod_uop = next(u for u in uops if u.op is Ops.MOD)
+            lhs_arg = _find_unique_param_arg(mod_uop.src[0])
+            rhs_arg = _find_unique_param_arg(mod_uop.src[1])
+        else:
+            idiv_uop = next(u for u in uops if u.op is Ops.IDIV)
+            lhs_arg = _find_unique_param_arg(idiv_uop.src[0])
+            rhs_arg = _find_unique_param_arg(idiv_uop.src[1])
+        if lhs_arg is None or rhs_arg is None:
+            return None
+
+        num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+        addrs_per_tile = 3  # lhs, rhs, out
+        all_instrs, data_plan, outputs = [], [], []
+        for tile_idx in range(num_tiles):
+            base = tile_idx * addrs_per_tile
+            offset = tile_idx * _TILE_ELEMS
+            count = min(_TILE_ELEMS, out_size - offset)
+            data_plan.append({"type": "VMEM", "addr": base, "param": lhs_arg,
+                              "offset": offset, "count": count, "dtype": "int32"})
+            data_plan.append({"type": "VMEM", "addr": base + 1, "param": rhs_arg,
+                              "offset": offset, "count": count, "dtype": "int32"})
+            out_vmem = base + 2
+            all_instrs += [
+                _load(0, base),         # v0 = x (dividend)
+                _load(1, base + 1),     # v1 = y (divisor)
+                _vpu(2, 0, DIV_OP, 1),  # v2 = x / y
+                _vpu(3, 2, MUL_OP, 1),  # v3 = (x/y) * y
+                _vpu(4, 0, SUB_OP, 3),  # v4 = x - (x/y)*y = x % y
+                _store(out_vmem, 4),
+            ]
+            outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
+        all_instrs.append(_halt())
+        return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+                "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
+
+    # --- CMPEQ: 2-3 params, chained CMPNE → CMPNE(x, y/const), CMPNE(result, True) ---
+    # This is NOT(CMPNE(x, y)) = CMPEQ. Detect by checking if any CMPNE has a CMPNE source.
+    if has_cmpne and not has_where and not has_mul and not has_idiv:
+        cmpne_uops = [u for u in uops if u.op is Ops.CMPNE]
+        has_chained_cmpne = any(s.op is Ops.CMPNE for u in cmpne_uops for s in u.src)
+        if has_chained_cmpne:
+            if len(src_params) == 2:
+                # Tensor-tensor CMPEQ
+                first_cmpne = next(u for u in cmpne_uops if all(s.op is not Ops.CMPNE for s in u.src))
+                lhs_arg = _find_unique_param_arg(first_cmpne.src[0])
+                rhs_arg = _find_unique_param_arg(first_cmpne.src[1])
+                if lhs_arg is None or rhs_arg is None:
+                    return None
+                num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+                addrs_per_tile = 3  # lhs, rhs, out
+                all_instrs, data_plan, outputs = [], [], []
+                for tile_idx in range(num_tiles):
+                    base = tile_idx * addrs_per_tile
+                    offset = tile_idx * _TILE_ELEMS
+                    count = min(_TILE_ELEMS, out_size - offset)
+                    data_plan.append({"type": "VMEM", "addr": base, "param": lhs_arg,
+                                      "offset": offset, "count": count, "dtype": "int32"})
+                    data_plan.append({"type": "VMEM", "addr": base + 1, "param": rhs_arg,
+                                      "offset": offset, "count": count, "dtype": "int32"})
+                    out_vmem = base + 2
+                    all_instrs += [
+                        _load(0, base),
+                        _load(1, base + 1),
+                        _vpu(2, 0, _VPU_OPS["CMPEQ"], 1),
+                        _store(out_vmem, 2),
+                    ]
+                    outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
+                all_instrs.append(_halt())
+                return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+                        "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg, "bool_out": True}
+            elif len(src_params) == 1:
+                # Scalar-const CMPEQ: find the const from the first CMPNE
+                first_cmpne = next(u for u in cmpne_uops if all(s.op is not Ops.CMPNE for s in u.src))
+                const_src = next((s for s in first_cmpne.src if s.op is Ops.CONST), None)
+                if const_src is None:
+                    return None
+                const_val = int(const_src.arg)
+                src_arg = src_params[0]
+                num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+                addrs_per_tile = 3  # src, const, out
+                all_instrs, data_plan, outputs = [], [], []
+                for tile_idx in range(num_tiles):
+                    base = tile_idx * addrs_per_tile
+                    offset = tile_idx * _TILE_ELEMS
+                    count = min(_TILE_ELEMS, out_size - offset)
+                    data_plan.append({"type": "VMEM", "addr": base, "param": src_arg,
+                                      "offset": offset, "count": count, "dtype": "int32"})
+                    data_plan.append({"type": "VMEM", "addr": base + 1,
+                                      "layout": "broadcast_const", "value": const_val, "count": count, "dtype": "int32"})
+                    out_vmem = base + 2
+                    all_instrs += [
+                        _load(0, base),
+                        _load(1, base + 1),
+                        _vpu(2, 0, _VPU_OPS["CMPEQ"], 1),
+                        _store(out_vmem, 2),
+                    ]
+                    outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
+                all_instrs.append(_halt())
+                return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+                        "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg, "bool_out": True}
+
+    return None
 
 
 def _render_where_sxu_program(uops: list[UOp]) -> dict | None:
