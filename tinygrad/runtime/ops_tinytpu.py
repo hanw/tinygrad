@@ -170,7 +170,6 @@ def _render_legacy_descriptor(uops: list[UOp]) -> dict | None:
         _KIND_SCHEMA = {
             "vpu_binary":      ("VPU_BINARY",       ["vpu_op", "out_arg:out", "lhs_arg:lhs", "lhs_const", "lhs_broadcast", "rhs_arg:rhs", "rhs_const", "rhs_broadcast", "num_elems", "bool_out", "bool_in"]),
             "vpu_program":     ("VPU_PROGRAM",       ["out_arg:out", "num_elems", "inputs", "steps", "output_reg"]),
-            "vpu_rowbc_binary":("VPU_ROWBC_BINARY",  ["vpu_op", "out_arg:out", "lhs_arg:lhs", "rhs_arg:rhs", "num_elems", "ncols", "nrows"]),
         }
         if diag["kind"] in _KIND_SCHEMA:
             op_name, keys = _KIND_SCHEMA[diag["kind"]]
@@ -242,8 +241,12 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return red_desc
         if (where_desc := _render_where_sxu_program(uops)) is not None:
             return where_desc
+        if (min_const_desc := _render_min_const_sxu_program(uops)) is not None:
+            return min_const_desc
         if (multi_desc := _render_multistep_sxu_program(uops)) is not None:
             return multi_desc
+        if (rowbc_desc := _render_rowbc_sxu_program(uops)) is not None:
+            return rowbc_desc
         return _render_elementwise_sxu_program(uops)
 
     wmma = wmmas[0]
@@ -813,6 +816,150 @@ def _render_where_sxu_program(uops: list[UOp]) -> dict | None:
     }
 
 
+def _render_rowbc_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render row-broadcast binary ops as SXU_PROGRAM.
+
+    Handles patterns of the form (nrows x ncols) OP (ncols,), such as GEMM
+    output plus row bias. Each row becomes one VMEM tile result.
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 3:
+        return None
+
+    has_bool_logic = op_counts.get("AND", 0) > 0 or op_counts.get("OR", 0) > 0 or op_counts.get("XOR", 0) > 0
+    has_fused_cmp = op_counts.get("CMPLT", 0) > 0 and op_counts.get("WHERE", 0) > 0
+    if not (op_counts.get("GROUP", 0) == 1 and op_counts.get("RANGE", 0) == 1 and
+            op_counts.get("STORE", 0) == 4 and op_counts.get("LOAD", 0) == 8 and
+            not has_bool_logic and not has_fused_cmp):
+        return None
+
+    if op_counts.get("CMPNE", 0):
+        op_name = "CMPNE"
+    elif op_counts.get("CMPLT", 0):
+        op_name = "CMPLT"
+    elif op_counts.get("MAX", 0):
+        op_name = "MAX"
+    elif op_counts.get("MUL", 0) > 1:
+        op_name = "MUL"
+    elif op_counts.get("ADD", 0):
+        op_name = "ADD"
+    else:
+        return None
+
+    out_arg = 0
+    out_size = params[out_arg].dtype.size
+    input_args = sorted(arg for arg in params if arg != out_arg)
+    if out_size <= 0 or len(input_args) != 2:
+        return None
+
+    full_args = [arg for arg in input_args if params[arg].dtype.size == out_size]
+    row_args = [arg for arg in input_args
+                if 0 < params[arg].dtype.size < out_size
+                and out_size % params[arg].dtype.size == 0
+                and params[arg].dtype.size <= _TILE_ELEMS]
+    if len(full_args) != 1 or len(row_args) != 1:
+        return None
+
+    lhs_arg = full_args[0]
+    rhs_arg = row_args[0]
+    ncols = params[rhs_arg].dtype.size
+    nrows = out_size // ncols
+    rhs_addr = 0
+
+    data_plan: list[dict] = [{
+        "type": "VMEM", "addr": rhs_addr, "param": rhs_arg,
+        "offset": 0, "count": ncols, "dtype": "int32",
+    }]
+    instructions: list[str] = []
+    outputs: list[dict] = []
+    out_base = 1 + nrows
+    vpu_op = _VPU_OPS[op_name]
+
+    for row in range(nrows):
+        lhs_addr = 1 + row
+        out_addr = out_base + row
+        offset = row * ncols
+        data_plan.append({
+            "type": "VMEM", "addr": lhs_addr, "param": lhs_arg,
+            "offset": offset, "count": ncols, "dtype": "int32",
+        })
+        instructions += [
+            _load(0, lhs_addr),
+            _load(1, rhs_addr),
+            _vpu(2, 0, vpu_op, 1),
+            _store(out_addr, 2),
+        ]
+        outputs.append({
+            "addr": out_addr, "param": out_arg,
+            "offset": offset, "count": ncols,
+        })
+
+    instructions.append(_halt())
+    return {
+        "op": "SXU_PROGRAM",
+        "instructions": instructions,
+        "data_plan": data_plan,
+        "outputs": outputs,
+        "num_output_tiles": nrows,
+        "out": out_arg,
+        "bool_out": vpu_op in _VPU_BOOL_OPS,
+    }
+
+
+def _render_min_const_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render minimum(x, const) through native VPU MIN in SXU_PROGRAM."""
+    op_counts = Counter(u.op.name for u in uops)
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2 or op_counts.get("STORE", 0) < 1 or op_counts.get("XOR", 0) == 0 or op_counts.get("MAX", 0) == 0:
+        return None
+
+    min_const = _find_min_scalar_const(uops)
+    out_size = params[0].dtype.size
+    src_size = params[1].dtype.size
+    if min_const is None or out_size != src_size or out_size <= 0:
+        return None
+
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    data_plan: list[dict] = []
+    instructions: list[str] = []
+    outputs: list[dict] = []
+    const_addr = 0
+    data_plan.append({
+        "type": "VMEM", "addr": const_addr,
+        "layout": "broadcast_const", "value": min_const,
+        "count": _TILE_ELEMS, "dtype": "int32",
+    })
+    for tile_idx in range(num_tiles):
+        lhs_addr = 1 + tile_idx
+        out_addr = 1 + num_tiles + tile_idx
+        offset = tile_idx * _TILE_ELEMS
+        count = min(_TILE_ELEMS, out_size - offset)
+        data_plan.append({
+            "type": "VMEM", "addr": lhs_addr, "param": 1,
+            "offset": offset, "count": count, "dtype": "int32",
+        })
+        instructions += [
+            _load(0, lhs_addr),
+            _load(1, const_addr),
+            _vpu(2, 0, _VPU_OPS["MIN"], 1),
+            _store(out_addr, 2),
+        ]
+        outputs.append({
+            "addr": out_addr, "param": 0,
+            "offset": offset, "count": count,
+        })
+    instructions.append(_halt())
+    return {
+        "op": "SXU_PROGRAM",
+        "instructions": instructions,
+        "data_plan": data_plan,
+        "outputs": outputs,
+        "num_output_tiles": num_tiles,
+        "out": 0,
+    }
+
+
 def _find_alu_const(data_alu_uops: list[UOp], alu_op) -> int | None:
     """Find the scalar constant used as an operand of the given data-path ALU op."""
     for u in data_alu_uops:
@@ -1181,7 +1328,7 @@ def _dump_lowering(desc:str) -> str:
 
 def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     """Slim legacy analyzer — only handles VPU_BINARY, VPU_PROGRAM, VPU_ROWBC_BINARY patterns
-    not yet migrated to SXU_PROGRAM (scalar-const DIV/MIN/MOD, row-broadcast binary)."""
+    not yet migrated to SXU_PROGRAM (scalar-const DIV/MIN/MOD)."""
     params = [u for u in uops if u.op is Ops.PARAM]
     op_counts = Counter(u.op.name for u in uops)
 
@@ -1232,29 +1379,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     _is_grouped_sc = (len(params) == 2 and op_counts.get("GROUP", 0) == 1
                       and op_counts.get("STORE", 0) == 4 and op_counts.get("LOAD", 0) == 4
                       and op_counts.get("RANGE", 0) == 1 and not _has_bool_logic_op)
-    # Scalar-const MIN via XOR+MAX decomposition
-    if (len(params) == 2 and op_counts.get("XOR", 0) > 0 and op_counts.get("MAX", 0) > 0
-          and not in_is_bool and op_counts.get("STORE", 0) >= 1):
-        out_size = param_sizes.get(0)
-        src_size = param_sizes.get(1)
-        min_const = _find_min_scalar_const(uops)
-        if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size and min_const is not None:
-            diag.update({
-                "supported": True,
-                "kind": "vpu_binary",
-                "reason": "supported vpu min const",
-                "out_arg": 0,
-                "lhs_arg": 1,
-                "lhs_const": None,
-                "rhs_arg": None,
-                "rhs_const": min_const,
-                "num_elems": src_size,
-                "vpu_op": binary_vpu_ops["MIN"],
-            })
-            return diag
-        diag["reason"] = f"unsupported vpu min const sizes {dict(sorted(param_sizes.items()))}"
-        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif len(params) in {2, 3} and divmod_pattern is not None and divmod_pattern[0] == "IDIV":
+    if len(params) in {2, 3} and divmod_pattern is not None and divmod_pattern[0] == "IDIV":
         _, rhs_const = divmod_pattern
         out_size, input_args = _resolve_binary_io(param_sizes)
         if out_size is not None and len(input_args) >= 1 and 0 < out_size and all(param_sizes[arg] in {1, out_size} for arg in input_args):
@@ -1551,50 +1676,6 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
             return diag
         diag["reason"] = f"unsupported vpu sub sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append("Current TinyTPU VPU SUB lowering handles one int32 VMEM tile with 1..16 elements.")
-        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif (len(params) == 3
-            and op_counts.get("GROUP", 0) == 1
-            and op_counts.get("RANGE", 0) == 1
-            and op_counts.get("STORE", 0) == 4
-            and op_counts.get("LOAD", 0) == 8
-            and len(matched_grouped_binary_ops) == 1
-            and not _has_bool_logic_op and not _has_fused_cmp
-            # Guard: at least one input must be strictly smaller than the output
-            # (otherwise this is a symmetric binary op handled by is_grouped_binary)
-            and any(0 < param_sizes.get(a, 0) < param_sizes.get(0, 0)
-                    for a in param_sizes if a != 0)
-            and param_sizes.get(0, 0) > 0):
-        # Row-broadcast binary op: (nrows×ncols) OP (ncols,) — e.g. bias-add.
-        # One input has out_size elements, the other has ncols elements
-        # and the same ncols values are applied to every row of the lhs.
-        op_name = matched_grouped_binary_ops[0]
-        out_size = param_sizes.get(0)
-        input_args = [arg for arg in sorted(param_sizes) if arg != 0]
-        if (out_size is not None and len(input_args) == 2
-                and 0 < out_size
-                and any(param_sizes[a] == out_size for a in input_args)
-                and any(0 < param_sizes[a] < out_size
-                        and out_size % param_sizes[a] == 0
-                        and param_sizes[a] <= _TILE_ELEMS
-                        for a in input_args)):
-            lhs_arg = next(a for a in input_args if param_sizes[a] == out_size)
-            rhs_arg = next(a for a in input_args if param_sizes[a] < out_size)
-            ncols_rb = param_sizes[rhs_arg]
-            nrows_rb = out_size // ncols_rb
-            diag.update({
-                "supported": True,
-                "kind": "vpu_rowbc_binary",
-                "reason": f"supported row-broadcast {op_name.lower()} {nrows_rb}x{ncols_rb}",
-                "out_arg": 0,
-                "lhs_arg": lhs_arg,
-                "rhs_arg": rhs_arg,
-                "num_elems": out_size,
-                "ncols": ncols_rb,
-                "nrows": nrows_rb,
-                "vpu_op": binary_vpu_ops[op_name],
-            })
-            return diag
-        diag["reason"] = f"unsupported row-broadcast {op_name} sizes {dict(sorted(param_sizes.items()))}"
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
     elif _is_grouped_sc and len(matched_grouped_binary_ops) == 1:
         # 2-param grouped scalar-const: e.g. x*-1 (neg), x*2, x+5 for 2D/large tensors.
@@ -2219,7 +2300,7 @@ def _unsupported_message(prog: dict) -> str:
 # ---------------------------------------------------------------------------
 # Program — drives the BSV simulator
 # ---------------------------------------------------------------------------
-_SUPPORTED_OPS = {"GEMM4x4", "SXU_PROGRAM", "VPU_BINARY", "VPU_PROGRAM", "VPU_ROWSUM", "VPU_ROWBC_BINARY", "HOST_ROWREDUCE", "HOST_COLREDUCE", "HOST_BINARY", "HOST_UNARY"}
+_SUPPORTED_OPS = {"GEMM4x4", "SXU_PROGRAM", "VPU_BINARY", "VPU_PROGRAM", "VPU_ROWSUM", "HOST_ROWREDUCE", "HOST_COLREDUCE", "HOST_BINARY", "HOST_UNARY"}
 
 class TinyTPUProgram:
     def __init__(self, name: str, lib: bytes, *args, **kwargs):
@@ -2421,36 +2502,6 @@ class TinyTPUProgram:
         else:
             raise RuntimeError(f"Unknown HOST_COLREDUCE op {host_op!r}")
         out_buf[:ncols * _BYTES_PER_ELEM] = result.tobytes()
-        return 1e-3
-
-    def _exec_vpu_rowbc_binary(self, bufs):
-        prog = self.prog
-        # Row-broadcast binary op: apply ncols-element rhs to each row of
-        # nrows×ncols lhs.  e.g. bias-add: output[i*C:(i+1)*C] = lhs[i*C:(i+1)*C] + rhs.
-        out_buf  = bufs[prog["out"]]
-        lhs_i32  = np.frombuffer(bytes(bufs[prog["lhs"]]), dtype="<i4")
-        rhs_i32  = np.frombuffer(bytes(bufs[prog["rhs"]]), dtype="<i4")
-        num_elems = int(prog["num_elems"])
-        ncols    = int(prog["ncols"])
-        nrows    = int(prog["nrows"])
-        vpu_op   = int(prog["vpu_op"])
-        if lhs_i32.size < num_elems:
-            raise RuntimeError(f"TinyTPU VPU_ROWBC_BINARY lhs too small ({lhs_i32.size} < {num_elems})")
-        if rhs_i32.size < ncols:
-            raise RuntimeError(f"TinyTPU VPU_ROWBC_BINARY rhs too small ({rhs_i32.size} < {ncols})")
-        lhs_i32 = lhs_i32[:num_elems]
-        rhs_i32 = rhs_i32[:ncols]
-        out_offset = 0
-        for row in range(nrows):
-            lhs_chunk = lhs_i32[row * ncols : (row + 1) * ncols]
-            stdout = self._run(_build_vpu_binary_bundle(
-                lhs_chunk, rhs_i32, ncols, vpu_op))
-            result = _parse_vmem_output(stdout)
-            if result is None:
-                raise RuntimeError(f"TinyTPU VPU_ROWBC_BINARY row {row}: no vmem_result")
-            chunk_out = np.array(result[:ncols], dtype="<i4")
-            out_buf[out_offset : out_offset + ncols * _BYTES_PER_ELEM] = chunk_out.tobytes()
-            out_offset += ncols * _BYTES_PER_ELEM
         return 1e-3
 
     def _exec_vpu_rowsum(self, bufs):
