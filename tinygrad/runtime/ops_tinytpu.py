@@ -27,7 +27,7 @@ _BYTES_PER_ELEM = 4           # Int#(32) = 4 bytes
 _TILE_ELEMS = _ROWS * _COLS   # 16 elements per VMEM tile
 _VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6, "SUB": 7, "CMPEQ": 8, "MAX_REDUCE": 9, "SHL": 10, "SHR": 11, "MIN": 12, "MIN_REDUCE": 13, "DIV": 14, "AND": 15, "OR": 16, "XOR": 17}
 _VPU_BOOL_OPS = {_VPU_OPS["CMPLT"], _VPU_OPS["CMPNE"], _VPU_OPS["CMPEQ"]}
-_SXU_OPS = {"LOAD_VREG": 0, "STORE_VREG": 1, "DISPATCH_VPU": 2, "DISPATCH_XLU_BROADCAST": 3, "DISPATCH_MXU": 4, "WAIT_MXU": 5, "HALT": 6}
+_SXU_OPS = {"LOAD_VREG": 0, "STORE_VREG": 1, "DISPATCH_VPU": 2, "DISPATCH_XLU_BROADCAST": 3, "DISPATCH_MXU": 4, "WAIT_MXU": 5, "LOAD_MXU_RESULT": 6, "HALT": 7}
 
 def _sim_path() -> str:
     if (p := os.environ.get("TINYTPU_SIM")):
@@ -1401,7 +1401,8 @@ def _mxu(wbase: int, abase: int, tiles: int) -> str:
     return f"2 4 0 0 0 0 0 {wbase} {abase} {tiles}"
 
 def _wait_mxu() -> str: return "2 5 0 0 0 0 0 0 0 0"
-def _halt()     -> str: return "2 6 0 0 0 0 0 0 0 0"
+def _load_mxu_result(vd: int) -> str: return f"2 6 0 {vd} 0 0 0 0 0 0"
+def _halt()     -> str: return "2 7 0 0 0 0 0 0 0 0"
 def _output_mxu()           -> str: return "3 1"
 def _output_vmem(addr: int) -> str: return f"6 {addr}"
 def _end()      -> str: return "4"
