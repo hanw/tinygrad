@@ -338,23 +338,39 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
     }
 
 
+def _find_alu_const(uops: list[UOp], alu_op) -> int | None:
+    """Find the scalar constant used as an operand of the given ALU op (not a loop bound)."""
+    for u in uops:
+        if u.op is alu_op:
+            for src in u.src:
+                if src.op is Ops.CONST and not isinstance(src.arg, bool):
+                    return src.arg
+                # bool CONST (e.g. NOT via CMPNE(x, True))
+                if src.op is Ops.CONST and isinstance(src.arg, bool):
+                    return int(src.arg)
+    return None
+
 def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
     """Render an elementwise kernel as an SXU_PROGRAM.
 
-    Handles binary ops (ADD, MUL, etc.), unary ops (RELU), and patterns
-    like SUB (lowered to ADD + MUL(-1)). Works by examining the UOp graph
-    to determine the VPU op sequence and param mappings.
-
-    Each tile chunk gets: LOAD inputs → VPU ops → STORE output.
-    For multi-tile, the same instruction sequence repeats with different VMEM addresses.
+    Handles: tensor-tensor binary, scalar-const binary (x+c, x*c, NEG, NOT),
+    unary (RELU), bool-typed ops (AND/OR/XOR/NOT). Each tile chunk gets:
+    LOAD inputs → VPU ops → STORE output.
     """
+    _ALU_MAP = {
+        Ops.ADD: "ADD", Ops.MUL: "MUL", Ops.SUB: "SUB", Ops.MAX: "MAX",
+        Ops.CMPLT: "CMPLT", Ops.CMPNE: "CMPNE", Ops.CMPEQ: "CMPEQ",
+        Ops.AND: "AND", Ops.OR: "OR", Ops.XOR: "XOR",
+        Ops.SHL: "SHL", Ops.SHR: "SHR", Ops.IDIV: "DIV",
+    }
+
     op_counts = Counter(u.op.name for u in uops)
     params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
     stores = [u for u in uops if u.op is Ops.STORE]
     if not stores or not params:
         return None
 
-    # Find output param (the STORE target)
+    # Find output param
     out_params = set()
     for s in stores:
         p = _find_unique_param_arg(s.src[0])
@@ -365,92 +381,78 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
     out_size = params[out_arg].dtype.size
     src_params = sorted(k for k in params if k != out_arg)
 
-    # Determine the VPU op by examining ALU UOps
-    _ALU_MAP = {
-        Ops.ADD: "ADD", Ops.MUL: "MUL", Ops.SUB: "SUB", Ops.MAX: "MAX",
-        Ops.CMPLT: "CMPLT", Ops.CMPNE: "CMPNE", Ops.CMPEQ: "CMPEQ",
-        Ops.AND: "AND", Ops.OR: "OR", Ops.XOR: "XOR",
-        Ops.SHL: "SHL", Ops.SHR: "SHR", Ops.IDIV: "DIV",
-    }
-    # Don't handle complex multi-op fusions or RANGE loops yet (leave to old path)
-    if op_counts.get("WHERE", 0) > 0 and op_counts.get("ADD", 0) > 0:
-        return None  # fused add+relu etc
-    if op_counts.get("RANGE", 0) > 0:
-        return None  # multi-tile loops not yet handled
+    # WHERE kernels: only handle simple RELU (WHERE+CMPLT with 1 src, no other ALU).
+    # RELU has equal WHERE and CMPLT counts matching STORE count; clip doubles them.
+    has_where = op_counts.get("WHERE", 0) > 0
+    store_count = op_counts.get("STORE", 0)
+    is_relu_candidate = (has_where and len(params) == 2 and len(src_params) == 1
+                         and op_counts.get("WHERE", 0) == store_count
+                         and op_counts.get("CMPLT", 0) == store_count
+                         and not any(op_counts.get(k.name, 0) > 0 for k in [Ops.ADD, Ops.MUL, Ops.MAX]))
+    if has_where and not is_relu_candidate:
+        return None
     # Don't handle broadcast (mismatched param sizes) yet
     src_sizes = [params[k].dtype.size for k in src_params]
     if len(set(src_sizes)) > 1 or (src_sizes and src_sizes[0] != out_size):
         return None
+
     alu_uops = [u for u in uops if u.op in _ALU_MAP]
-    # RELU: WHERE+CMPLT with exactly out_size of each (not doubled like clip)
-    is_relu = (op_counts.get("WHERE", 0) == out_size and op_counts.get("CMPLT", 0) == out_size
-               and len(params) == 2 and len(src_params) == 1
-               and not any(op_counts.get(k.name, 0) > 0 for k in [Ops.ADD, Ops.MUL, Ops.MAX]))
+    alu_op_types = sum(1 for k in _ALU_MAP if op_counts.get(k.name, 0) > 0)
+
+    # Detect bool dtype on params
+    has_bool_in = any(isinstance(p.dtype, PtrDType) and p.dtype.base.itemsize == 1
+                      for k, p in params.items() if k in src_params)
+    has_bool_out = isinstance(params[out_arg].dtype, PtrDType) and params[out_arg].dtype.base.itemsize == 1
 
     # Detect SUB pattern: MUL(x, -1) + ADD → emit VPU SUB
-    is_neg_add = (op_counts.get("MUL", 0) > 0 and op_counts.get("ADD", 0) > 0
+    # Must be exactly MUL+ADD with 2 src params (not XOR+MAX MIN decomposition)
+    is_neg_add = (len(src_params) == 2 and alu_op_types == 2
+                  and op_counts.get("MUL", 0) > 0 and op_counts.get("ADD", 0) > 0
                   and any(u.op is Ops.CONST and u.arg == -1 for u in uops))
 
-    # Only handle kernels with exactly one type of ALU op (not multi-op patterns like abs=MUL+MAX)
-    alu_op_types = sum(1 for k in _ALU_MAP if op_counts.get(k.name, 0) > 0)
+    # Only handle single-ALU-op kernels (not multi-op patterns like abs=MUL+MAX)
     if alu_op_types > 1 and not is_neg_add:
         return None
-    # Don't handle bool-typed params yet (bool AND/OR/XOR need dtype-aware marshaling)
-    if any(not isinstance(p.dtype, PtrDType) or p.dtype.base.itemsize == 1 for p in params.values()):
+    # Don't handle compound patterns like CMPEQ (= NOT(CMPNE(x,y))) where ALU ops chain
+    alu_set = {u for u in uops if u.op in _ALU_MAP}
+    if any(s in alu_set for u in alu_set for s in u.src):
         return None
-    # Don't handle scalar-const binary ops (e.g. NOT = XOR(x, -1)) — constant isn't a buffer
-    if len(src_params) == 1 and not is_relu and alu_op_types > 0:
-        # Check if it's a true unary (relu handled above) or a const-binary
-        if any(op_counts.get(k.name, 0) > 0 for k in [Ops.XOR, Ops.AND, Ops.OR, Ops.SHL, Ops.SHR]):
-            return None
 
-    # Build the VPU instruction sequence for ONE tile
-    tile_instrs: list[str] = []
-    # Placeholder VMEM addresses — runtime replaces per chunk
-    # vmem_src0 = chunk_base, vmem_src1 = chunk_base+1, vmem_out = chunk_base+2
+    is_relu = is_relu_candidate and op_counts.get("CMPLT", 0) > 0
+
+    # --- Determine VPU op, operand sources, and inputs_per_tile ---
+    const_val = None  # set if one operand is a scalar constant
+    is_bool_out_flag = has_bool_out
 
     if is_relu and len(src_params) == 1:
-        # Unary relu: LOAD → VPU_RELU → STORE
         tile_vpu_op = 2  # VPU_RELU
         inputs_per_tile = 1
-        is_bool_out = False
     elif len(src_params) == 2:
-        # Binary op
+        # Tensor-tensor binary
         if is_neg_add:
-            # SUB pattern: a - b → load both, VPU SUB
             vpu_name = "SUB"
         else:
-            # Direct binary — find the ALU op
-            # Trace which alu op connects the two source params
             vpu_name = None
             for u in alu_uops:
                 name = _ALU_MAP.get(u.op)
-                if name and name not in {"MUL"}:  # skip MUL that might be part of SUB lowering
+                if name and name not in {"MUL"}:
                     vpu_name = name
                     break
             if vpu_name is None:
-                # Might be pure MUL
-                if op_counts.get("MUL", 0) > 0:
-                    vpu_name = "MUL"
-                else:
-                    return None
+                vpu_name = "MUL" if op_counts.get("MUL", 0) > 0 else None
+            if vpu_name is None:
+                return None
 
         tile_vpu_op = _VPU_OPS[vpu_name]
-        is_bool_out = vpu_name in {"CMPLT", "CMPNE", "CMPEQ"}
+        is_bool_out_flag = is_bool_out_flag or vpu_name in {"CMPLT", "CMPNE", "CMPEQ"}
 
-        # Determine operand order from UOp graph
+        # Determine operand order
         if is_neg_add:
-            # For SUB: the ADD's src[0] is the minuend (from one param),
-            # ADD's src[1] is MUL(other_param, -1)
-            add_uop = next(u for u in uops if u.op is Ops.ADD and
-                           any(s.op is Ops.MUL for s in u.src))
-            # src[0] of ADD is the direct LOAD (lhs), src[1] is MUL (negated rhs)
+            add_uop = next(u for u in uops if u.op is Ops.ADD and any(s.op is Ops.MUL for s in u.src))
             lhs_param = _find_unique_param_arg(add_uop.src[0])
             mul_uop = next(s for s in add_uop.src if s.op is Ops.MUL)
             rhs_param = _find_unique_param_arg(mul_uop)
-            # rhs_param traces to the param through the MUL
             if rhs_param is None:
-                # Try the LOAD inside the MUL
                 for s in mul_uop.src:
                     if s.op is Ops.LOAD:
                         rhs_param = _find_unique_param_arg(s)
@@ -462,31 +464,41 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
 
         if lhs_param is None or rhs_param is None:
             return None
-
-        # Map params to VMEM slots: lhs=0, rhs=1, out=2 per chunk
         inputs_per_tile = 2
-        # Record which param is lhs vs rhs for data plan
         src_params = [lhs_param, rhs_param]
     elif len(src_params) == 1:
-        # Unary op (not relu) — only handle WHERE/CMPLT patterns that the old path can do
-        # Don't try to handle complex patterns like clip (WHERE+CMPLT+const) here
-        if op_counts.get("WHERE", 0) > 0 or op_counts.get("CMPLT", 0) > 0:
-            return None
+        # 1 source param: either unary RELU (handled above), or scalar-const binary
+        # Find the ALU op
         vpu_name = None
-        for u in alu_uops:
-            name = _ALU_MAP.get(u.op)
-            if name:
+        alu_op_enum = None
+        for op_enum, name in _ALU_MAP.items():
+            if op_counts.get(op_enum.name, 0) > 0:
+                alu_op_enum = op_enum
                 vpu_name = name
                 break
         if vpu_name is None:
             return None
+
+        # Find the constant value from the UOp graph
+        const_val = _find_alu_const(uops, alu_op_enum)
+        if const_val is None:
+            return None
+
+        # Determine operand order: is src the lhs or rhs?
+        alu_uop = next(u for u in uops if u.op is alu_op_enum)
+        src_is_lhs = _find_unique_param_arg(alu_uop.src[0]) is not None
+
         tile_vpu_op = _VPU_OPS[vpu_name]
-        is_bool_out = vpu_name in {"CMPLT", "CMPNE", "CMPEQ"}
-        inputs_per_tile = 1
+        is_bool_out_flag = is_bool_out_flag or vpu_name in {"CMPLT", "CMPNE", "CMPEQ"}
+        inputs_per_tile = 2  # src tile + const broadcast tile
+        if src_is_lhs:
+            src_params = [src_params[0], None]  # None = const slot
+        else:
+            src_params = [None, src_params[0]]  # const is lhs
     else:
         return None
 
-    # Build full program: repeat tile_instrs for each chunk, adjusting VMEM addresses
+    # Build full program: repeat per tile chunk
     num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
     addrs_per_tile = inputs_per_tile + 1  # inputs + output
 
@@ -499,15 +511,22 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
         offset = tile_idx * _TILE_ELEMS
         count = min(_TILE_ELEMS, out_size - offset)
 
-        # Data plan entries for this tile's inputs
         for inp_idx in range(inputs_per_tile):
             src_arg = src_params[inp_idx] if inputs_per_tile > 1 else src_params[0]
-            data_plan.append({
-                "type": "VMEM", "addr": base + inp_idx,
-                "param": src_arg, "offset": offset, "count": count, "dtype": "int32",
-            })
+            if src_arg is None:
+                # Broadcast constant tile
+                data_plan.append({
+                    "type": "VMEM", "addr": base + inp_idx,
+                    "layout": "broadcast_const", "value": const_val,
+                    "count": count, "dtype": "int32",
+                })
+            else:
+                entry = {"type": "VMEM", "addr": base + inp_idx,
+                         "param": src_arg, "offset": offset, "count": count, "dtype": "int32"}
+                if has_bool_in and isinstance(params[src_arg].dtype, PtrDType) and params[src_arg].dtype.base.itemsize == 1:
+                    entry["bool"] = True
+                data_plan.append(entry)
 
-        # Instructions: adjust VMEM addresses
         out_vmem = base + inputs_per_tile
         if inputs_per_tile == 1:
             all_instrs += [_load(0, base), _vpu(1, 0, tile_vpu_op), _store(out_vmem, 1)]
@@ -515,7 +534,6 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
             all_instrs += [_load(0, base), _load(1, base + 1),
                            _vpu(2, 0, tile_vpu_op, 1), _store(out_vmem, 2)]
 
-        # Output plan
         outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
 
     all_instrs.append(_halt())
@@ -527,7 +545,7 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
         "outputs": outputs,
         "num_output_tiles": num_tiles,
         "out": out_arg,
-        "bool_out": is_bool_out,
+        "bool_out": is_bool_out_flag,
     }
 
 
@@ -2388,6 +2406,10 @@ class TinyTPUProgram:
         data_lines: list[str] = []
         for entry in data_plan:
             mem_type = entry["type"]
+            if entry.get("layout") == "broadcast_const":
+                val = int(entry["value"])
+                data_lines.append(_vmem(int(entry["addr"]), [val] * _TILE_ELEMS))
+                continue
             param_idx = int(entry["param"])
             buf_data = bufs[param_idx]
 
@@ -2414,7 +2436,10 @@ class TinyTPUProgram:
                         data_lines.append(_amem(row*nk+k, [int(x) for x in a_tile]))
 
             elif mem_type == "VMEM":
-                raw = np.frombuffer(bytes(buf_data), dtype="<i4")
+                is_bool = entry.get("bool", False)
+                raw = np.frombuffer(bytes(buf_data), dtype=np.bool_ if is_bool else "<i4")
+                if is_bool:
+                    raw = raw.astype(np.int32)
                 addr = int(entry["addr"])
                 offset = int(entry.get("offset", 0))
                 count = int(entry.get("count", _TILE_ELEMS))
@@ -2446,7 +2471,7 @@ class TinyTPUProgram:
 
         # Write results to output buffer
         out_buf = bufs[int(prog["out"])]
-        out_dtype = np.bool_ if is_bool_out else np.dtype("<i4")
+        out_dtype = np.dtype(np.bool_) if is_bool_out else np.dtype("<i4")
         out_offset = 0
         for idx, out_entry in enumerate(outputs):
             count = int(out_entry["count"])
