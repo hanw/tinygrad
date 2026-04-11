@@ -505,6 +505,43 @@ def _render_multistep_sxu_program(uops: list[UOp]) -> dict | None:
         return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
                 "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
 
+    # --- MIN decomposition: XOR+MAX pattern → emit VPU MIN ---
+    has_xor = data_alu.get("XOR", 0) > 0
+    if has_xor and has_max and not has_where and not has_cmplt and not has_idiv:
+        if len(src_params) == 2:
+            # Tensor-tensor MIN
+            # Find operand params from the MAX UOp sources
+            max_uops = [u for u in uops if u.op is Ops.MAX and _has_load_src(u)]
+            if max_uops:
+                # The MAX operates on XOR(x,-1) and XOR(y,-1), trace through to params
+                lhs_arg = rhs_arg = None
+                for u in uops:
+                    if u.op is Ops.XOR and _has_load_src(u):
+                        p = _find_unique_param_arg(u)
+                        if p is not None:
+                            if lhs_arg is None: lhs_arg = p
+                            elif lhs_arg != p: rhs_arg = p
+                if lhs_arg is not None and rhs_arg is not None:
+                    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+                    addrs_per_tile = 3
+                    all_instrs, data_plan, outputs = [], [], []
+                    for tile_idx in range(num_tiles):
+                        base = tile_idx * addrs_per_tile
+                        offset = tile_idx * _TILE_ELEMS
+                        count = min(_TILE_ELEMS, out_size - offset)
+                        data_plan.append({"type": "VMEM", "addr": base, "param": lhs_arg,
+                                          "offset": offset, "count": count, "dtype": "int32"})
+                        data_plan.append({"type": "VMEM", "addr": base + 1, "param": rhs_arg,
+                                          "offset": offset, "count": count, "dtype": "int32"})
+                        out_vmem = base + 2
+                        all_instrs += [_load(0, base), _load(1, base + 1),
+                                       _vpu(2, 0, MIN_OP, 1), _store(out_vmem, 2)]
+                        outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
+                    all_instrs.append(_halt())
+                    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+                            "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
+        # Scalar-const MIN stays on old path (XOR encoding makes const recovery fragile)
+
     # --- CLIP: 2 params, WHERE+CMPLT (double count vs STORE), constants → MIN(x, hi), MAX(result, lo) ---
     store_count = op_counts.get("STORE", 0)
     if (len(src_params) == 1 and has_where and has_cmplt and not has_mul and not has_idiv
