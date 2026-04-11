@@ -15,8 +15,8 @@ import numpy as np
 from tinygrad.device import Compiled, Allocator, BufferSpec
 from tinygrad.renderer import Renderer
 from tinygrad.uop.ops import Ops, UOp
-from tinygrad.dtype import PtrDType
-from tinygrad.helpers import Target
+from tinygrad.dtype import PtrDType, dtypes
+from tinygrad.codegen.opt.tc import TensorCore
 
 # ---------------------------------------------------------------------------
 # Constants matching the BSV TensorCore#(4,4,16) prototype
@@ -74,8 +74,20 @@ class TinyTPURenderer(Renderer):
     has_threads = False
     global_max  = (1,) * 3
     local_max   = (1,) * 3
+    tensor_cores = [TensorCore(
+        dims=(4, 4, 4),
+        threads=1,
+        elements_per_thread=(16, 16, 16),
+        dtype_in=dtypes.int,
+        dtype_out=dtypes.int,
+        opts=("u0", "u0", "u1", "u1"),
+        swizzle=(((), ("u2", "u3", "r0", "r1"), ("u0", "u1")),
+                 ((), ("u0", "u1", "r0", "r1"), ("u2", "u3"))),
+    )]
 
     def render(self, uops: list[UOp]) -> str:  # type: ignore[override]
+        if (wmma_desc := _render_wmma_descriptor(uops)) is not None:
+            return _dump_lowering(json.dumps(wmma_desc))
         diag = analyze_tinytpu_uops(uops)
         if diag["supported"]:
             if diag["kind"] == "gemm":
@@ -173,6 +185,145 @@ class TinyTPURenderer(Renderer):
             "notes": diag["notes"],
             "op_counts": diag["op_counts"],
         }))
+
+
+def _render_wmma_descriptor(uops: list[UOp]) -> dict | None:
+    wmmas = [u for u in uops if u.op is Ops.WMMA]
+    if not wmmas:
+        return None
+
+    wmma = wmmas[0]
+    if len(wmmas) != 1:
+        return {
+            "op": "UNSUPPORTED",
+            "reason": f"expected a single WMMA op, found {len(wmmas)}",
+            "missing_instructions": ["multi-wmma lowering"],
+            "notes": ["TinyTPU currently lowers one WMMA kernel body at a time."],
+            "op_counts": dict(sorted(Counter(u.op.name for u in uops).items())),
+        }
+
+    out_params = {_find_unique_param_arg(store.src[0]) for store in uops if store.op is Ops.STORE}
+    out_params.discard(None)
+    src0_param = _find_unique_param_arg(wmma.src[0])
+    src1_param = _find_unique_param_arg(wmma.src[1])
+    if len(out_params) != 1 or src0_param is None or src1_param is None:
+        return {
+            "op": "UNSUPPORTED",
+            "reason": "could not recover WMMA buffer parameters",
+            "missing_instructions": ["wmma buffer mapping"],
+            "notes": ["The renderer found a WMMA op but could not map it cleanly to output and input PARAM nodes."],
+            "op_counts": dict(sorted(Counter(u.op.name for u in uops).items())),
+        }
+
+    out_arg = next(iter(out_params))
+    act_arg, weight_arg = src0_param, src1_param
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if out_arg not in params or act_arg not in params or weight_arg not in params:
+        return {
+            "op": "UNSUPPORTED",
+            "reason": "wmma params missing pointer metadata",
+            "missing_instructions": ["wmma param sizing"],
+            "notes": ["TinyTPU needs pointer-backed PARAM metadata to infer GEMM tiling from a WMMA kernel."],
+            "op_counts": dict(sorted(Counter(u.op.name for u in uops).items())),
+        }
+
+    out_size = params[out_arg].dtype.size
+    act_size = params[act_arg].dtype.size
+    weight_size = params[weight_arg].dtype.size
+    if (tiling := _infer_tiling(out_size, act_size, weight_size)) is None:
+        return {
+            "op": "UNSUPPORTED",
+            "reason": f"unexpected wmma param sizes {[out_size, act_size, weight_size]}",
+            "missing_instructions": ["wmma tiling inference"],
+            "notes": [_tiling_failure_note(out_size, act_size, weight_size)],
+            "op_counts": dict(sorted(Counter(u.op.name for u in uops).items())),
+        }
+
+    num_vecs, num_k_tiles, num_weight_tiles = tiling
+    out_cols = num_weight_tiles * _COLS
+    epilogue, epilogue_error = _extract_wmma_epilogue(uops, params, out_arg, act_arg, weight_arg, out_size, out_cols)
+    if epilogue_error is not None:
+        return {
+            "op": "UNSUPPORTED",
+            "reason": epilogue_error,
+            "missing_instructions": ["wmma epilogue lowering"],
+            "notes": ["TinyTPU recognized the WMMA kernel, but the post-WMMA elementwise suffix did not match a supported epilogue shape."],
+            "op_counts": dict(sorted(Counter(u.op.name for u in uops).items())),
+        }
+
+    return {
+        "op": "GEMM4x4",
+        "out": out_arg,
+        "act": act_arg,
+        "weight": weight_arg,
+        "num_vecs": num_vecs,
+        "num_k_tiles": num_k_tiles,
+        "num_weight_tiles": num_weight_tiles,
+        "lowering": "WMMA",
+        "epilogue": epilogue,
+    }
+
+
+def _find_unique_param_arg(u: UOp) -> int | None:
+    params = {node.arg for node in u.toposort() if node.op is Ops.PARAM}
+    if len(params) != 1:
+        return None
+    arg = next(iter(params))
+    return arg if isinstance(arg, int) else None
+
+
+def _extract_wmma_epilogue(uops: list[UOp], params: dict[int, UOp], out_arg: int, act_arg: int, weight_arg: int,
+                           out_size: int, out_cols: int) -> tuple[list[dict], str | None]:
+    op_counts = Counter(u.op.name for u in uops)
+    extra_params = sorted(k for k in params if k not in {out_arg, act_arg, weight_arg})
+    epilogue: list[dict] = []
+
+    if op_counts.get("ADD", 0):
+        if len(extra_params) != 1:
+            return [], f"wmma add epilogue expected one extra param, found {len(extra_params)}"
+        bias_arg = extra_params[0]
+        bias_size = params[bias_arg].dtype.size
+        if bias_size == out_cols:
+            epilogue.append({"op": "ADD", "arg": bias_arg, "mode": "ROW_BROADCAST"})
+        elif bias_size == out_size:
+            epilogue.append({"op": "ADD", "arg": bias_arg, "mode": "FULL"})
+        else:
+            return [], f"wmma add epilogue unsupported bias size {bias_size}"
+
+    if op_counts.get("WHERE", 0) or op_counts.get("CMPLT", 0):
+        if op_counts.get("WHERE", 0) != out_size or op_counts.get("CMPLT", 0) != out_size:
+            return [], f"wmma relu epilogue expected {out_size} lane ops, got where={op_counts.get('WHERE', 0)} cmplt={op_counts.get('CMPLT', 0)}"
+        epilogue.append({"op": "RELU"})
+
+    unsupported = {name for name, count in op_counts.items() if count and name in {"MAX", "CMPNE", "CMPEQ"}}
+    if unsupported:
+        return [], f"wmma epilogue present: {', '.join(sorted(unsupported))}"
+    return epilogue, None
+
+
+def _apply_gemm_epilogue(bufs: tuple[bytearray, ...], out_i32: np.ndarray, prog: dict) -> np.ndarray:
+    out = out_i32
+    num_vecs = int(prog["num_vecs"])
+    out_cols = int(prog["num_weight_tiles"]) * _COLS
+    out_size = num_vecs * out_cols
+    for step in prog.get("epilogue", []):
+        if step["op"] == "ADD":
+            raw = np.frombuffer(bytes(bufs[int(step["arg"])]), dtype="<i4")
+            if step["mode"] == "ROW_BROADCAST":
+                if raw.size < out_cols:
+                    raise RuntimeError(f"TinyTPU row-broadcast bias expected at least {out_cols} elements, got {raw.size}")
+                out = (out.reshape(num_vecs, out_cols) + raw[:out_cols].reshape(1, out_cols)).reshape(out_size)
+            elif step["mode"] == "FULL":
+                if raw.size < out_size:
+                    raise RuntimeError(f"TinyTPU full bias expected at least {out_size} elements, got {raw.size}")
+                out = out + raw[:out_size]
+            else:
+                raise RuntimeError(f"unknown TinyTPU GEMM epilogue mode {step['mode']}")
+        elif step["op"] == "RELU":
+            out = np.maximum(out, 0)
+        else:
+            raise RuntimeError(f"unknown TinyTPU GEMM epilogue op {step['op']}")
+    return np.asarray(out, dtype=np.int32)
 
 
 def _dump_lowering(desc:str) -> str:
@@ -1961,6 +2112,7 @@ class TinyTPUProgram:
                                               tile_idx * _COLS : (tile_idx + 1) * _COLS].astype(np.int8)
                     acc += np.array(_run_gemm_vec(sim, weight_i8, act_i8), dtype=np.int32)
                 out_i32[col_base : col_base + _COLS] = acc
+        out_i32 = _apply_gemm_epilogue(bufs, out_i32, prog)
         out_buf[: len(out_i32) * _BYTES_PER_ELEM] = out_i32.tobytes()
         return 1e-3  # placeholder timing (seconds)
 
