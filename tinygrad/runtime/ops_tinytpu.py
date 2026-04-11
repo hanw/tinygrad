@@ -779,6 +779,7 @@ def _render_where_sxu_program(uops: list[UOp]) -> dict | None:
     all_instrs: list[str] = []
     data_plan: list[dict] = []
     outputs: list[dict] = []
+    uses_scalar_broadcast = False
 
     for tile_idx in range(num_tiles):
         base = tile_idx * addrs_per_tile
@@ -1169,11 +1170,13 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
                     "count": count, "dtype": "int32",
                 })
             elif src_arg in broadcast_params:
-                # Scalar broadcast: read single element, fill entire tile
+                # Scalar broadcast: load the scalar into lane [0,0], then
+                # expand it in hardware via BROADCAST_SCALAR.
                 entry = {"type": "VMEM", "addr": base + inp_idx,
                          "param": src_arg, "offset": 0, "count": 1, "dtype": "int32",
-                         "broadcast": True}
+                         "broadcast": False}
                 data_plan.append(entry)
+                uses_scalar_broadcast = True
             else:
                 entry = {"type": "VMEM", "addr": base + inp_idx,
                          "param": src_arg, "offset": offset, "count": count, "dtype": "int32"}
@@ -1185,8 +1188,13 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
         if inputs_per_tile == 1:
             all_instrs += [_load(0, base), _vpu(1, 0, tile_vpu_op), _store(out_vmem, 1)]
         else:
-            all_instrs += [_load(0, base), _load(1, base + 1),
-                           _vpu(2, 0, tile_vpu_op, 1), _store(out_vmem, 2)]
+            tile_instrs = [_load(0, base), _load(1, base + 1)]
+            if src_params[0] in broadcast_params:
+                tile_instrs.append(_broadcast_scalar(0, 0, 0, 0))
+            if src_params[1] in broadcast_params:
+                tile_instrs.append(_broadcast_scalar(1, 1, 0, 0))
+            tile_instrs += [_vpu(2, 0, tile_vpu_op, 1), _store(out_vmem, 2)]
+            all_instrs += tile_instrs
 
         outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
 
@@ -1194,6 +1202,7 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
 
     return {
         "op": "SXU_PROGRAM",
+        **({"primitive": "BROADCAST_SCALAR"} if uses_scalar_broadcast else {}),
         "instructions": all_instrs,
         "data_plan": data_plan,
         "outputs": outputs,
