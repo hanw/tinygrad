@@ -723,14 +723,13 @@ def _render_where_sxu_program(uops: list[UOp]) -> dict | None:
     }
 
 
-def _find_alu_const(uops: list[UOp], alu_op) -> int | None:
-    """Find the scalar constant used as an operand of the given ALU op (not a loop bound)."""
-    for u in uops:
+def _find_alu_const(data_alu_uops: list[UOp], alu_op) -> int | None:
+    """Find the scalar constant used as an operand of the given data-path ALU op."""
+    for u in data_alu_uops:
         if u.op is alu_op:
             for src in u.src:
                 if src.op is Ops.CONST and not isinstance(src.arg, bool):
                     return src.arg
-                # bool CONST (e.g. NOT via CMPNE(x, True))
                 if src.op is Ops.CONST and isinstance(src.arg, bool):
                     return int(src.arg)
     return None
@@ -781,8 +780,15 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
     if len(set(src_sizes)) > 1 or (src_sizes and src_sizes[0] != out_size):
         return None
 
-    alu_uops = [u for u in uops if u.op in _ALU_MAP]
-    alu_op_types = sum(1 for k in _ALU_MAP if op_counts.get(k.name, 0) > 0)
+    # Only count ALU UOps in the data path (have LOAD in source tree), not index arithmetic
+    def _has_load_src(u: UOp, visited=None) -> bool:
+        if visited is None: visited = set()
+        if id(u) in visited: return False
+        visited.add(id(u))
+        if u.op is Ops.LOAD: return True
+        return any(_has_load_src(s, visited) for s in u.src)
+    alu_uops = [u for u in uops if u.op in _ALU_MAP and _has_load_src(u)]
+    alu_op_types = len(set(_ALU_MAP[u.op] for u in alu_uops))
 
     # Detect bool dtype on params
     has_bool_in = any(isinstance(p.dtype, PtrDType) and p.dtype.base.itemsize == 1
@@ -798,9 +804,9 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
     # Only handle single-ALU-op kernels (not multi-op patterns like abs=MUL+MAX)
     if alu_op_types > 1 and not is_neg_add:
         return None
-    # Don't handle compound patterns like CMPEQ (= NOT(CMPNE(x,y))) where ALU ops chain
-    alu_set = {u for u in uops if u.op in _ALU_MAP}
-    if any(s in alu_set for u in alu_set for s in u.src):
+    # Don't handle compound patterns like CMPEQ (= NOT(CMPNE(x,y))) where data ALU ops chain
+    data_alu_set = set(alu_uops)
+    if any(s in data_alu_set for u in data_alu_set for s in u.src):
         return None
 
     is_relu = is_relu_candidate and op_counts.get("CMPLT", 0) > 0
@@ -865,12 +871,12 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
             return None
 
         # Find the constant value from the UOp graph
-        const_val = _find_alu_const(uops, alu_op_enum)
+        const_val = _find_alu_const(alu_uops, alu_op_enum)
         if const_val is None:
             return None
 
         # Determine operand order: is src the lhs or rhs?
-        alu_uop = next(u for u in uops if u.op is alu_op_enum)
+        alu_uop = next(u for u in alu_uops if u.op is alu_op_enum)
         src_is_lhs = _find_unique_param_arg(alu_uop.src[0]) is not None
 
         tile_vpu_op = _VPU_OPS[vpu_name]
