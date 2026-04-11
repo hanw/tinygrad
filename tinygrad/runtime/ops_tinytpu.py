@@ -96,99 +96,35 @@ class TinyTPURenderer(Renderer):
                  ((), ("u0", "u1", "r0", "r1"), ("u2", "u3"))),
     )]
 
+    # Map diag["kind"] → (op_name, list of diag keys to copy into descriptor)
+    _KIND_SCHEMA: dict[str, tuple[str, list[str | tuple[str, str]]]] = {
+        "gemm":            ("GEMM4x4",          ["out_arg:out", "act_arg:act", "weight_arg:weight", "num_vecs", "num_k_tiles", "num_weight_tiles"]),
+        "vpu_binary":      ("VPU_BINARY",       ["vpu_op", "out_arg:out", "lhs_arg:lhs", "lhs_const", "lhs_broadcast", "rhs_arg:rhs", "rhs_const", "rhs_broadcast", "num_elems", "bool_out", "bool_in"]),
+        "vpu_unary":       ("VPU_UNARY",        ["vpu_op", "out_arg:out", "src_arg:src", "num_elems", "out_elems"]),
+        "vpu_where":       ("VPU_WHERE",        ["out_arg:out", "cond_arg:cond", "lhs_arg:lhs", "rhs_arg:rhs", "num_elems"]),
+        "host_rowreduce":  ("HOST_ROWREDUCE",    ["out_arg:out", "src_arg:src", "nrows", "ncols", "host_op"]),
+        "host_colreduce":  ("HOST_COLREDUCE",    ["out_arg:out", "src_arg:src", "nrows", "ncols", "host_op"]),
+        "vpu_rowbc_binary":("VPU_ROWBC_BINARY",  ["vpu_op", "out_arg:out", "lhs_arg:lhs", "rhs_arg:rhs", "num_elems", "ncols", "nrows"]),
+        "vpu_rowsum":      ("VPU_ROWSUM",        ["out_arg:out", "src_arg:src", "num_rows", "num_cols", "vpu_op"]),
+        "vpu_program":     ("VPU_PROGRAM",       ["out_arg:out", "num_elems", "inputs", "steps", "output_reg"]),
+        "host_binary":     ("HOST_BINARY",       ["host_op", "out_arg:out", "lhs_arg:lhs", "lhs_const", "rhs_arg:rhs", "rhs_const", "num_elems"]),
+        "host_unary":      ("HOST_UNARY",        ["host_op", "host_dtype:dtype", "out_arg:out", "src_arg:src", "num_elems"]),
+    }
+
     def render(self, uops: list[UOp]) -> str:  # type: ignore[override]
         if (wmma_desc := _render_wmma_descriptor(uops)) is not None:
             return _dump_lowering(json.dumps(wmma_desc))
         diag = analyze_tinytpu_uops(uops)
-        if diag["supported"]:
-            if diag["kind"] == "gemm":
-                return _dump_lowering(json.dumps({"op": "GEMM4x4",
-                                                  "out": diag["out_arg"],
-                                                  "act": diag["act_arg"],
-                                                  "weight": diag["weight_arg"],
-                                                  "num_vecs": diag["num_vecs"],
-                                                  "num_k_tiles": diag["num_k_tiles"],
-                                                  "num_weight_tiles": diag["num_weight_tiles"]}))
-            if diag["kind"] == "vpu_binary":
-                return _dump_lowering(json.dumps({"op": "VPU_BINARY",
-                                                  "vpu_op": diag["vpu_op"],
-                                                  "out": diag["out_arg"],
-                                                  "lhs": diag["lhs_arg"],
-                                                  "lhs_const": diag["lhs_const"],
-                                                  "lhs_broadcast": diag.get("lhs_broadcast", False),
-                                                  "rhs": diag["rhs_arg"],
-                                                  "rhs_const": diag["rhs_const"],
-                                                  "rhs_broadcast": diag.get("rhs_broadcast", False),
-                                                  "num_elems": diag["num_elems"],
-                                                  "bool_out": diag.get("bool_out", False),
-                                                  "bool_in": diag.get("bool_in", False)}))
-            if diag["kind"] == "vpu_unary":
-                return _dump_lowering(json.dumps({"op": "VPU_UNARY",
-                                                  "vpu_op": diag["vpu_op"],
-                                                  "out": diag["out_arg"],
-                                                  "src": diag["src_arg"],
-                                                  "num_elems": diag["num_elems"],
-                                                  "out_elems": diag["out_elems"]}))
-            if diag["kind"] == "vpu_where":
-                return _dump_lowering(json.dumps({"op": "VPU_WHERE",
-                                                  "out": diag["out_arg"],
-                                                  "cond": diag["cond_arg"],
-                                                  "lhs": diag["lhs_arg"],
-                                                  "rhs": diag["rhs_arg"],
-                                                  "num_elems": diag["num_elems"]}))
-            if diag["kind"] == "host_rowreduce":
-                return _dump_lowering(json.dumps({"op": "HOST_ROWREDUCE",
-                                                  "out": diag["out_arg"],
-                                                  "src": diag["src_arg"],
-                                                  "nrows": diag["nrows"],
-                                                  "ncols": diag["ncols"],
-                                                  "host_op": diag["host_op"]}))
-            if diag["kind"] == "host_colreduce":
-                return _dump_lowering(json.dumps({"op": "HOST_COLREDUCE",
-                                                  "out": diag["out_arg"],
-                                                  "src": diag["src_arg"],
-                                                  "nrows": diag["nrows"],
-                                                  "ncols": diag["ncols"],
-                                                  "host_op": diag["host_op"]}))
-            if diag["kind"] == "vpu_rowbc_binary":
-                return _dump_lowering(json.dumps({"op": "VPU_ROWBC_BINARY",
-                                                  "vpu_op": diag["vpu_op"],
-                                                  "out": diag["out_arg"],
-                                                  "lhs": diag["lhs_arg"],
-                                                  "rhs": diag["rhs_arg"],
-                                                  "num_elems": diag["num_elems"],
-                                                  "ncols": diag["ncols"],
-                                                  "nrows": diag["nrows"]}))
-            if diag["kind"] == "vpu_rowsum":
-                return _dump_lowering(json.dumps({"op": "VPU_ROWSUM",
-                                                  "out": diag["out_arg"],
-                                                  "src": diag["src_arg"],
-                                                  "num_rows": diag["num_rows"],
-                                                  "num_cols": diag["num_cols"],
-                                                  "vpu_op": diag["vpu_op"]}))
-            if diag["kind"] == "vpu_program":
-                return _dump_lowering(json.dumps({"op": "VPU_PROGRAM",
-                                                  "out": diag["out_arg"],
-                                                  "num_elems": diag["num_elems"],
-                                                  "inputs": diag["inputs"],
-                                                  "steps": diag["steps"],
-                                                  "output_reg": diag["output_reg"]}))
-            if diag["kind"] == "host_binary":
-                return _dump_lowering(json.dumps({"op": "HOST_BINARY",
-                                                  "host_op": diag["host_op"],
-                                                  "out": diag["out_arg"],
-                                                  "lhs": diag["lhs_arg"],
-                                                  "lhs_const": diag["lhs_const"],
-                                                  "rhs": diag["rhs_arg"],
-                                                  "rhs_const": diag["rhs_const"],
-                                                  "num_elems": diag["num_elems"]}))
-            if diag["kind"] == "host_unary":
-                return _dump_lowering(json.dumps({"op": "HOST_UNARY",
-                                                  "host_op": diag["host_op"],
-                                                  "dtype": diag["host_dtype"],
-                                                  "out": diag["out_arg"],
-                                                  "src": diag["src_arg"],
-                                                  "num_elems": diag["num_elems"]}))
+        if diag["supported"] and diag["kind"] in self._KIND_SCHEMA:
+            op_name, keys = self._KIND_SCHEMA[diag["kind"]]
+            desc: dict = {"op": op_name}
+            for key in keys:
+                if ":" in key:
+                    src, dst = key.split(":")
+                else:
+                    src = dst = key
+                desc[dst] = diag.get(src, False)
+            return _dump_lowering(json.dumps(desc))
         return _dump_lowering(json.dumps({
             "op": "UNSUPPORTED",
             "reason": diag["reason"],
@@ -1770,6 +1706,27 @@ class TinyTPUProgram:
     def _run(self, bundle_text: str) -> str:
         return _run_bundle(self.sim, bundle_text)
 
+    def _run_vmem(self, bundle_text: str) -> list[int]:
+        """Run bundle and parse the first vmem_result line."""
+        result = _parse_vmem_output(self._run(bundle_text))
+        if result is None:
+            raise RuntimeError("TinyTPU sim produced no vmem_result")
+        return result
+
+    def _run_tiled_vpu(self, out_buf: bytearray, num_elems: int,
+                       build_fn, *, out_dtype: np.dtype = np.dtype("<i4")) -> float:
+        """Run a VPU op in VMEM-tile chunks, writing results to out_buf."""
+        elem_bytes = out_dtype.itemsize
+        out_offset = 0
+        for chunk_start in range(0, num_elems, _TILE_ELEMS):
+            chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
+            chunk_size = chunk_end - chunk_start
+            result = self._run_vmem(build_fn(chunk_start, chunk_end, chunk_size))
+            chunk_out = np.array(result[:chunk_size], dtype=out_dtype)
+            out_buf[out_offset : out_offset + len(chunk_out) * elem_bytes] = chunk_out.tobytes()
+            out_offset += len(chunk_out) * elem_bytes
+        return 1e-3
+
     def __call__(self, *bufs: bytearray,
                  global_size: tuple = (1, 1, 1),
                  local_size: tuple | None = None,
@@ -1787,44 +1744,23 @@ class TinyTPUProgram:
         out_buf = bufs[prog["out"]]
         num_elems = int(prog["num_elems"])
         bool_inputs = prog.get("bool_in", False) or prog.get("bool_out", False)
-        if prog.get("lhs_const") is None:
-            lhs_raw = np.frombuffer(bytes(bufs[prog["lhs"]]), dtype=np.bool_ if bool_inputs else "<i4")
-            lhs_i32 = lhs_raw.astype(np.int32) if bool_inputs else lhs_raw
-        else:
-            lhs_i32 = np.full(num_elems, int(prog["lhs_const"]), dtype="<i4")
-        if prog.get("rhs_const") is None:
-            rhs_raw = np.frombuffer(bytes(bufs[prog["rhs"]]), dtype=np.bool_ if bool_inputs else "<i4")
-            rhs_i32 = rhs_raw.astype(np.int32) if bool_inputs else rhs_raw
-        else:
-            rhs_i32 = np.full(num_elems, int(prog["rhs_const"]), dtype="<i4")
-        lhs_broadcast = bool(prog.get("lhs_broadcast", False)) and prog.get("lhs_const") is None
-        rhs_broadcast = bool(prog.get("rhs_broadcast", False)) and prog.get("rhs_const") is None
-        if lhs_i32.size not in {1, num_elems} or rhs_i32.size not in {1, num_elems}:
-            raise RuntimeError(f"TinyTPU VPU binary op expected {num_elems} elements, got lhs={lhs_i32.size} rhs={rhs_i32.size}")
+        def _read_operand(key, const_key):
+            if prog.get(const_key) is not None:
+                return np.full(num_elems, int(prog[const_key]), dtype="<i4")
+            raw = np.frombuffer(bytes(bufs[prog[key]]), dtype=np.bool_ if bool_inputs else "<i4")
+            return raw.astype(np.int32) if bool_inputs else raw
+        lhs_i32 = _read_operand("lhs", "lhs_const")
+        rhs_i32 = _read_operand("rhs", "rhs_const")
+        lhs_bc = bool(prog.get("lhs_broadcast", False)) and prog.get("lhs_const") is None
+        rhs_bc = bool(prog.get("rhs_broadcast", False)) and prog.get("rhs_const") is None
         is_bool = int(prog["vpu_op"]) in _VPU_BOOL_OPS or prog.get("bool_out", False)
-        out_elem_bytes = 1 if is_bool else _BYTES_PER_ELEM
-        if len(out_buf) < num_elems * out_elem_bytes:
-            raise RuntimeError(f"TinyTPU output buffer too small for VPU binary op elements={num_elems}")
         vpu_op = int(prog["vpu_op"])
-        out_offset = 0
-        for chunk_start in range(0, num_elems, _TILE_ELEMS):
-            chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
-            chunk_size = chunk_end - chunk_start
-            lhs_chunk = lhs_i32[:1] if lhs_broadcast else lhs_i32[chunk_start:chunk_end]
-            rhs_chunk = rhs_i32[:1] if rhs_broadcast else rhs_i32[chunk_start:chunk_end]
-            result = _parse_vmem_output(self._run(_build_vpu_binary_bundle(lhs_chunk, rhs_chunk, chunk_size, vpu_op,
-                                                                           lhs_broadcast=lhs_broadcast, rhs_broadcast=rhs_broadcast)))
-            if result is None:
-                raise RuntimeError("TinyTPU sim produced no vmem_result")
-            if is_bool:
-                chunk_out = np.array(result[:chunk_size], dtype=np.bool_)
-                out_buf[out_offset : out_offset + len(chunk_out)] = chunk_out.tobytes()
-                out_offset += len(chunk_out)
-            else:
-                chunk_out = np.array(result[:chunk_size], dtype="<i4")
-                out_buf[out_offset : out_offset + len(chunk_out) * _BYTES_PER_ELEM] = chunk_out.tobytes()
-                out_offset += len(chunk_out) * _BYTES_PER_ELEM
-        return 1e-3
+        return self._run_tiled_vpu(out_buf, num_elems,
+            lambda s, e, n: _build_vpu_binary_bundle(
+                lhs_i32[:1] if lhs_bc else lhs_i32[s:e],
+                rhs_i32[:1] if rhs_bc else rhs_i32[s:e],
+                n, vpu_op, lhs_broadcast=lhs_bc, rhs_broadcast=rhs_bc),
+            out_dtype=np.dtype(np.bool_) if is_bool else np.dtype("<i4"))
 
     def _exec_vpu_where(self, bufs):
         prog = self.prog
@@ -1833,21 +1769,8 @@ class TinyTPUProgram:
         cond_i32 = np.frombuffer(bytes(bufs[prog["cond"]]), dtype=np.bool_)[:num_elems].astype(np.int32)
         lhs_i32 = np.frombuffer(bytes(bufs[prog["lhs"]]), dtype="<i4")
         rhs_i32 = np.frombuffer(bytes(bufs[prog["rhs"]]), dtype="<i4")
-        if len(out_buf) < num_elems * _BYTES_PER_ELEM:
-            raise RuntimeError(f"TinyTPU output buffer too small for VPU WHERE elements={num_elems}")
-        out_offset = 0
-        for chunk_start in range(0, num_elems, _TILE_ELEMS):
-            chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
-            chunk_size = chunk_end - chunk_start
-            result = _parse_vmem_output(self._run(_build_vpu_where_bundle(
-                cond_i32[chunk_start:chunk_end], lhs_i32[chunk_start:chunk_end],
-                rhs_i32[chunk_start:chunk_end], chunk_size)))
-            if result is None:
-                raise RuntimeError("TinyTPU sim produced no vmem_result")
-            chunk_out = np.array(result[:chunk_size], dtype="<i4")
-            out_buf[out_offset : out_offset + len(chunk_out) * _BYTES_PER_ELEM] = chunk_out.tobytes()
-            out_offset += len(chunk_out) * _BYTES_PER_ELEM
-        return 1e-3
+        return self._run_tiled_vpu(out_buf, num_elems, lambda s, e, n:
+            _build_vpu_where_bundle(cond_i32[s:e], lhs_i32[s:e], rhs_i32[s:e], n))
 
     def _exec_vpu_program(self, bufs):
         prog = self.prog
@@ -1939,86 +1862,24 @@ class TinyTPUProgram:
         src_i32 = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<i4")
         num_elems = int(prog["num_elems"])
         out_elems = int(prog["out_elems"])
-        if src_i32.size != num_elems:
-            raise RuntimeError(f"TinyTPU VPU unary op expected {num_elems} elements, got src={src_i32.size}")
-        if len(out_buf) < out_elems * _BYTES_PER_ELEM:
-            raise RuntimeError(f"TinyTPU output buffer too small for VPU unary op elements={out_elems}")
         vpu_op = int(prog["vpu_op"])
-        is_sum_reduce = vpu_op == 4 and out_elems == 1
-        is_max_reduce = vpu_op == _VPU_OPS["MAX_REDUCE"] and out_elems == 1
-        is_min_reduce = vpu_op == _VPU_OPS["MIN_REDUCE"] and out_elems == 1
-        if is_sum_reduce:
-            # Sum reduction: chunk into tiles, sum each via VPU_SUM_REDUCE,
-            # then accumulate partial sums on the host.
-            total = np.int32(0)
+
+        # Scalar reductions: chunk → VPU reduce → host accumulate
+        _REDUCE_OPS = {4: (np.int32(0), sum, 0), _VPU_OPS["MAX_REDUCE"]: (np.int32(-2**31), max, -2**31),
+                       _VPU_OPS["MIN_REDUCE"]: (np.int32(2**31-1), min, 2**31-1)}
+        if out_elems == 1 and vpu_op in _REDUCE_OPS:
+            acc, combine, pad_val = _REDUCE_OPS[vpu_op]
             for chunk_start in range(0, num_elems, _TILE_ELEMS):
                 chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
-                chunk_size = chunk_end - chunk_start
-                src_chunk = src_i32[chunk_start:chunk_end]
-                # Pad chunk to 4 elements minimum for VPU_SUM_REDUCE row
-                padded = np.zeros(_TILE_ELEMS, dtype=np.int32)
-                padded[:chunk_size] = src_chunk
-                stdout = self._run(_build_vpu_unary_bundle(padded, _TILE_ELEMS, vpu_op))
-                result = _parse_vmem_output(stdout)
-                if result is None:
-                    raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
-                # VPU_SUM_REDUCE broadcasts row sums; sum the 4 row sums
-                row_sums = [result[r * _COLS] for r in range(_ROWS)]
-                total += np.int32(sum(row_sums))
-            out_i32 = np.array([total], dtype="<i4")
-            out_buf[: _BYTES_PER_ELEM] = out_i32.tobytes()
-        elif is_max_reduce:
-            # Max reduction: chunk into tiles, max each via VPU_MAX_REDUCE,
-            # then take the running max across tiles on the host.
-            import sys
-            running_max = np.int32(-2**31)  # INT32_MIN
-            for chunk_start in range(0, num_elems, _TILE_ELEMS):
-                chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
-                chunk_size = chunk_end - chunk_start
-                src_chunk = src_i32[chunk_start:chunk_end]
-                padded = np.full(_TILE_ELEMS, -2**31, dtype=np.int32)
-                padded[:chunk_size] = src_chunk
-                stdout = self._run(_build_vpu_unary_bundle(padded, _TILE_ELEMS, vpu_op))
-                result = _parse_vmem_output(stdout)
-                if result is None:
-                    raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
-                # VPU_MAX_REDUCE broadcasts row maxes; take max of all row maxes
-                row_maxes = [np.int32(result[r * _COLS]) for r in range(_ROWS)]
-                tile_max = max(row_maxes)
-                running_max = max(running_max, tile_max)
-            out_i32 = np.array([running_max], dtype="<i4")
-            out_buf[: _BYTES_PER_ELEM] = out_i32.tobytes()
-        elif is_min_reduce:
-            running_min = np.int32(2**31 - 1)  # INT32_MAX
-            for chunk_start in range(0, num_elems, _TILE_ELEMS):
-                chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
-                chunk_size = chunk_end - chunk_start
-                src_chunk = src_i32[chunk_start:chunk_end]
-                padded = np.full(_TILE_ELEMS, 2**31 - 1, dtype=np.int32)
-                padded[:chunk_size] = src_chunk
-                stdout = self._run(_build_vpu_unary_bundle(padded, _TILE_ELEMS, vpu_op))
-                result = _parse_vmem_output(stdout)
-                if result is None:
-                    raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
-                row_mins = [np.int32(result[r * _COLS]) for r in range(_ROWS)]
-                tile_min = min(row_mins)
-                running_min = min(running_min, tile_min)
-            out_i32 = np.array([running_min], dtype="<i4")
-            out_buf[: _BYTES_PER_ELEM] = out_i32.tobytes()
+                padded = np.full(_TILE_ELEMS, pad_val, dtype=np.int32)
+                padded[:chunk_end - chunk_start] = src_i32[chunk_start:chunk_end]
+                result = self._run_vmem(_build_vpu_unary_bundle(padded, _TILE_ELEMS, vpu_op))
+                row_vals = [np.int32(result[r * _COLS]) for r in range(_ROWS)]
+                acc = np.int32(combine([acc, *row_vals]) if vpu_op != 4 else acc + sum(row_vals))
+            out_buf[:_BYTES_PER_ELEM] = np.array([acc], dtype="<i4").tobytes()
         else:
-            out_offset = 0
-            for chunk_start in range(0, num_elems, _TILE_ELEMS):
-                chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
-                chunk_size = chunk_end - chunk_start
-                out_chunk_size = min(out_elems - (chunk_start if out_elems == num_elems else 0), chunk_size)
-                src_chunk = src_i32[chunk_start:chunk_end]
-                stdout = self._run(_build_vpu_unary_bundle(src_chunk, chunk_size, vpu_op))
-                result = _parse_vmem_output(stdout)
-                if result is None:
-                    raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
-                chunk_out = np.array(result[:out_chunk_size], dtype="<i4")
-                out_buf[out_offset : out_offset + len(chunk_out) * _BYTES_PER_ELEM] = chunk_out.tobytes()
-                out_offset += len(chunk_out) * _BYTES_PER_ELEM
+            return self._run_tiled_vpu(out_buf, num_elems, lambda s, e, n:
+                _build_vpu_unary_bundle(src_i32[s:e], n, vpu_op))
         return 1e-3
 
     def _exec_host_rowreduce(self, bufs):
