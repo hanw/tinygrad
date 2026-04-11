@@ -127,6 +127,15 @@ class TinyTPURenderer(Renderer):
                                                   "nrows": diag["nrows"],
                                                   "ncols": diag["ncols"],
                                                   "host_op": diag["host_op"]}))
+            if diag["kind"] == "vpu_rowbc_binary":
+                return _dump_lowering(json.dumps({"op": "VPU_ROWBC_BINARY",
+                                                  "vpu_op": diag["vpu_op"],
+                                                  "out": diag["out_arg"],
+                                                  "lhs": diag["lhs_arg"],
+                                                  "rhs": diag["rhs_arg"],
+                                                  "num_elems": diag["num_elems"],
+                                                  "ncols": diag["ncols"],
+                                                  "nrows": diag["nrows"]}))
             if diag["kind"] == "vpu_rowsum":
                 return _dump_lowering(json.dumps({"op": "VPU_ROWSUM",
                                                   "out": diag["out_arg"],
@@ -766,6 +775,50 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["reason"] = f"unsupported vpu sub sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append("Current TinyTPU VPU SUB lowering handles one int32 VMEM tile with 1..16 elements.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
+    elif (len(params) == 3
+            and op_counts.get("GROUP", 0) == 1
+            and op_counts.get("RANGE", 0) == 1
+            and op_counts.get("STORE", 0) == 4
+            and op_counts.get("LOAD", 0) == 8
+            and len(matched_grouped_binary_ops) == 1
+            and not _has_bool_logic_op and not _has_fused_cmp
+            # Guard: at least one input must be strictly smaller than the output
+            # (otherwise this is a symmetric binary op handled by is_grouped_binary)
+            and any(0 < param_sizes.get(a, 0) < param_sizes.get(0, 0)
+                    for a in param_sizes if a != 0)
+            and param_sizes.get(0, 0) > 0):
+        # Row-broadcast binary op: (nrows×ncols) OP (ncols,) — e.g. bias-add.
+        # One input has out_size elements, the other has ncols elements
+        # and the same ncols values are applied to every row of the lhs.
+        op_name = matched_grouped_binary_ops[0]
+        out_size = param_sizes.get(0)
+        input_args = [arg for arg in sorted(param_sizes) if arg != 0]
+        if (out_size is not None and len(input_args) == 2
+                and 0 < out_size
+                and any(param_sizes[a] == out_size for a in input_args)
+                and any(0 < param_sizes[a] < out_size
+                        and out_size % param_sizes[a] == 0
+                        and param_sizes[a] <= _TILE_ELEMS
+                        for a in input_args)):
+            lhs_arg = next(a for a in input_args if param_sizes[a] == out_size)
+            rhs_arg = next(a for a in input_args if param_sizes[a] < out_size)
+            ncols_rb = param_sizes[rhs_arg]
+            nrows_rb = out_size // ncols_rb
+            diag.update({
+                "supported": True,
+                "kind": "vpu_rowbc_binary",
+                "reason": f"supported row-broadcast {op_name.lower()} {nrows_rb}x{ncols_rb}",
+                "out_arg": 0,
+                "lhs_arg": lhs_arg,
+                "rhs_arg": rhs_arg,
+                "num_elems": out_size,
+                "ncols": ncols_rb,
+                "nrows": nrows_rb,
+                "vpu_op": binary_vpu_ops[op_name],
+            })
+            return diag
+        diag["reason"] = f"unsupported row-broadcast {op_name} sizes {dict(sorted(param_sizes.items()))}"
+        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
     elif _is_grouped_sc and len(matched_grouped_binary_ops) == 1:
         # 2-param grouped scalar-const: e.g. x*-1 (neg), x*2, x+5 for 2D/large tensors.
         op_name = matched_grouped_binary_ops[0]
@@ -950,9 +1003,14 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
                 "num_elems": src_size,
             })
             return diag
-    elif len(params) == 3 and is_gemm and has_store:
+    elif len(params) == 3 and is_gemm and has_store and op_counts.get("GROUP", 0) == 0:
+        # GROUP=1 flags a vectorized elementwise binary, never a GEMM.
         sizes = sorted(param_sizes.values())
         candidate_weights = [arg for arg, sz in param_sizes.items() if sz >= 16 and sz % 16 == 0]
+        # For square GEMM all non-output params are the same size.  Tinygrad
+        # consistently emits PARAM 1 = activations, PARAM 2 = weight for
+        # matmul, so prefer higher param indices as the weight candidate.
+        candidate_weights = sorted(candidate_weights, reverse=True)
         for weight_arg in candidate_weights:
             weight_size = param_sizes[weight_arg]
             non_weight = {arg: sz for arg, sz in param_sizes.items() if arg != weight_arg}
@@ -1512,7 +1570,7 @@ class TinyTPUProgram:
                  wait: bool = False,
                  **kwargs) -> float | None:
         prog = self.prog
-        if prog.get("op") not in {"GEMM4x4", "VPU_BINARY", "VPU_UNARY", "VPU_WHERE", "VPU_PROGRAM", "VPU_ROWSUM", "HOST_ROWREDUCE", "HOST_COLREDUCE", "HOST_BINARY", "HOST_UNARY"}:
+        if prog.get("op") not in {"GEMM4x4", "VPU_BINARY", "VPU_UNARY", "VPU_WHERE", "VPU_PROGRAM", "VPU_ROWSUM", "VPU_ROWBC_BINARY", "HOST_ROWREDUCE", "HOST_COLREDUCE", "HOST_BINARY", "HOST_UNARY"}:
             raise NotImplementedError(_unsupported_message(prog))
 
         if prog.get("op") == "VPU_BINARY":
@@ -1800,6 +1858,36 @@ class TinyTPUProgram:
             else:
                 raise RuntimeError(f"Unknown HOST_COLREDUCE op {host_op!r}")
             out_buf[:ncols * _BYTES_PER_ELEM] = result.tobytes()
+            return 1e-3
+
+        if prog.get("op") == "VPU_ROWBC_BINARY":
+            # Row-broadcast binary op: apply ncols-element rhs to each row of
+            # nrows×ncols lhs.  e.g. bias-add: output[i*C:(i+1)*C] = lhs[i*C:(i+1)*C] + rhs.
+            out_buf  = bufs[prog["out"]]
+            lhs_i32  = np.frombuffer(bytes(bufs[prog["lhs"]]), dtype="<i4")
+            rhs_i32  = np.frombuffer(bytes(bufs[prog["rhs"]]), dtype="<i4")
+            num_elems = int(prog["num_elems"])
+            ncols    = int(prog["ncols"])
+            nrows    = int(prog["nrows"])
+            vpu_op   = int(prog["vpu_op"])
+            if lhs_i32.size < num_elems:
+                raise RuntimeError(f"TinyTPU VPU_ROWBC_BINARY lhs too small ({lhs_i32.size} < {num_elems})")
+            if rhs_i32.size < ncols:
+                raise RuntimeError(f"TinyTPU VPU_ROWBC_BINARY rhs too small ({rhs_i32.size} < {ncols})")
+            lhs_i32 = lhs_i32[:num_elems]
+            rhs_i32 = rhs_i32[:ncols]
+            sim = _sim_path()
+            out_offset = 0
+            for row in range(nrows):
+                lhs_chunk = lhs_i32[row * ncols : (row + 1) * ncols]
+                stdout = _run_bundle(sim, _build_vpu_binary_bundle(
+                    lhs_chunk, rhs_i32, ncols, vpu_op))
+                result = _parse_vmem_output(stdout)
+                if result is None:
+                    raise RuntimeError(f"TinyTPU VPU_ROWBC_BINARY row {row}: no vmem_result")
+                chunk_out = np.array(result[:ncols], dtype="<i4")
+                out_buf[out_offset : out_offset + ncols * _BYTES_PER_ELEM] = chunk_out.tobytes()
+                out_offset += ncols * _BYTES_PER_ELEM
             return 1e-3
 
         if prog.get("op") == "VPU_ROWSUM":
