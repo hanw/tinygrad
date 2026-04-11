@@ -206,17 +206,18 @@ def _render_wmma_descriptor(uops: list[UOp]) -> dict | None:
 
 
 def _render_sxu_program(uops: list[UOp]) -> dict | None:
-    """Render a WMMA kernel as an SXU_PROGRAM descriptor.
+    """Render a kernel as an SXU_PROGRAM descriptor.
 
     Returns a dict with op="SXU_PROGRAM", pre-built SXU instructions, and a
     data_plan that maps buffer param indices to WMEM/AMEM/VMEM addresses.
     The runtime fills in actual data at call time.
 
-    Returns None if the kernel is not a WMMA kernel.
+    Handles: WMMA GEMM kernels, elementwise binary/unary VPU kernels.
+    Returns None if the kernel pattern is not recognized.
     """
     wmmas = [u for u in uops if u.op is Ops.WMMA]
     if not wmmas:
-        return None
+        return _render_elementwise_sxu_program(uops)
 
     wmma = wmmas[0]
 
@@ -334,6 +335,181 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
         "num_k_tiles": num_k_tiles,
         "num_weight_tiles": num_weight_tiles,
         "out": out_arg,
+    }
+
+
+def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render an elementwise kernel as an SXU_PROGRAM.
+
+    Handles binary ops (ADD, MUL, etc.), unary ops (RELU), and patterns
+    like SUB (lowered to ADD + MUL(-1)). Works by examining the UOp graph
+    to determine the VPU op sequence and param mappings.
+
+    Each tile chunk gets: LOAD inputs → VPU ops → STORE output.
+    For multi-tile, the same instruction sequence repeats with different VMEM addresses.
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    stores = [u for u in uops if u.op is Ops.STORE]
+    if not stores or not params:
+        return None
+
+    # Find output param (the STORE target)
+    out_params = set()
+    for s in stores:
+        p = _find_unique_param_arg(s.src[0])
+        if p is not None: out_params.add(p)
+    if len(out_params) != 1:
+        return None
+    out_arg = next(iter(out_params))
+    out_size = params[out_arg].dtype.size
+    src_params = sorted(k for k in params if k != out_arg)
+
+    # Determine the VPU op by examining ALU UOps
+    _ALU_MAP = {
+        Ops.ADD: "ADD", Ops.MUL: "MUL", Ops.SUB: "SUB", Ops.MAX: "MAX",
+        Ops.CMPLT: "CMPLT", Ops.CMPNE: "CMPNE", Ops.CMPEQ: "CMPEQ",
+        Ops.AND: "AND", Ops.OR: "OR", Ops.XOR: "XOR",
+        Ops.SHL: "SHL", Ops.SHR: "SHR", Ops.IDIV: "DIV",
+    }
+    # Don't handle complex multi-op fusions or RANGE loops yet (leave to old path)
+    if op_counts.get("WHERE", 0) > 0 and op_counts.get("ADD", 0) > 0:
+        return None  # fused add+relu etc
+    if op_counts.get("RANGE", 0) > 0:
+        return None  # multi-tile loops not yet handled
+    # Don't handle broadcast (mismatched param sizes) yet
+    src_sizes = [params[k].dtype.size for k in src_params]
+    if len(set(src_sizes)) > 1 or (src_sizes and src_sizes[0] != out_size):
+        return None
+    alu_uops = [u for u in uops if u.op in _ALU_MAP]
+    is_relu = op_counts.get("WHERE", 0) > 0 and op_counts.get("CMPLT", 0) > 0
+    has_range = op_counts.get("RANGE", 0) > 0
+
+    # Detect SUB pattern: MUL(x, -1) + ADD → emit VPU SUB
+    is_neg_add = (op_counts.get("MUL", 0) > 0 and op_counts.get("ADD", 0) > 0
+                  and any(u.op is Ops.CONST and u.arg == -1 for u in uops))
+
+    # Build the VPU instruction sequence for ONE tile
+    tile_instrs: list[str] = []
+    # Placeholder VMEM addresses — runtime replaces per chunk
+    # vmem_src0 = chunk_base, vmem_src1 = chunk_base+1, vmem_out = chunk_base+2
+
+    if is_relu and len(src_params) == 1:
+        # Unary relu: LOAD → VPU_RELU → STORE
+        tile_vpu_op = 2  # VPU_RELU
+        inputs_per_tile = 1
+        is_bool_out = False
+    elif len(src_params) == 2:
+        # Binary op
+        if is_neg_add:
+            # SUB pattern: a - b → load both, VPU SUB
+            vpu_name = "SUB"
+        else:
+            # Direct binary — find the ALU op
+            # Trace which alu op connects the two source params
+            vpu_name = None
+            for u in alu_uops:
+                name = _ALU_MAP.get(u.op)
+                if name and name not in {"MUL"}:  # skip MUL that might be part of SUB lowering
+                    vpu_name = name
+                    break
+            if vpu_name is None:
+                # Might be pure MUL
+                if op_counts.get("MUL", 0) > 0:
+                    vpu_name = "MUL"
+                else:
+                    return None
+
+        tile_vpu_op = _VPU_OPS[vpu_name]
+        is_bool_out = vpu_name in {"CMPLT", "CMPNE", "CMPEQ"}
+
+        # Determine operand order from UOp graph
+        if is_neg_add:
+            # For SUB: the ADD's src[0] is the minuend (from one param),
+            # ADD's src[1] is MUL(other_param, -1)
+            add_uop = next(u for u in uops if u.op is Ops.ADD and
+                           any(s.op is Ops.MUL for s in u.src))
+            # src[0] of ADD is the direct LOAD (lhs), src[1] is MUL (negated rhs)
+            lhs_param = _find_unique_param_arg(add_uop.src[0])
+            mul_uop = next(s for s in add_uop.src if s.op is Ops.MUL)
+            rhs_param = _find_unique_param_arg(mul_uop)
+            # rhs_param traces to the param through the MUL
+            if rhs_param is None:
+                # Try the LOAD inside the MUL
+                for s in mul_uop.src:
+                    if s.op is Ops.LOAD:
+                        rhs_param = _find_unique_param_arg(s)
+                        break
+        else:
+            alu_uop = next(u for u in alu_uops if _ALU_MAP.get(u.op) == vpu_name)
+            lhs_param = _find_unique_param_arg(alu_uop.src[0])
+            rhs_param = _find_unique_param_arg(alu_uop.src[1])
+
+        if lhs_param is None or rhs_param is None:
+            return None
+
+        # Map params to VMEM slots: lhs=0, rhs=1, out=2 per chunk
+        inputs_per_tile = 2
+        # Record which param is lhs vs rhs for data plan
+        src_params = [lhs_param, rhs_param]
+    elif len(src_params) == 1:
+        # Unary op (not relu)
+        vpu_name = None
+        for u in alu_uops:
+            name = _ALU_MAP.get(u.op)
+            if name:
+                vpu_name = name
+                break
+        if vpu_name is None:
+            return None
+        tile_vpu_op = _VPU_OPS[vpu_name]
+        is_bool_out = vpu_name in {"CMPLT", "CMPNE", "CMPEQ"}
+        inputs_per_tile = 1
+    else:
+        return None
+
+    # Build full program: repeat tile_instrs for each chunk, adjusting VMEM addresses
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    addrs_per_tile = inputs_per_tile + 1  # inputs + output
+
+    all_instrs: list[str] = []
+    data_plan: list[dict] = []
+    outputs: list[dict] = []
+
+    for tile_idx in range(num_tiles):
+        base = tile_idx * addrs_per_tile
+        offset = tile_idx * _TILE_ELEMS
+        count = min(_TILE_ELEMS, out_size - offset)
+
+        # Data plan entries for this tile's inputs
+        for inp_idx in range(inputs_per_tile):
+            src_arg = src_params[inp_idx] if inputs_per_tile > 1 else src_params[0]
+            data_plan.append({
+                "type": "VMEM", "addr": base + inp_idx,
+                "param": src_arg, "offset": offset, "count": count, "dtype": "int32",
+            })
+
+        # Instructions: adjust VMEM addresses
+        out_vmem = base + inputs_per_tile
+        if inputs_per_tile == 1:
+            all_instrs += [_load(0, base), _vpu(1, 0, tile_vpu_op), _store(out_vmem, 1)]
+        else:
+            all_instrs += [_load(0, base), _load(1, base + 1),
+                           _vpu(2, 0, tile_vpu_op, 1), _store(out_vmem, 2)]
+
+        # Output plan
+        outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
+
+    all_instrs.append(_halt())
+
+    return {
+        "op": "SXU_PROGRAM",
+        "instructions": all_instrs,
+        "data_plan": data_plan,
+        "outputs": outputs,
+        "num_output_tiles": num_tiles,
+        "out": out_arg,
+        "bool_out": is_bool_out,
     }
 
 
@@ -2188,99 +2364,78 @@ class TinyTPUProgram:
         data_plan = prog["data_plan"]
         instructions = prog["instructions"]
         outputs = prog["outputs"]
-        num_vecs = int(prog["num_vecs"])
-        num_k_tiles = int(prog["num_k_tiles"])
-        num_weight_tiles = int(prog["num_weight_tiles"])
-        out_cols = num_weight_tiles * _COLS
-        k_cols = num_k_tiles * _ROWS
+        is_bool_out = prog.get("bool_out", False)
 
         # Build bundle from data_plan + instructions + outputs
         data_lines: list[str] = []
-
         for entry in data_plan:
             mem_type = entry["type"]
             param_idx = int(entry["param"])
             buf_data = bufs[param_idx]
 
             if mem_type == "WMEM":
-                # Weight tiles: read as int32, validate int8 range, reshape into tiles
                 weight_i32 = np.frombuffer(bytes(buf_data), dtype="<i4")
                 _require_int8_range("weight", weight_i32)
                 weight_i8 = weight_i32.astype(np.int8)
-                nk = entry["num_k_tiles"]
-                nwt = entry["num_weight_tiles"]
+                nk, nwt = entry["num_k_tiles"], entry["num_weight_tiles"]
                 weight_matrix = weight_i8.reshape(nk * _ROWS, nwt * _COLS)
                 for k in range(nk):
                     for t in range(nwt):
-                        w_tile = weight_matrix[k * _ROWS : (k + 1) * _ROWS,
-                                               t * _COLS : (t + 1) * _COLS]
-                        wmem_addr = k * nwt + t
-                        data_lines.append(_wmem(wmem_addr, [int(x) for x in w_tile.flatten()]))
+                        w_tile = weight_matrix[k*_ROWS:(k+1)*_ROWS, t*_COLS:(t+1)*_COLS]
+                        data_lines.append(_wmem(k*nwt+t, [int(x) for x in w_tile.flatten()]))
 
             elif mem_type == "AMEM":
-                # Activation tiles: read as int32, validate int8 range, reshape into vectors
                 act_i32 = np.frombuffer(bytes(buf_data), dtype="<i4")
                 _require_int8_range("activation", act_i32)
                 act_i8 = act_i32.astype(np.int8)
-                nv = entry["num_vecs"]
-                nk = entry["num_k_tiles"]
+                nv, nk = entry["num_vecs"], entry["num_k_tiles"]
                 act_rows = act_i8.reshape(nv, nk * _ROWS)
                 for row in range(nv):
                     for k in range(nk):
-                        a_tile = act_rows[row, k * _ROWS : (k + 1) * _ROWS]
-                        amem_addr = row * nk + k
-                        data_lines.append(_amem(amem_addr, [int(x) for x in a_tile]))
+                        a_tile = act_rows[row, k*_ROWS:(k+1)*_ROWS]
+                        data_lines.append(_amem(row*nk+k, [int(x) for x in a_tile]))
 
             elif mem_type == "VMEM":
-                # Bias or other VMEM data
-                vmem_i32 = np.frombuffer(bytes(buf_data), dtype="<i4")
-                base_addr = int(entry["addr"])
-                mode = entry.get("mode", "FULL")
-                nwt = entry.get("num_weight_tiles", 1)
+                raw = np.frombuffer(bytes(buf_data), dtype="<i4")
+                addr = int(entry["addr"])
+                offset = int(entry.get("offset", 0))
+                count = int(entry.get("count", _TILE_ELEMS))
+                mode = entry.get("mode", "TILE")
                 if mode == "ROW_BROADCAST":
+                    nwt = entry.get("num_weight_tiles", 1)
                     for t in range(nwt):
-                        bias_tile = [0] * _TILE_ELEMS
+                        tile = [0] * _TILE_ELEMS
                         for i in range(_COLS):
-                            bias_tile[i] = int(vmem_i32[t * _COLS + i])
-                        data_lines.append(_vmem(base_addr + t, bias_tile))
-                elif mode == "FULL":
-                    # Full bias: one tile per (row, weight_tile) -- but for now
-                    # treat like row-broadcast since that's what GEMM epilogue expects
-                    for t in range(nwt):
-                        bias_tile = [0] * _TILE_ELEMS
-                        for i in range(_COLS):
-                            if t * _COLS + i < vmem_i32.size:
-                                bias_tile[i] = int(vmem_i32[t * _COLS + i])
-                        data_lines.append(_vmem(base_addr + t, bias_tile))
+                            tile[i] = int(raw[t*_COLS+i])
+                        data_lines.append(_vmem(addr+t, tile))
+                else:
+                    tile = [0] * _TILE_ELEMS
+                    chunk = raw[offset:offset+count]
+                    for i in range(min(count, len(chunk))):
+                        tile[i] = int(chunk[i])
+                    data_lines.append(_vmem(addr, tile))
 
         # Output records
-        output_lines: list[str] = []
-        for out_entry in outputs:
-            output_lines.append(_output_vmem(int(out_entry["addr"])))
-        output_lines.append(_end())
-
+        output_lines = [_output_vmem(int(o["addr"])) for o in outputs] + [_end()]
         bundle_text = _bundle(*(data_lines + instructions + output_lines))
 
         # Run sim
         stdout = self._run(bundle_text)
         vmem_results = _parse_multi_vmem_output(stdout)
-
-        expected_tiles = int(prog["num_output_tiles"])
-        if len(vmem_results) != expected_tiles:
-            raise RuntimeError(
-                f"TinyTPU SXU_PROGRAM expected {expected_tiles} vmem_result lines, "
-                f"got {len(vmem_results)}\nstdout: {stdout[:500]}")
+        expected = int(prog["num_output_tiles"])
+        if len(vmem_results) != expected:
+            raise RuntimeError(f"SXU_PROGRAM expected {expected} vmem tiles, got {len(vmem_results)}\n{stdout[:500]}")
 
         # Write results to output buffer
         out_buf = bufs[int(prog["out"])]
-        out_i32 = np.empty(num_vecs * out_cols, dtype="<i4")
+        out_dtype = np.bool_ if is_bool_out else np.dtype("<i4")
+        out_offset = 0
         for idx, out_entry in enumerate(outputs):
-            tile_data = vmem_results[idx]
-            offset = int(out_entry["offset"])
             count = int(out_entry["count"])
-            out_i32[offset : offset + count] = tile_data[:count]
-
-        out_buf[: len(out_i32) * _BYTES_PER_ELEM] = out_i32.tobytes()
+            tile_data = vmem_results[idx][:count]
+            chunk_out = np.array(tile_data, dtype=out_dtype)
+            out_buf[out_offset:out_offset+len(chunk_out)*out_dtype.itemsize] = chunk_out.tobytes()
+            out_offset += len(chunk_out) * out_dtype.itemsize
         return 1e-3
 
     def _exec_gemm4x4(self, bufs):
