@@ -342,6 +342,91 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
     }
 
 
+def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render a scalar reduction (SUM/MAX/MIN to scalar) as SXU_PROGRAM.
+
+    Uses VPU_SUM_REDUCE (4), VPU_MAX_REDUCE (9), or VPU_MIN_REDUCE (13).
+    For multi-tile sources, reduces each tile then combines across tiles.
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2:
+        return None
+
+    out_arg = 0
+    src_arg = next((k for k in params if k != 0), None)
+    if src_arg is None:
+        return None
+    out_size = params[out_arg].dtype.size
+    src_size = params[src_arg].dtype.size
+    if out_size != 1:
+        return None
+
+    # Detect reduction type from UOp tree
+    has_add = op_counts.get("ADD", 0) > 0
+    has_max = op_counts.get("MAX", 0) > 0
+    has_xor = op_counts.get("XOR", 0) > 0
+    has_store = op_counts.get("STORE", 0) > 0
+    if not has_store:
+        return None
+
+    if has_add and not has_max:
+        vpu_op = 4  # VPU_SUM_REDUCE
+        combine_op = _VPU_OPS["ADD"]
+    elif has_max and not has_xor:
+        vpu_op = _VPU_OPS["MAX_REDUCE"]
+        combine_op = _VPU_OPS["MAX"]
+    elif has_max and has_xor:
+        vpu_op = _VPU_OPS["MIN_REDUCE"]
+        combine_op = _VPU_OPS["MIN"]
+    else:
+        return None
+
+    num_tiles = (src_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    all_instrs: list[str] = []
+    data_plan: list[dict] = []
+
+    # Load and reduce each tile, accumulate result in vregs
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count = min(_TILE_ELEMS, src_size - offset)
+        vmem_addr = tile_idx
+        data_plan.append({"type": "VMEM", "addr": vmem_addr, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        # Load tile into vreg, reduce
+        src_vreg = tile_idx * 2
+        dst_vreg = tile_idx * 2 + 1
+        all_instrs.append(_load(src_vreg, vmem_addr))
+        all_instrs.append(_vpu(dst_vreg, src_vreg, vpu_op))
+
+    # Combine across tiles if multi-tile
+    if num_tiles > 1:
+        # Accumulate tile results: tile 0 result is in vreg 1, tile 1 in vreg 3, etc.
+        acc_vreg = 1  # first tile reduce result
+        for tile_idx in range(1, num_tiles):
+            tile_result_vreg = tile_idx * 2 + 1
+            next_vreg = num_tiles * 2 + tile_idx
+            all_instrs.append(_vpu(next_vreg, acc_vreg, combine_op, tile_result_vreg))
+            acc_vreg = next_vreg
+        out_vmem = num_tiles
+        all_instrs.append(_store(out_vmem, acc_vreg))
+    else:
+        out_vmem = 1  # single tile: store reduce result
+        all_instrs.append(_store(out_vmem, 1))
+
+    all_instrs.append(_halt())
+    outputs = [{"addr": out_vmem, "param": out_arg, "offset": 0, "count": 1}]
+
+    return {
+        "op": "SXU_PROGRAM",
+        "instructions": all_instrs,
+        "data_plan": data_plan,
+        "outputs": outputs,
+        "num_output_tiles": 1,
+        "out": out_arg,
+    }
+
+
 def _render_multistep_sxu_program(uops: list[UOp]) -> dict | None:
     """Render multi-step VPU patterns (abs, clip, MOD, CMPEQ) as SXU_PROGRAM.
 
