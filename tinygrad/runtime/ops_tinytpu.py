@@ -382,8 +382,8 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
     if len(set(src_sizes)) > 1 or (src_sizes and src_sizes[0] != out_size):
         return None
     alu_uops = [u for u in uops if u.op in _ALU_MAP]
-    # RELU: WHERE+CMPLT with exactly 2 params total (out + src), no other ALU ops
-    is_relu = (op_counts.get("WHERE", 0) > 0 and op_counts.get("CMPLT", 0) > 0
+    # RELU: WHERE+CMPLT with exactly out_size of each (not doubled like clip)
+    is_relu = (op_counts.get("WHERE", 0) == out_size and op_counts.get("CMPLT", 0) == out_size
                and len(params) == 2 and len(src_params) == 1
                and not any(op_counts.get(k.name, 0) > 0 for k in [Ops.ADD, Ops.MUL, Ops.MAX]))
 
