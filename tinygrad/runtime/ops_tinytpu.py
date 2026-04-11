@@ -1427,46 +1427,76 @@ def _build_gemm_bundle(weight_i8: np.ndarray, act_i8: np.ndarray) -> str:
     )
 
 
-def _build_gemm_epilogue_bundle(weight_i8: np.ndarray, act_i8: np.ndarray,
+def _build_gemm_epilogue_bundle(weight_tiles_i8: list[np.ndarray], act_tiles_i8: list[np.ndarray],
                                 bias_i32: np.ndarray | None = None,
                                 relu: bool = False) -> str:
-    """MXU GEMM with optional bias-add and ReLU epilogue, all in hardware.
+    """MXU GEMM with K-tile accumulation and optional bias-add/ReLU epilogue, all in hardware.
 
-    Program: MXU → WAIT → LOAD_MXU_RESULT(v0) → [LOAD bias(v1), ADD(v2=v0+v1)] → [RELU(v3=relu(vN))] → STORE → HALT
-    Output via VMEM (not MXU output), so the result includes the epilogue.
+    For num_k_tiles K-tiles:
+      1. Preload all weight tiles into WMEM[0..K-1], activation tiles into AMEM[0..K-1]
+      2. For each k: MXU(WMEM[k], AMEM[k], 1) → WAIT → LOAD_MXU_RESULT(v_k)
+      3. VPU ADD to accumulate partial results
+      4. Optional bias add + relu epilogue
+      5. STORE result to VMEM, output via VMEM
     """
-    lines: list[str] = [
-        _wmem(0, [int(x) for x in weight_i8.flatten()]),
-        _amem(1, [int(x) for x in act_i8]),
-        _mxu(0, 1, 1),
-        _wait_mxu(),
-        _load_mxu_result(0),   # v0 = MXU result (row 0 = 4 values)
-    ]
-    cur_vreg = 0  # tracks which vreg holds the current result
+    num_k = len(weight_tiles_i8)
+    assert len(act_tiles_i8) == num_k
 
+    # Preload data records
+    data_lines: list[str] = []
+    for k in range(num_k):
+        data_lines.append(_wmem(k, [int(x) for x in weight_tiles_i8[k].flatten()]))
+        data_lines.append(_amem(k, [int(x) for x in act_tiles_i8[k]]))
+
+    # Bias preload into VMEM[0] if needed
+    vmem_bias_addr = 0
     if bias_i32 is not None:
-        # Preload bias into VMEM[0], load into v1, broadcast, add
         bias_tile = [0] * _TILE_ELEMS
         for i in range(_COLS):
             bias_tile[i] = int(bias_i32[i])
-        lines.insert(0, _vmem(0, bias_tile))   # VMEM[0] = bias (row 0 only)
-        lines.append(_load(1, 0))              # v1 = VMEM[0] (bias in row 0)
-        lines.append(_vpu(2, 0, _VPU_OPS["ADD"], 1))  # v2 = v0 + v1
-        cur_vreg = 2
+        data_lines.append(_vmem(vmem_bias_addr, bias_tile))
 
+    # Program: MXU dispatches + accumulation
+    prog_lines: list[str] = []
+    for k in range(num_k):
+        prog_lines.append(_mxu(k, k, 1))        # MXU WMEM[k], AMEM[k], tiles=1
+        prog_lines.append(_wait_mxu())
+        prog_lines.append(_load_mxu_result(k))   # v_k = MXU result
+
+    # Accumulate K-tile partial results via VPU ADD
+    if num_k == 1:
+        cur_vreg = 0
+    else:
+        # v0 + v1 → v_{num_k}, then + v2 → v_{num_k+1}, etc.
+        acc_vreg = num_k  # first accumulator vreg
+        prog_lines.append(_vpu(acc_vreg, 0, _VPU_OPS["ADD"], 1))  # acc = v0 + v1
+        cur_vreg = acc_vreg
+        for k in range(2, num_k):
+            next_vreg = cur_vreg + 1
+            prog_lines.append(_vpu(next_vreg, cur_vreg, _VPU_OPS["ADD"], k))  # acc += v_k
+            cur_vreg = next_vreg
+
+    # Epilogue: bias add
+    if bias_i32 is not None:
+        bias_vreg = cur_vreg + 1
+        prog_lines.append(_load(bias_vreg, vmem_bias_addr))   # load bias from VMEM
+        result_vreg = bias_vreg + 1
+        prog_lines.append(_vpu(result_vreg, cur_vreg, _VPU_OPS["ADD"], bias_vreg))
+        cur_vreg = result_vreg
+
+    # Epilogue: relu
     if relu:
         next_vreg = cur_vreg + 1
-        lines.append(_vpu(next_vreg, cur_vreg, 2))  # VPU_RELU (unary, opcode 2)
+        prog_lines.append(_vpu(next_vreg, cur_vreg, 2))  # VPU_RELU (unary, opcode 2)
         cur_vreg = next_vreg
 
     out_vmem = 1 if bias_i32 is not None else 0
-    lines += [
+    prog_lines += [
         _store(out_vmem, cur_vreg),
         _halt(),
-        _output_vmem(out_vmem),
-        _end(),
     ]
-    return _bundle(*lines)
+
+    return _bundle(*(data_lines + prog_lines + [_output_vmem(out_vmem), _end()]))
 
 
 def _build_vpu_binary_bundle(lhs_i32: np.ndarray, rhs_i32: np.ndarray, num_elems: int, vpu_op: int,
@@ -1644,10 +1674,10 @@ def _run_gemm_vec(sim: str, weight_i8: np.ndarray, act_i8: np.ndarray) -> list[i
     return result
 
 
-def _run_gemm_epilogue_vec(sim: str, weight_i8: np.ndarray, act_i8: np.ndarray,
+def _run_gemm_epilogue_vec(sim: str, weight_tiles_i8: list[np.ndarray], act_tiles_i8: list[np.ndarray],
                            bias_i32: np.ndarray | None, relu: bool) -> list[int]:
-    """Run a fused MXU GEMM + epilogue (bias/relu) in hardware, return 4 int32 values."""
-    bundle_text = _build_gemm_epilogue_bundle(weight_i8, act_i8, bias_i32=bias_i32, relu=relu)
+    """Run a fused MXU GEMM + K-tile accumulation + epilogue (bias/relu) in hardware, return 4 int32 values."""
+    bundle_text = _build_gemm_epilogue_bundle(weight_tiles_i8, act_tiles_i8, bias_i32=bias_i32, relu=relu)
     stdout = _run_bundle(sim, bundle_text)
     vals = _parse_vmem_output(stdout)
     if vals is None:
@@ -2148,43 +2178,36 @@ class TinyTPUProgram:
         out_i32 = np.empty(num_vecs * out_cols, dtype="<i4")
         act_rows = act_i32.reshape(num_vecs, k_cols).astype(np.int8)
 
-        # Determine if we can fuse epilogue in hardware (single K-tile only)
+        # Parse epilogue into hardware-level parameters
         epilogue = prog.get("epilogue", [])
-        hw_epilogue = epilogue and num_k_tiles == 1
         hw_bias: np.ndarray | None = None
         hw_relu = False
-        if hw_epilogue:
-            for step in epilogue:
-                if step["op"] == "ADD":
-                    raw = np.frombuffer(bytes(bufs[int(step["arg"])]), dtype="<i4")
-                    hw_bias = raw[:_COLS]
-                elif step["op"] == "RELU":
-                    hw_relu = True
+        for step in epilogue:
+            if step["op"] == "ADD":
+                hw_bias = np.frombuffer(bytes(bufs[int(step["arg"])]), dtype="<i4")
+            elif step["op"] == "RELU":
+                hw_relu = True
+        use_hw_epilogue = bool(epilogue) or num_k_tiles > 1
 
         for i, act_row in enumerate(act_rows):
             row_base = i * out_cols
             for tile_idx in range(num_weight_tiles):
                 col_base = row_base + tile_idx * _COLS
-                weight_i8 = weight_matrix[:_ROWS, tile_idx * _COLS : (tile_idx + 1) * _COLS].astype(np.int8) if num_k_tiles == 1 else None
-                if hw_epilogue:
-                    act_i8 = act_row[:_ROWS]
-                    bias_tile = hw_bias if hw_bias is not None else None
-                    if num_weight_tiles > 1 and hw_bias is not None:
-                        # For wide output, select the bias slice for this tile
-                        raw = np.frombuffer(bytes(bufs[int(epilogue[0]["arg"])]), dtype="<i4")
-                        bias_tile = raw[tile_idx * _COLS : (tile_idx + 1) * _COLS]
+                # Collect weight and activation tiles for all K-tiles
+                w_tiles = [weight_matrix[k * _ROWS : (k + 1) * _ROWS,
+                                         tile_idx * _COLS : (tile_idx + 1) * _COLS].astype(np.int8)
+                           for k in range(num_k_tiles)]
+                a_tiles = [act_row[k * _ROWS : (k + 1) * _ROWS] for k in range(num_k_tiles)]
+                # Bias slice for this weight tile
+                bias_tile = None
+                if hw_bias is not None:
+                    bias_tile = hw_bias[tile_idx * _COLS : (tile_idx + 1) * _COLS]
+                if use_hw_epilogue:
                     out_i32[col_base : col_base + _COLS] = _run_gemm_epilogue_vec(
-                        sim, weight_i8, act_i8, bias_i32=bias_tile, relu=hw_relu)
+                        sim, w_tiles, a_tiles, bias_i32=bias_tile, relu=hw_relu)
                 else:
-                    acc = np.zeros(_COLS, dtype=np.int32)
-                    for k_idx in range(num_k_tiles):
-                        act_i8 = act_row[k_idx * _ROWS : (k_idx + 1) * _ROWS]
-                        weight_k8 = weight_matrix[k_idx * _ROWS : (k_idx + 1) * _ROWS,
-                                                  tile_idx * _COLS : (tile_idx + 1) * _COLS].astype(np.int8)
-                        acc += np.array(_run_gemm_vec(sim, weight_k8, act_i8), dtype=np.int32)
-                    out_i32[col_base : col_base + _COLS] = acc
-        if not hw_epilogue:
-            out_i32 = _apply_gemm_epilogue(bufs, out_i32, prog)
+                    # Plain GEMM with no epilogue — single K-tile fast path
+                    out_i32[col_base : col_base + _COLS] = _run_gemm_vec(sim, w_tiles[0], a_tiles[0])
         out_buf[: len(out_i32) * _BYTES_PER_ELEM] = out_i32.tobytes()
         return 1e-3  # placeholder timing (seconds)
 
