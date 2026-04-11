@@ -1635,6 +1635,115 @@ def _parse_vmem_output(stdout: str) -> list[int] | None:
     return None
 
 
+def _build_full_gemm_bundle(act_rows_i8: np.ndarray, weight_matrix_i8: np.ndarray,
+                            num_vecs: int, num_k_tiles: int, num_weight_tiles: int,
+                            bias_i32: np.ndarray | None = None, relu: bool = False) -> str:
+    """Build a single SXU program that computes all rows×tiles of a GEMM + epilogue.
+
+    Preloads all weight tiles into WMEM, all activation rows into AMEM,
+    and bias into VMEM. Runs one MXU dispatch per (row, k_tile), accumulates
+    via VPU, applies epilogue, and stores each row's result to a separate
+    VMEM address for output.
+    """
+    data_lines: list[str] = []
+
+    # Preload weight tiles into WMEM: address = k*num_weight_tiles + tile_idx
+    for k in range(num_k_tiles):
+        for t in range(num_weight_tiles):
+            w_tile = weight_matrix_i8[k * _ROWS : (k + 1) * _ROWS,
+                                      t * _COLS : (t + 1) * _COLS]
+            wmem_addr = k * num_weight_tiles + t
+            data_lines.append(_wmem(wmem_addr, [int(x) for x in w_tile.flatten()]))
+
+    # Preload activation rows into AMEM: address = row * num_k_tiles + k
+    for row in range(num_vecs):
+        for k in range(num_k_tiles):
+            a_tile = act_rows_i8[row, k * _ROWS : (k + 1) * _ROWS]
+            amem_addr = row * num_k_tiles + k
+            data_lines.append(_amem(amem_addr, [int(x) for x in a_tile]))
+
+    # Preload bias tiles into VMEM if needed (one tile per weight_tile)
+    bias_vmem_base = 0
+    if bias_i32 is not None:
+        for t in range(num_weight_tiles):
+            bias_tile = [0] * _TILE_ELEMS
+            for i in range(_COLS):
+                bias_tile[i] = int(bias_i32[t * _COLS + i])
+            data_lines.append(_vmem(bias_vmem_base + t, bias_tile))
+
+    # Output VMEM addresses: one per (row, weight_tile)
+    # Start after bias tiles
+    out_vmem_base = (num_weight_tiles if bias_i32 is not None else 0)
+
+    # Build SXU program
+    prog_lines: list[str] = []
+    for row in range(num_vecs):
+        for tile_idx in range(num_weight_tiles):
+            # MXU dispatches for K-tile accumulation
+            for k in range(num_k_tiles):
+                wmem_addr = k * num_weight_tiles + tile_idx
+                amem_addr = row * num_k_tiles + k
+                vreg_k = k  # v0, v1, ... for K-tile partials
+                prog_lines.append(_mxu(wmem_addr, amem_addr, 1))
+                prog_lines.append(_wait_mxu())
+                prog_lines.append(_load_mxu_result(vreg_k))
+
+            # Accumulate K-tiles
+            if num_k_tiles == 1:
+                cur = 0
+            else:
+                acc = num_k_tiles  # first free vreg after K-tile results
+                prog_lines.append(_vpu(acc, 0, _VPU_OPS["ADD"], 1))
+                cur = acc
+                for k in range(2, num_k_tiles):
+                    nxt = cur + 1
+                    prog_lines.append(_vpu(nxt, cur, _VPU_OPS["ADD"], k))
+                    cur = nxt
+
+            # Bias epilogue
+            if bias_i32 is not None:
+                bias_vreg = cur + 1
+                prog_lines.append(_load(bias_vreg, bias_vmem_base + tile_idx))
+                result_vreg = bias_vreg + 1
+                prog_lines.append(_vpu(result_vreg, cur, _VPU_OPS["ADD"], bias_vreg))
+                cur = result_vreg
+
+            # ReLU epilogue
+            if relu:
+                nxt = cur + 1
+                prog_lines.append(_vpu(nxt, cur, 2))  # VPU_RELU
+                cur = nxt
+
+            # Store result
+            out_addr = out_vmem_base + row * num_weight_tiles + tile_idx
+            prog_lines.append(_store(out_addr, cur))
+
+    prog_lines.append(_halt())
+
+    # Output records
+    output_lines: list[str] = []
+    for row in range(num_vecs):
+        for tile_idx in range(num_weight_tiles):
+            out_addr = out_vmem_base + row * num_weight_tiles + tile_idx
+            output_lines.append(_output_vmem(out_addr))
+    output_lines.append(_end())
+
+    return _bundle(*(data_lines + prog_lines + output_lines))
+
+
+def _parse_multi_vmem_output(stdout: str) -> list[list[int]]:
+    """Extract all vmem_result lines from BSV sim stdout."""
+    results = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("vmem_result "):
+            vals = line.split()[1:]
+            if len(vals) != _ROWS * _COLS:
+                raise ValueError(f"vmem_result expects {_ROWS * _COLS} values, got {len(vals)}")
+            results.append([int(x) for x in vals])
+    return results
+
+
 def _run_gemm_vec(sim: str, weight_i8: np.ndarray, act_i8: np.ndarray) -> list[int]:
     bundle_text = _build_gemm_bundle(weight_i8, act_i8)
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
@@ -2173,12 +2282,11 @@ class TinyTPUProgram:
         _require_int8_range("activation", act_i32)
 
         # Downcast to int8 (hardware operand type)
-        weight_matrix = weight_i32.reshape(k_cols, out_cols)
-        sim = _sim_path()
-        out_i32 = np.empty(num_vecs * out_cols, dtype="<i4")
+        weight_matrix = weight_i32.reshape(k_cols, out_cols).astype(np.int8)
         act_rows = act_i32.reshape(num_vecs, k_cols).astype(np.int8)
+        sim = _sim_path()
 
-        # Parse epilogue into hardware-level parameters
+        # Parse epilogue
         epilogue = prog.get("epilogue", [])
         hw_bias: np.ndarray | None = None
         hw_relu = False
@@ -2187,27 +2295,28 @@ class TinyTPUProgram:
                 hw_bias = np.frombuffer(bytes(bufs[int(step["arg"])]), dtype="<i4")
             elif step["op"] == "RELU":
                 hw_relu = True
-        use_hw_epilogue = bool(epilogue) or num_k_tiles > 1
 
-        for i, act_row in enumerate(act_rows):
-            row_base = i * out_cols
+        # Build one bundle for the entire GEMM (all rows × tiles)
+        bundle = _build_full_gemm_bundle(act_rows, weight_matrix,
+                                         num_vecs, num_k_tiles, num_weight_tiles,
+                                         bias_i32=hw_bias, relu=hw_relu)
+        stdout = _run_bundle(sim, bundle)
+        vmem_results = _parse_multi_vmem_output(stdout)
+
+        expected_tiles = num_vecs * num_weight_tiles
+        if len(vmem_results) != expected_tiles:
+            raise RuntimeError(
+                f"TinyTPU full GEMM expected {expected_tiles} vmem_result lines, got {len(vmem_results)}\n"
+                f"stdout: {stdout[:500]}")
+
+        # Assemble output from VMEM tiles (row-major: row0_tile0, row0_tile1, ..., row1_tile0, ...)
+        out_i32 = np.empty(num_vecs * out_cols, dtype="<i4")
+        for row in range(num_vecs):
             for tile_idx in range(num_weight_tiles):
-                col_base = row_base + tile_idx * _COLS
-                # Collect weight and activation tiles for all K-tiles
-                w_tiles = [weight_matrix[k * _ROWS : (k + 1) * _ROWS,
-                                         tile_idx * _COLS : (tile_idx + 1) * _COLS].astype(np.int8)
-                           for k in range(num_k_tiles)]
-                a_tiles = [act_row[k * _ROWS : (k + 1) * _ROWS] for k in range(num_k_tiles)]
-                # Bias slice for this weight tile
-                bias_tile = None
-                if hw_bias is not None:
-                    bias_tile = hw_bias[tile_idx * _COLS : (tile_idx + 1) * _COLS]
-                if use_hw_epilogue:
-                    out_i32[col_base : col_base + _COLS] = _run_gemm_epilogue_vec(
-                        sim, w_tiles, a_tiles, bias_i32=bias_tile, relu=hw_relu)
-                else:
-                    # Plain GEMM with no epilogue — single K-tile fast path
-                    out_i32[col_base : col_base + _COLS] = _run_gemm_vec(sim, w_tiles[0], a_tiles[0])
+                tile_data = vmem_results[row * num_weight_tiles + tile_idx]
+                col_base = row * out_cols + tile_idx * _COLS
+                out_i32[col_base : col_base + _COLS] = tile_data[:_COLS]
+
         out_buf[: len(out_i32) * _BYTES_PER_ELEM] = out_i32.tobytes()
         return 1e-3  # placeholder timing (seconds)
 
