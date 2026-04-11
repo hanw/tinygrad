@@ -213,8 +213,6 @@ class TinyTPURenderer(Renderer):
     def render(self, uops: list[UOp]) -> str:  # type: ignore[override]
         if (sxu_desc := _render_sxu_program(uops)) is not None:
             return _dump_lowering(json.dumps(sxu_desc))
-        if (wmma_desc := _render_wmma_descriptor(uops)) is not None:
-            return _dump_lowering(json.dumps(wmma_desc))
         if (legacy := _render_legacy_descriptor(uops)) is not None:
             return _dump_lowering(json.dumps(legacy))
         op_counts = dict(sorted(Counter(u.op.name for u in uops).items()))
@@ -226,74 +224,6 @@ class TinyTPURenderer(Renderer):
             "op_counts": op_counts,
         }))
 
-
-def _render_wmma_descriptor(uops: list[UOp]) -> dict | None:
-    wmmas = [u for u in uops if u.op is Ops.WMMA]
-    if not wmmas:
-        return None
-
-    wmma = wmmas[0]
-
-    out_params = {_find_unique_param_arg(store.src[0]) for store in uops if store.op is Ops.STORE}
-    out_params.discard(None)
-    src0_param = _find_unique_param_arg(wmma.src[0])
-    src1_param = _find_unique_param_arg(wmma.src[1])
-    if len(out_params) != 1 or src0_param is None or src1_param is None:
-        return {
-            "op": "UNSUPPORTED",
-            "reason": "could not recover WMMA buffer parameters",
-            "missing_instructions": ["wmma buffer mapping"],
-            "notes": ["The renderer found a WMMA op but could not map it cleanly to output and input PARAM nodes."],
-            "op_counts": dict(sorted(Counter(u.op.name for u in uops).items())),
-        }
-
-    out_arg = next(iter(out_params))
-    act_arg, weight_arg = src0_param, src1_param
-    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
-    if out_arg not in params or act_arg not in params or weight_arg not in params:
-        return {
-            "op": "UNSUPPORTED",
-            "reason": "wmma params missing pointer metadata",
-            "missing_instructions": ["wmma param sizing"],
-            "notes": ["TinyTPU needs pointer-backed PARAM metadata to infer GEMM tiling from a WMMA kernel."],
-            "op_counts": dict(sorted(Counter(u.op.name for u in uops).items())),
-        }
-
-    out_size = params[out_arg].dtype.size
-    act_size = params[act_arg].dtype.size
-    weight_size = params[weight_arg].dtype.size
-    if (tiling := _infer_tiling(out_size, act_size, weight_size)) is None:
-        return {
-            "op": "UNSUPPORTED",
-            "reason": f"unexpected wmma param sizes {[out_size, act_size, weight_size]}",
-            "missing_instructions": ["wmma tiling inference"],
-            "notes": [_tiling_failure_note(out_size, act_size, weight_size)],
-            "op_counts": dict(sorted(Counter(u.op.name for u in uops).items())),
-        }
-
-    num_vecs, num_k_tiles, num_weight_tiles = tiling
-    out_cols = num_weight_tiles * _COLS
-    epilogue, epilogue_error = _extract_wmma_epilogue(uops, params, out_arg, act_arg, weight_arg, out_size, out_cols)
-    if epilogue_error is not None:
-        return {
-            "op": "UNSUPPORTED",
-            "reason": epilogue_error,
-            "missing_instructions": ["wmma epilogue lowering"],
-            "notes": ["TinyTPU recognized the WMMA kernel, but the post-WMMA elementwise suffix did not match a supported epilogue shape."],
-            "op_counts": dict(sorted(Counter(u.op.name for u in uops).items())),
-        }
-
-    return {
-        "op": "GEMM4x4",
-        "out": out_arg,
-        "act": act_arg,
-        "weight": weight_arg,
-        "num_vecs": num_vecs,
-        "num_k_tiles": num_k_tiles,
-        "num_weight_tiles": num_weight_tiles,
-        "lowering": "WMMA",
-        "epilogue": epilogue,
-    }
 
 
 def _render_sxu_program(uops: list[UOp]) -> dict | None:
