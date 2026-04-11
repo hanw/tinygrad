@@ -118,7 +118,8 @@ class TinyTPURenderer(Renderer):
                                                   "out": diag["out_arg"],
                                                   "src": diag["src_arg"],
                                                   "num_rows": diag["num_rows"],
-                                                  "num_cols": diag["num_cols"]}))
+                                                  "num_cols": diag["num_cols"],
+                                                  "vpu_op": diag["vpu_op"]}))
             if diag["kind"] == "vpu_program":
                 return _dump_lowering(json.dumps({"op": "VPU_PROGRAM",
                                                   "out": diag["out_arg"],
@@ -246,26 +247,45 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     is_single_binary = len(params) == 3 and len(matched_single_binary_ops) == 1 and op_counts.get("LOAD", 0) in {0, 2} and op_counts.get("STORE", 0) == 1 and not _has_bool_logic_op
     _has_fused_cmp = op_counts.get("CMPLT", 0) > 0 and op_counts.get("WHERE", 0) > 0
     is_grouped_binary = len(params) == 3 and len(matched_grouped_binary_ops) == 1 and op_counts.get("STORE", 0) == 4 and op_counts.get("GROUP", 0) == 1 and not _has_bool_logic_op and not _has_fused_cmp
-    if (len(params) == 2
-            and op_counts.get("RANGE", 0) == 1
-            and op_counts.get("MUL", 0) == 1
-            and op_counts.get("LOAD", 0) == 4
-            and op_counts.get("STORE", 0) == 1
-            and param_sizes.get(1) is not None
-            and param_sizes.get(0) is not None
-            and 1 < param_sizes.get(0, 0) <= _ROWS
-            and param_sizes.get(1) == param_sizes.get(0, 0) * _COLS):
+    _is_rowwise = (len(params) == 2
+                   and op_counts.get("RANGE", 0) == 1
+                   and op_counts.get("MUL", 0) == 1
+                   and op_counts.get("LOAD", 0) == 4
+                   and op_counts.get("STORE", 0) == 1
+                   and param_sizes.get(1) is not None
+                   and param_sizes.get(0) is not None
+                   and 1 < param_sizes.get(0, 0) <= _ROWS
+                   and param_sizes.get(1) == param_sizes.get(0, 0) * _COLS)
+    if _is_rowwise:
         nrows = param_sizes[0]
-        diag.update({
-            "supported": True,
-            "kind": "vpu_rowsum",
-            "reason": f"supported row-wise sum {nrows}x{_COLS}",
-            "out_arg": 0,
-            "src_arg": 1,
-            "num_rows": nrows,
-            "num_cols": _COLS,
-        })
-        return diag
+        # Discriminate by the reduction operator in the loop body:
+        # sum:  ADD > 3 (3 for addressing + 3 for summing), no MAX
+        # max:  MAX == _COLS-1 (tree of comparisons), no XOR
+        # min:  MAX == _COLS-1 and XOR > 0 (tinygrad encodes min as XOR+MAX)
+        if op_counts.get("ADD", 0) > _COLS - 1 and op_counts.get("MAX", 0) == 0:
+            row_vpu_op = 4  # SUM_REDUCE
+            row_reason = f"supported row-wise sum {nrows}x{_COLS}"
+        elif op_counts.get("MAX", 0) >= _COLS - 1 and op_counts.get("XOR", 0) == 0:
+            row_vpu_op = _VPU_OPS["MAX_REDUCE"]
+            row_reason = f"supported row-wise max {nrows}x{_COLS}"
+        elif op_counts.get("MAX", 0) >= _COLS - 1 and op_counts.get("XOR", 0) > 0:
+            row_vpu_op = _VPU_OPS["MIN_REDUCE"]
+            row_reason = f"supported row-wise min {nrows}x{_COLS}"
+        else:
+            row_vpu_op = None
+            row_reason = None
+        if row_vpu_op is not None:
+            diag.update({
+                "supported": True,
+                "kind": "vpu_rowsum",
+                "reason": row_reason,
+                "out_arg": 0,
+                "src_arg": 1,
+                "num_rows": nrows,
+                "num_cols": _COLS,
+                "vpu_op": row_vpu_op,
+            })
+            return diag
     if len(params) == 2 and op_counts.get("STORE", 0) == 1 and op_counts.get("ADD", 0) > 0 and param_sizes.get(0) == 1:
         out_size = param_sizes.get(0)
         src_size = param_sizes.get(1)
@@ -1608,7 +1628,8 @@ class TinyTPUProgram:
             # Pad to a full _ROWS × _COLS tile for the hardware
             padded = np.zeros(_TILE_ELEMS, dtype=np.int32)
             padded[:num_rows * num_cols] = src_i32
-            stdout = _run_bundle(sim, _build_vpu_unary_bundle(padded, _TILE_ELEMS, 4))  # vpu_op=4 SUM_REDUCE
+            row_vpu_op = int(prog.get("vpu_op", 4))  # default 4=SUM_REDUCE
+            stdout = _run_bundle(sim, _build_vpu_unary_bundle(padded, _TILE_ELEMS, row_vpu_op))
             result = _parse_vmem_output(stdout)
             if result is None:
                 raise RuntimeError(
