@@ -113,6 +113,13 @@ class TinyTPURenderer(Renderer):
                                                   "lhs": diag["lhs_arg"],
                                                   "rhs": diag["rhs_arg"],
                                                   "num_elems": diag["num_elems"]}))
+            if diag["kind"] == "host_rowreduce":
+                return _dump_lowering(json.dumps({"op": "HOST_ROWREDUCE",
+                                                  "out": diag["out_arg"],
+                                                  "src": diag["src_arg"],
+                                                  "nrows": diag["nrows"],
+                                                  "ncols": diag["ncols"],
+                                                  "host_op": diag["host_op"]}))
             if diag["kind"] == "host_colreduce":
                 return _dump_lowering(json.dumps({"op": "HOST_COLREDUCE",
                                                   "out": diag["out_arg"],
@@ -259,15 +266,19 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     _is_grouped_sc = (len(params) == 2 and op_counts.get("GROUP", 0) == 1
                       and op_counts.get("STORE", 0) == 4 and op_counts.get("LOAD", 0) == 4
                       and op_counts.get("RANGE", 0) == 1 and not _has_bool_logic_op)
+    # Row-wise reduction: generalised to any ncols >= 2 (LOAD=ncols per row).
+    _rw_ncols = (param_sizes.get(1, 0) // param_sizes.get(0, 1)
+                 if param_sizes.get(0, 0) > 0 else 0)
     _is_rowwise = (len(params) == 2
                    and op_counts.get("RANGE", 0) == 1
                    and op_counts.get("MUL", 0) == 1
-                   and op_counts.get("LOAD", 0) == 4
                    and op_counts.get("STORE", 0) == 1
+                   and op_counts.get("LOAD", 0) == _rw_ncols
                    and param_sizes.get(1) is not None
                    and param_sizes.get(0) is not None
                    and 1 < param_sizes.get(0, 0)
-                   and param_sizes.get(1) == param_sizes.get(0, 0) * _COLS)
+                   and _rw_ncols >= 2                    # ncols=1 is not a meaningful reduction
+                   and param_sizes.get(1) == param_sizes.get(0, 0) * _rw_ncols)
     # Column-wise reduction: same UOp shape as row-wise but MUL=0 (no stride
     # multiply — each column accesses consecutive rows with fixed offsets).
     _is_colwise = (len(params) == 2
@@ -308,34 +319,44 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
             })
             return diag
     if _is_rowwise:
-        nrows = param_sizes[0]
-        # Discriminate by the reduction operator in the loop body:
-        # sum:  ADD > 3 (3 for addressing + 3 for summing), no MAX
-        # max:  MAX == _COLS-1 (tree of comparisons), no XOR
-        # min:  MAX == _COLS-1 and XOR > 0 (tinygrad encodes min as XOR+MAX)
-        if op_counts.get("ADD", 0) > _COLS - 1 and op_counts.get("MAX", 0) == 0:
-            row_vpu_op = 4  # SUM_REDUCE
-            row_reason = f"supported row-wise sum {nrows}x{_COLS}"
-        elif op_counts.get("MAX", 0) >= _COLS - 1 and op_counts.get("XOR", 0) == 0:
-            row_vpu_op = _VPU_OPS["MAX_REDUCE"]
-            row_reason = f"supported row-wise max {nrows}x{_COLS}"
-        elif op_counts.get("MAX", 0) >= _COLS - 1 and op_counts.get("XOR", 0) > 0:
-            row_vpu_op = _VPU_OPS["MIN_REDUCE"]
-            row_reason = f"supported row-wise min {nrows}x{_COLS}"
+        nrows    = param_sizes[0]
+        ncols_rw = _rw_ncols
+        nloads   = op_counts.get("LOAD", 0)
+        # Discriminate reduction op by loop body:
+        if op_counts.get("ADD", 0) > nloads - 1 and op_counts.get("MAX", 0) == 0:
+            rw_op = "SUM"
+        elif op_counts.get("MAX", 0) >= nloads - 1 and op_counts.get("XOR", 0) == 0:
+            rw_op = "MAX"
+        elif op_counts.get("MAX", 0) >= nloads - 1 and op_counts.get("XOR", 0) > 0:
+            rw_op = "MIN"
         else:
-            row_vpu_op = None
-            row_reason = None
-        if row_vpu_op is not None:
-            diag.update({
-                "supported": True,
-                "kind": "vpu_rowsum",
-                "reason": row_reason,
-                "out_arg": 0,
-                "src_arg": 1,
-                "num_rows": nrows,
-                "num_cols": _COLS,
-                "vpu_op": row_vpu_op,
-            })
+            rw_op = None
+        if rw_op is not None:
+            if ncols_rw == _COLS:
+                # Hardware path: VPU SUM/MAX/MIN REDUCE on 4-column tiles
+                vpu_ops_map = {"SUM": 4, "MAX": _VPU_OPS["MAX_REDUCE"], "MIN": _VPU_OPS["MIN_REDUCE"]}
+                diag.update({
+                    "supported": True,
+                    "kind": "vpu_rowsum",
+                    "reason": f"supported row-wise {rw_op.lower()} {nrows}x{ncols_rw}",
+                    "out_arg": 0,
+                    "src_arg": 1,
+                    "num_rows": nrows,
+                    "num_cols": ncols_rw,
+                    "vpu_op": vpu_ops_map[rw_op],
+                })
+            else:
+                # Host fallback for non-_COLS column count
+                diag.update({
+                    "supported": True,
+                    "kind": "host_rowreduce",
+                    "reason": f"supported host row-wise {rw_op.lower()} {nrows}x{ncols_rw}",
+                    "out_arg": 0,
+                    "src_arg": 1,
+                    "nrows": nrows,
+                    "ncols": ncols_rw,
+                    "host_op": rw_op,
+                })
             return diag
     if len(params) == 2 and op_counts.get("STORE", 0) == 1 and op_counts.get("ADD", 0) > 0 and param_sizes.get(0) == 1:
         out_size = param_sizes.get(0)
@@ -1491,7 +1512,7 @@ class TinyTPUProgram:
                  wait: bool = False,
                  **kwargs) -> float | None:
         prog = self.prog
-        if prog.get("op") not in {"GEMM4x4", "VPU_BINARY", "VPU_UNARY", "VPU_WHERE", "VPU_PROGRAM", "VPU_ROWSUM", "HOST_COLREDUCE", "HOST_BINARY", "HOST_UNARY"}:
+        if prog.get("op") not in {"GEMM4x4", "VPU_BINARY", "VPU_UNARY", "VPU_WHERE", "VPU_PROGRAM", "VPU_ROWSUM", "HOST_ROWREDUCE", "HOST_COLREDUCE", "HOST_BINARY", "HOST_UNARY"}:
             raise NotImplementedError(_unsupported_message(prog))
 
         if prog.get("op") == "VPU_BINARY":
@@ -1732,6 +1753,29 @@ class TinyTPUProgram:
                     chunk_out = np.array(result[:out_chunk_size], dtype="<i4")
                     out_buf[out_offset : out_offset + len(chunk_out) * _BYTES_PER_ELEM] = chunk_out.tobytes()
                     out_offset += len(chunk_out) * _BYTES_PER_ELEM
+            return 1e-3
+
+        if prog.get("op") == "HOST_ROWREDUCE":
+            # Row-wise reduction for non-standard column count (host numpy).
+            out_buf = bufs[prog["out"]]
+            src_i32 = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<i4")
+            nrows   = int(prog["nrows"])
+            ncols   = int(prog["ncols"])
+            if src_i32.size < nrows * ncols:
+                raise RuntimeError(
+                    f"TinyTPU HOST_ROWREDUCE expected at least {nrows*ncols} elements, "
+                    f"got {src_i32.size}")
+            mat = src_i32[:nrows * ncols].reshape(nrows, ncols)
+            host_op = prog["host_op"]
+            if host_op == "SUM":
+                result = mat.sum(axis=1).astype(np.int32)
+            elif host_op == "MAX":
+                result = mat.max(axis=1).astype(np.int32)
+            elif host_op == "MIN":
+                result = mat.min(axis=1).astype(np.int32)
+            else:
+                raise RuntimeError(f"Unknown HOST_ROWREDUCE op {host_op!r}")
+            out_buf[:nrows * _BYTES_PER_ELEM] = result.tobytes()
             return 1e-3
 
         if prog.get("op") == "HOST_COLREDUCE":
