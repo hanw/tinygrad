@@ -542,6 +542,40 @@ def _render_multistep_sxu_program(uops: list[UOp]) -> dict | None:
                             "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
         # Scalar-const MIN stays on old path (XOR encoding makes const recovery fragile)
 
+    # --- FUSED ADD+RELU: 3 params, ADD+WHERE+CMPLT → ADD then RELU ---
+    has_add = data_alu.get("ADD", 0) > 0
+    if (len(src_params) == 2 and has_where and has_cmplt and has_add and not has_idiv
+            and op_counts.get("WHERE", 0) == op_counts.get("STORE", 0)):
+        # Trace ADD operand order
+        add_uops_data = [u for u in uops if u.op is Ops.ADD and _has_load_src(u)]
+        if add_uops_data:
+            lhs_arg = _find_unique_param_arg(add_uops_data[0].src[0])
+            rhs_arg = _find_unique_param_arg(add_uops_data[0].src[1])
+            if lhs_arg is not None and rhs_arg is not None:
+                num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+                addrs_per_tile = 3  # lhs, rhs, out
+                all_instrs, data_plan, outputs = [], [], []
+                RELU_OP = 2  # VPU_RELU opcode
+                for tile_idx in range(num_tiles):
+                    base = tile_idx * addrs_per_tile
+                    offset = tile_idx * _TILE_ELEMS
+                    count = min(_TILE_ELEMS, out_size - offset)
+                    data_plan.append({"type": "VMEM", "addr": base, "param": lhs_arg,
+                                      "offset": offset, "count": count, "dtype": "int32"})
+                    data_plan.append({"type": "VMEM", "addr": base + 1, "param": rhs_arg,
+                                      "offset": offset, "count": count, "dtype": "int32"})
+                    out_vmem = base + 2
+                    all_instrs += [
+                        _load(0, base), _load(1, base + 1),
+                        _vpu(2, 0, ADD_OP, 1),   # v2 = x + y
+                        _vpu(3, 2, RELU_OP),      # v3 = relu(v2)
+                        _store(out_vmem, 3),
+                    ]
+                    outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
+                all_instrs.append(_halt())
+                return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+                        "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
+
     # --- CLIP: 2 params, WHERE+CMPLT (double count vs STORE), constants → MIN(x, hi), MAX(result, lo) ---
     store_count = op_counts.get("STORE", 0)
     if (len(src_params) == 1 and has_where and has_cmplt and not has_mul and not has_idiv
