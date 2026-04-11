@@ -381,17 +381,17 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
     src_sizes = [params[k].dtype.size for k in src_params]
     if len(set(src_sizes)) > 1 or (src_sizes and src_sizes[0] != out_size):
         return None
-    # Only handle kernels with exactly one type of ALU op (not multi-op patterns like abs=MUL+MAX)
-    alu_op_types = sum(1 for k in _ALU_MAP if op_counts.get(k.name, 0) > 0)
-    if alu_op_types > 1 and not is_neg_add:  # neg_add (SUB) is a known 2-op pattern
-        return None
     alu_uops = [u for u in uops if u.op in _ALU_MAP]
     is_relu = op_counts.get("WHERE", 0) > 0 and op_counts.get("CMPLT", 0) > 0
-    has_range = op_counts.get("RANGE", 0) > 0
 
     # Detect SUB pattern: MUL(x, -1) + ADD → emit VPU SUB
     is_neg_add = (op_counts.get("MUL", 0) > 0 and op_counts.get("ADD", 0) > 0
                   and any(u.op is Ops.CONST and u.arg == -1 for u in uops))
+
+    # Only handle kernels with exactly one type of ALU op (not multi-op patterns like abs=MUL+MAX)
+    alu_op_types = sum(1 for k in _ALU_MAP if op_counts.get(k.name, 0) > 0)
+    if alu_op_types > 1 and not is_neg_add:
+        return None
 
     # Build the VPU instruction sequence for ONE tile
     tile_instrs: list[str] = []
