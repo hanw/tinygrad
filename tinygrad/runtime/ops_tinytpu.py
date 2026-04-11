@@ -217,6 +217,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
     """
     wmmas = [u for u in uops if u.op is Ops.WMMA]
     if not wmmas:
+        if (where_desc := _render_where_sxu_program(uops)) is not None:
+            return where_desc
         return _render_elementwise_sxu_program(uops)
 
     wmma = wmmas[0]
@@ -334,6 +336,94 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
         "num_vecs": num_vecs,
         "num_k_tiles": num_k_tiles,
         "num_weight_tiles": num_weight_tiles,
+        "out": out_arg,
+    }
+
+
+def _render_where_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render a WHERE (ternary select) kernel as SXU_PROGRAM.
+
+    WHERE(cond, lhs, rhs) = cond*lhs + (1-cond)*rhs via 4 VPU instructions per tile.
+    Expects 4 params: out, cond (bool), lhs (int32), rhs (int32).
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    if op_counts.get("WHERE", 0) == 0:
+        return None
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 4:
+        return None
+
+    # Find output param
+    out_params = set()
+    for s in uops:
+        if s.op is Ops.STORE:
+            p = _find_unique_param_arg(s.src[0])
+            if p is not None: out_params.add(p)
+    if len(out_params) != 1:
+        return None
+    out_arg = next(iter(out_params))
+    out_size = params[out_arg].dtype.size
+    input_args = sorted(k for k in params if k != out_arg)
+    if len(input_args) != 3:
+        return None
+
+    # All inputs must be same size or size 1 (broadcast)
+    if not all(params[a].dtype.size in {1, out_size} for a in input_args):
+        return None
+
+    # Identify cond (bool dtype), lhs, rhs from WHERE UOp sources
+    where_uop = next(u for u in uops if u.op is Ops.WHERE)
+    cond_arg = _find_unique_param_arg(where_uop.src[0])
+    lhs_arg = _find_unique_param_arg(where_uop.src[1])
+    rhs_arg = _find_unique_param_arg(where_uop.src[2])
+    if cond_arg is None or lhs_arg is None or rhs_arg is None:
+        return None
+
+    MUL, SUB, ADD = _VPU_OPS["MUL"], _VPU_OPS["SUB"], _VPU_OPS["ADD"]
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    addrs_per_tile = 5  # cond, lhs, rhs, ones, out
+
+    all_instrs: list[str] = []
+    data_plan: list[dict] = []
+    outputs: list[dict] = []
+
+    for tile_idx in range(num_tiles):
+        base = tile_idx * addrs_per_tile
+        offset = tile_idx * _TILE_ELEMS
+        count = min(_TILE_ELEMS, out_size - offset)
+
+        # Data plan: cond, lhs, rhs, ones
+        data_plan.append({"type": "VMEM", "addr": base, "param": cond_arg,
+                          "offset": offset, "count": count, "dtype": "int32", "bool": True})
+        data_plan.append({"type": "VMEM", "addr": base + 1, "param": lhs_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        data_plan.append({"type": "VMEM", "addr": base + 2, "param": rhs_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        data_plan.append({"type": "VMEM", "addr": base + 3,
+                          "layout": "broadcast_const", "value": 1, "count": count, "dtype": "int32"})
+
+        out_vmem = base + 4
+        all_instrs += [
+            _load(0, base),        # v0 = cond
+            _load(1, base + 1),    # v1 = lhs
+            _load(2, base + 2),    # v2 = rhs
+            _load(3, base + 3),    # v3 = ones
+            _vpu(4, 0, MUL, 1),    # v4 = cond * lhs
+            _vpu(5, 3, SUB, 0),    # v5 = 1 - cond
+            _vpu(6, 5, MUL, 2),    # v6 = (1-cond) * rhs
+            _vpu(7, 4, ADD, 6),    # v7 = result
+            _store(out_vmem, 7),
+        ]
+        outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
+
+    all_instrs.append(_halt())
+
+    return {
+        "op": "SXU_PROGRAM",
+        "instructions": all_instrs,
+        "data_plan": data_plan,
+        "outputs": outputs,
+        "num_output_tiles": num_tiles,
         "out": out_arg,
     }
 
