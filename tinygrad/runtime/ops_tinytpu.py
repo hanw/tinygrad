@@ -1427,6 +1427,48 @@ def _build_gemm_bundle(weight_i8: np.ndarray, act_i8: np.ndarray) -> str:
     )
 
 
+def _build_gemm_epilogue_bundle(weight_i8: np.ndarray, act_i8: np.ndarray,
+                                bias_i32: np.ndarray | None = None,
+                                relu: bool = False) -> str:
+    """MXU GEMM with optional bias-add and ReLU epilogue, all in hardware.
+
+    Program: MXU → WAIT → LOAD_MXU_RESULT(v0) → [LOAD bias(v1), ADD(v2=v0+v1)] → [RELU(v3=relu(vN))] → STORE → HALT
+    Output via VMEM (not MXU output), so the result includes the epilogue.
+    """
+    lines: list[str] = [
+        _wmem(0, [int(x) for x in weight_i8.flatten()]),
+        _amem(1, [int(x) for x in act_i8]),
+        _mxu(0, 1, 1),
+        _wait_mxu(),
+        _load_mxu_result(0),   # v0 = MXU result (row 0 = 4 values)
+    ]
+    cur_vreg = 0  # tracks which vreg holds the current result
+
+    if bias_i32 is not None:
+        # Preload bias into VMEM[0], load into v1, broadcast, add
+        bias_tile = [0] * _TILE_ELEMS
+        for i in range(_COLS):
+            bias_tile[i] = int(bias_i32[i])
+        lines.insert(0, _vmem(0, bias_tile))   # VMEM[0] = bias (row 0 only)
+        lines.append(_load(1, 0))              # v1 = VMEM[0] (bias in row 0)
+        lines.append(_vpu(2, 0, _VPU_OPS["ADD"], 1))  # v2 = v0 + v1
+        cur_vreg = 2
+
+    if relu:
+        next_vreg = cur_vreg + 1
+        lines.append(_vpu(next_vreg, cur_vreg, 2))  # VPU_RELU (unary, opcode 2)
+        cur_vreg = next_vreg
+
+    out_vmem = 1 if bias_i32 is not None else 0
+    lines += [
+        _store(out_vmem, cur_vreg),
+        _halt(),
+        _output_vmem(out_vmem),
+        _end(),
+    ]
+    return _bundle(*lines)
+
+
 def _build_vpu_binary_bundle(lhs_i32: np.ndarray, rhs_i32: np.ndarray, num_elems: int, vpu_op: int,
                              lhs_broadcast: bool = False, rhs_broadcast: bool = False) -> str:
     """VMEM[0]=lhs, VMEM[1]=rhs, VPU v2=OP(v0,v1), OUTPUT_VMEM VMEM[2]."""
