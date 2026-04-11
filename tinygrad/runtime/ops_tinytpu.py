@@ -1907,10 +1907,16 @@ def _unsupported_message(prog: dict) -> str:
 # ---------------------------------------------------------------------------
 # Program — drives the BSV simulator
 # ---------------------------------------------------------------------------
+_SUPPORTED_OPS = {"GEMM4x4", "VPU_BINARY", "VPU_UNARY", "VPU_WHERE", "VPU_PROGRAM", "VPU_ROWSUM", "VPU_ROWBC_BINARY", "HOST_ROWREDUCE", "HOST_COLREDUCE", "HOST_BINARY", "HOST_UNARY"}
+
 class TinyTPUProgram:
     def __init__(self, name: str, lib: bytes, *args, **kwargs):
         self.name = name
         self.prog = json.loads(lib)
+        self.sim = _sim_path()
+
+    def _run(self, bundle_text: str) -> str:
+        return _run_bundle(self.sim, bundle_text)
 
     def __call__(self, *bufs: bytearray,
                  global_size: tuple = (1, 1, 1),
@@ -1919,358 +1925,363 @@ class TinyTPUProgram:
                  wait: bool = False,
                  **kwargs) -> float | None:
         prog = self.prog
-        if prog.get("op") not in {"GEMM4x4", "VPU_BINARY", "VPU_UNARY", "VPU_WHERE", "VPU_PROGRAM", "VPU_ROWSUM", "VPU_ROWBC_BINARY", "HOST_ROWREDUCE", "HOST_COLREDUCE", "HOST_BINARY", "HOST_UNARY"}:
+        op = prog.get("op")
+        if op not in _SUPPORTED_OPS:
             raise NotImplementedError(_unsupported_message(prog))
+        return getattr(self, f"_exec_{op.lower()}")(bufs)
 
-        if prog.get("op") == "VPU_BINARY":
-            out_buf = bufs[prog["out"]]
-            num_elems = int(prog["num_elems"])
-            bool_inputs = prog.get("bool_in", False) or prog.get("bool_out", False)
-            if prog.get("lhs_const") is None:
-                lhs_raw = np.frombuffer(bytes(bufs[prog["lhs"]]), dtype=np.bool_ if bool_inputs else "<i4")
-                lhs_i32 = lhs_raw.astype(np.int32) if bool_inputs else lhs_raw
+    def _exec_vpu_binary(self, bufs):
+        prog = self.prog
+        out_buf = bufs[prog["out"]]
+        num_elems = int(prog["num_elems"])
+        bool_inputs = prog.get("bool_in", False) or prog.get("bool_out", False)
+        if prog.get("lhs_const") is None:
+            lhs_raw = np.frombuffer(bytes(bufs[prog["lhs"]]), dtype=np.bool_ if bool_inputs else "<i4")
+            lhs_i32 = lhs_raw.astype(np.int32) if bool_inputs else lhs_raw
+        else:
+            lhs_i32 = np.full(num_elems, int(prog["lhs_const"]), dtype="<i4")
+        if prog.get("rhs_const") is None:
+            rhs_raw = np.frombuffer(bytes(bufs[prog["rhs"]]), dtype=np.bool_ if bool_inputs else "<i4")
+            rhs_i32 = rhs_raw.astype(np.int32) if bool_inputs else rhs_raw
+        else:
+            rhs_i32 = np.full(num_elems, int(prog["rhs_const"]), dtype="<i4")
+        lhs_broadcast = bool(prog.get("lhs_broadcast", False)) and prog.get("lhs_const") is None
+        rhs_broadcast = bool(prog.get("rhs_broadcast", False)) and prog.get("rhs_const") is None
+        if lhs_i32.size not in {1, num_elems} or rhs_i32.size not in {1, num_elems}:
+            raise RuntimeError(f"TinyTPU VPU binary op expected {num_elems} elements, got lhs={lhs_i32.size} rhs={rhs_i32.size}")
+        is_bool = int(prog["vpu_op"]) in _VPU_BOOL_OPS or prog.get("bool_out", False)
+        out_elem_bytes = 1 if is_bool else _BYTES_PER_ELEM
+        if len(out_buf) < num_elems * out_elem_bytes:
+            raise RuntimeError(f"TinyTPU output buffer too small for VPU binary op elements={num_elems}")
+        vpu_op = int(prog["vpu_op"])
+        out_offset = 0
+        for chunk_start in range(0, num_elems, _TILE_ELEMS):
+            chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
+            chunk_size = chunk_end - chunk_start
+            lhs_chunk = lhs_i32[:1] if lhs_broadcast else lhs_i32[chunk_start:chunk_end]
+            rhs_chunk = rhs_i32[:1] if rhs_broadcast else rhs_i32[chunk_start:chunk_end]
+            result = _parse_vmem_output(self._run(_build_vpu_binary_bundle(lhs_chunk, rhs_chunk, chunk_size, vpu_op,
+                                                                           lhs_broadcast=lhs_broadcast, rhs_broadcast=rhs_broadcast)))
+            if result is None:
+                raise RuntimeError("TinyTPU sim produced no vmem_result")
+            if is_bool:
+                chunk_out = np.array(result[:chunk_size], dtype=np.bool_)
+                out_buf[out_offset : out_offset + len(chunk_out)] = chunk_out.tobytes()
+                out_offset += len(chunk_out)
             else:
-                lhs_i32 = np.full(num_elems, int(prog["lhs_const"]), dtype="<i4")
-            if prog.get("rhs_const") is None:
-                rhs_raw = np.frombuffer(bytes(bufs[prog["rhs"]]), dtype=np.bool_ if bool_inputs else "<i4")
-                rhs_i32 = rhs_raw.astype(np.int32) if bool_inputs else rhs_raw
-            else:
-                rhs_i32 = np.full(num_elems, int(prog["rhs_const"]), dtype="<i4")
-            lhs_broadcast = bool(prog.get("lhs_broadcast", False)) and prog.get("lhs_const") is None
-            rhs_broadcast = bool(prog.get("rhs_broadcast", False)) and prog.get("rhs_const") is None
-            if lhs_i32.size not in {1, num_elems} or rhs_i32.size not in {1, num_elems}:
-                raise RuntimeError(f"TinyTPU VPU binary op expected {num_elems} elements, got lhs={lhs_i32.size} rhs={rhs_i32.size}")
-            is_bool = int(prog["vpu_op"]) in _VPU_BOOL_OPS or prog.get("bool_out", False)
-            out_elem_bytes = 1 if is_bool else _BYTES_PER_ELEM
-            if len(out_buf) < num_elems * out_elem_bytes:
-                raise RuntimeError(f"TinyTPU output buffer too small for VPU binary op elements={num_elems}")
-            sim = _sim_path()
-            vpu_op = int(prog["vpu_op"])
-            out_offset = 0
-            for chunk_start in range(0, num_elems, _TILE_ELEMS):
-                chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
-                chunk_size = chunk_end - chunk_start
-                lhs_chunk = lhs_i32[:1] if lhs_broadcast else lhs_i32[chunk_start:chunk_end]
-                rhs_chunk = rhs_i32[:1] if rhs_broadcast else rhs_i32[chunk_start:chunk_end]
-                stdout = _run_bundle(sim, _build_vpu_binary_bundle(lhs_chunk, rhs_chunk, chunk_size, vpu_op,
-                                                                   lhs_broadcast=lhs_broadcast, rhs_broadcast=rhs_broadcast))
-                result = _parse_vmem_output(stdout)
-                if result is None:
-                    raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
-                if is_bool:
-                    chunk_out = np.array(result[:chunk_size], dtype=np.bool_)
-                    out_buf[out_offset : out_offset + len(chunk_out)] = chunk_out.tobytes()
-                    out_offset += len(chunk_out)
+                chunk_out = np.array(result[:chunk_size], dtype="<i4")
+                out_buf[out_offset : out_offset + len(chunk_out) * _BYTES_PER_ELEM] = chunk_out.tobytes()
+                out_offset += len(chunk_out) * _BYTES_PER_ELEM
+        return 1e-3
+
+    def _exec_vpu_where(self, bufs):
+        prog = self.prog
+        out_buf = bufs[prog["out"]]
+        num_elems = int(prog["num_elems"])
+        cond_i32 = np.frombuffer(bytes(bufs[prog["cond"]]), dtype=np.bool_)[:num_elems].astype(np.int32)
+        lhs_i32 = np.frombuffer(bytes(bufs[prog["lhs"]]), dtype="<i4")
+        rhs_i32 = np.frombuffer(bytes(bufs[prog["rhs"]]), dtype="<i4")
+        if len(out_buf) < num_elems * _BYTES_PER_ELEM:
+            raise RuntimeError(f"TinyTPU output buffer too small for VPU WHERE elements={num_elems}")
+        out_offset = 0
+        for chunk_start in range(0, num_elems, _TILE_ELEMS):
+            chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
+            chunk_size = chunk_end - chunk_start
+            result = _parse_vmem_output(self._run(_build_vpu_where_bundle(
+                cond_i32[chunk_start:chunk_end], lhs_i32[chunk_start:chunk_end],
+                rhs_i32[chunk_start:chunk_end], chunk_size)))
+            if result is None:
+                raise RuntimeError("TinyTPU sim produced no vmem_result")
+            chunk_out = np.array(result[:chunk_size], dtype="<i4")
+            out_buf[out_offset : out_offset + len(chunk_out) * _BYTES_PER_ELEM] = chunk_out.tobytes()
+            out_offset += len(chunk_out) * _BYTES_PER_ELEM
+        return 1e-3
+
+    def _exec_vpu_program(self, bufs):
+        prog = self.prog
+        out_buf = bufs[prog["out"]]
+        num_elems = int(prog["num_elems"])
+        if len(out_buf) < num_elems * _BYTES_PER_ELEM:
+            raise RuntimeError(f"TinyTPU output buffer too small for VPU program elements={num_elems}")
+        out_offset = 0
+        for chunk_start in range(0, num_elems, _TILE_ELEMS):
+            chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
+            chunk_size = chunk_end - chunk_start
+            input_tiles: list[np.ndarray] = []
+            input_broadcasts: list[bool] = []
+            for spec in prog["inputs"]:
+                if "const" in spec:
+                    input_tiles.append(np.full(chunk_size, int(spec["const"]), dtype=np.int32))
+                    input_broadcasts.append(False)
+                    continue
+                is_bool = bool(spec.get("bool", False))
+                broadcast = bool(spec.get("broadcast", False))
+                raw = np.frombuffer(bytes(bufs[int(spec["arg"])]), dtype=np.bool_ if is_bool else "<i4")
+                if raw.size == 1 and chunk_size > 1 and broadcast:
+                    chunk = raw[:1].astype(np.int32) if is_bool else raw[:1]
                 else:
-                    chunk_out = np.array(result[:chunk_size], dtype="<i4")
-                    out_buf[out_offset : out_offset + len(chunk_out) * _BYTES_PER_ELEM] = chunk_out.tobytes()
-                    out_offset += len(chunk_out) * _BYTES_PER_ELEM
-            return 1e-3
+                    chunk = raw[chunk_start:chunk_end].astype(np.int32) if is_bool else raw[chunk_start:chunk_end]
+                    if raw.size == 1 and chunk_size > 1:
+                        scalar = int(raw[0])
+                        chunk = np.full(chunk_size, scalar, dtype=np.int32)
+                if chunk.size != chunk_size:
+                    if not (broadcast and chunk.size == 1):
+                        raise RuntimeError(f"TinyTPU VPU program input expected {chunk_size} elements, got {chunk.size}")
+                input_tiles.append(np.asarray(chunk, dtype=np.int32))
+                input_broadcasts.append(broadcast)
+            stdout = self._run(_build_vpu_program_bundle(input_tiles, chunk_size, prog["steps"], int(prog["output_reg"]),
+                                                                input_broadcasts=input_broadcasts))
+            result = _parse_vmem_output(stdout)
+            if result is None:
+                raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
+            chunk_out = np.array(result[:chunk_size], dtype="<i4")
+            out_buf[out_offset : out_offset + len(chunk_out) * _BYTES_PER_ELEM] = chunk_out.tobytes()
+            out_offset += len(chunk_out) * _BYTES_PER_ELEM
+        return 1e-3
 
-        if prog.get("op") == "VPU_WHERE":
-            out_buf = bufs[prog["out"]]
-            num_elems = int(prog["num_elems"])
-            cond_raw = np.frombuffer(bytes(bufs[prog["cond"]]), dtype=np.bool_)
-            lhs_i32 = np.frombuffer(bytes(bufs[prog["lhs"]]), dtype="<i4")
-            rhs_i32 = np.frombuffer(bytes(bufs[prog["rhs"]]), dtype="<i4")
-            cond_i32 = cond_raw[:num_elems].astype(np.int32)
-            if len(out_buf) < num_elems * _BYTES_PER_ELEM:
-                raise RuntimeError(f"TinyTPU output buffer too small for VPU WHERE elements={num_elems}")
-            sim = _sim_path()
+    def _exec_host_binary(self, bufs):
+        prog = self.prog
+        out_buf = bufs[prog["out"]]
+        num_elems = int(prog["num_elems"])
+        lhs_i32 = np.full(num_elems, int(prog["lhs_const"]), dtype=np.int32) if prog.get("lhs_const") is not None else np.frombuffer(bytes(bufs[prog["lhs"]]), dtype="<i4")
+        rhs_i32 = np.full(num_elems, int(prog["rhs_const"]), dtype=np.int32) if prog.get("rhs_const") is not None else np.frombuffer(bytes(bufs[prog["rhs"]]), dtype="<i4")
+        if lhs_i32.size == 1 and num_elems > 1:
+            lhs_i32 = np.full(num_elems, int(lhs_i32[0]), dtype=np.int32)
+        if rhs_i32.size == 1 and num_elems > 1:
+            rhs_i32 = np.full(num_elems, int(rhs_i32[0]), dtype=np.int32)
+        if lhs_i32.size != num_elems or rhs_i32.size != num_elems:
+            raise RuntimeError(f"TinyTPU host binary op expected {num_elems} elements, got lhs={lhs_i32.size} rhs={rhs_i32.size}")
+        if np.any(rhs_i32 == 0):
+            raise ZeroDivisionError("TinyTPU host division fallback received divisor 0")
+        q = np.trunc(lhs_i32.astype(np.float64) / rhs_i32.astype(np.float64)).astype(np.int32)
+        if prog["host_op"] == "IDIV":
+            out_i32 = q
+        elif prog["host_op"] == "MOD":
+            out_i32 = lhs_i32 - q * rhs_i32
+        else:
+            raise RuntimeError(f"unknown TinyTPU host binary op {prog['host_op']}")
+        out_buf[: len(out_i32) * _BYTES_PER_ELEM] = np.asarray(out_i32, dtype="<i4").tobytes()
+        return 1e-3
+
+    def _exec_host_unary(self, bufs):
+        prog = self.prog
+        out_buf = bufs[prog["out"]]
+        num_elems = int(prog["num_elems"])
+        if prog.get("dtype") != "float32":
+            raise RuntimeError(f"unsupported TinyTPU host unary dtype {prog.get('dtype')}")
+        src_f32 = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<f4")
+        if src_f32.size != num_elems:
+            raise RuntimeError(f"TinyTPU host unary op expected {num_elems} elements, got src={src_f32.size}")
+        if prog["host_op"] == "TRUNC":
+            out_f32 = np.trunc(src_f32).astype(np.float32)
+        elif prog["host_op"] == "RECIPROCAL":
+            out_f32 = np.reciprocal(src_f32.astype(np.float32))
+        else:
+            raise RuntimeError(f"unknown TinyTPU host unary op {prog['host_op']}")
+        out_buf[: len(out_f32) * 4] = np.asarray(out_f32, dtype="<f4").tobytes()
+        return 1e-3
+
+    def _exec_vpu_unary(self, bufs):
+        prog = self.prog
+        out_buf = bufs[prog["out"]]
+        src_i32 = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<i4")
+        num_elems = int(prog["num_elems"])
+        out_elems = int(prog["out_elems"])
+        if src_i32.size != num_elems:
+            raise RuntimeError(f"TinyTPU VPU unary op expected {num_elems} elements, got src={src_i32.size}")
+        if len(out_buf) < out_elems * _BYTES_PER_ELEM:
+            raise RuntimeError(f"TinyTPU output buffer too small for VPU unary op elements={out_elems}")
+        vpu_op = int(prog["vpu_op"])
+        is_sum_reduce = vpu_op == 4 and out_elems == 1
+        is_max_reduce = vpu_op == _VPU_OPS["MAX_REDUCE"] and out_elems == 1
+        is_min_reduce = vpu_op == _VPU_OPS["MIN_REDUCE"] and out_elems == 1
+        if is_sum_reduce:
+            # Sum reduction: chunk into tiles, sum each via VPU_SUM_REDUCE,
+            # then accumulate partial sums on the host.
+            total = np.int32(0)
+            for chunk_start in range(0, num_elems, _TILE_ELEMS):
+                chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
+                chunk_size = chunk_end - chunk_start
+                src_chunk = src_i32[chunk_start:chunk_end]
+                # Pad chunk to 4 elements minimum for VPU_SUM_REDUCE row
+                padded = np.zeros(_TILE_ELEMS, dtype=np.int32)
+                padded[:chunk_size] = src_chunk
+                stdout = self._run(_build_vpu_unary_bundle(padded, _TILE_ELEMS, vpu_op))
+                result = _parse_vmem_output(stdout)
+                if result is None:
+                    raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
+                # VPU_SUM_REDUCE broadcasts row sums; sum the 4 row sums
+                row_sums = [result[r * _COLS] for r in range(_ROWS)]
+                total += np.int32(sum(row_sums))
+            out_i32 = np.array([total], dtype="<i4")
+            out_buf[: _BYTES_PER_ELEM] = out_i32.tobytes()
+        elif is_max_reduce:
+            # Max reduction: chunk into tiles, max each via VPU_MAX_REDUCE,
+            # then take the running max across tiles on the host.
+            import sys
+            running_max = np.int32(-2**31)  # INT32_MIN
+            for chunk_start in range(0, num_elems, _TILE_ELEMS):
+                chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
+                chunk_size = chunk_end - chunk_start
+                src_chunk = src_i32[chunk_start:chunk_end]
+                padded = np.full(_TILE_ELEMS, -2**31, dtype=np.int32)
+                padded[:chunk_size] = src_chunk
+                stdout = self._run(_build_vpu_unary_bundle(padded, _TILE_ELEMS, vpu_op))
+                result = _parse_vmem_output(stdout)
+                if result is None:
+                    raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
+                # VPU_MAX_REDUCE broadcasts row maxes; take max of all row maxes
+                row_maxes = [np.int32(result[r * _COLS]) for r in range(_ROWS)]
+                tile_max = max(row_maxes)
+                running_max = max(running_max, tile_max)
+            out_i32 = np.array([running_max], dtype="<i4")
+            out_buf[: _BYTES_PER_ELEM] = out_i32.tobytes()
+        elif is_min_reduce:
+            running_min = np.int32(2**31 - 1)  # INT32_MAX
+            for chunk_start in range(0, num_elems, _TILE_ELEMS):
+                chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
+                chunk_size = chunk_end - chunk_start
+                src_chunk = src_i32[chunk_start:chunk_end]
+                padded = np.full(_TILE_ELEMS, 2**31 - 1, dtype=np.int32)
+                padded[:chunk_size] = src_chunk
+                stdout = self._run(_build_vpu_unary_bundle(padded, _TILE_ELEMS, vpu_op))
+                result = _parse_vmem_output(stdout)
+                if result is None:
+                    raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
+                row_mins = [np.int32(result[r * _COLS]) for r in range(_ROWS)]
+                tile_min = min(row_mins)
+                running_min = min(running_min, tile_min)
+            out_i32 = np.array([running_min], dtype="<i4")
+            out_buf[: _BYTES_PER_ELEM] = out_i32.tobytes()
+        else:
             out_offset = 0
             for chunk_start in range(0, num_elems, _TILE_ELEMS):
                 chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
                 chunk_size = chunk_end - chunk_start
-                stdout = _run_bundle(sim, _build_vpu_where_bundle(
-                    cond_i32[chunk_start:chunk_end], lhs_i32[chunk_start:chunk_end],
-                    rhs_i32[chunk_start:chunk_end], chunk_size))
+                out_chunk_size = min(out_elems - (chunk_start if out_elems == num_elems else 0), chunk_size)
+                src_chunk = src_i32[chunk_start:chunk_end]
+                stdout = self._run(_build_vpu_unary_bundle(src_chunk, chunk_size, vpu_op))
                 result = _parse_vmem_output(stdout)
                 if result is None:
                     raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
-                chunk_out = np.array(result[:chunk_size], dtype="<i4")
+                chunk_out = np.array(result[:out_chunk_size], dtype="<i4")
                 out_buf[out_offset : out_offset + len(chunk_out) * _BYTES_PER_ELEM] = chunk_out.tobytes()
                 out_offset += len(chunk_out) * _BYTES_PER_ELEM
-            return 1e-3
+        return 1e-3
 
-        if prog.get("op") == "VPU_PROGRAM":
-            out_buf = bufs[prog["out"]]
-            num_elems = int(prog["num_elems"])
-            if len(out_buf) < num_elems * _BYTES_PER_ELEM:
-                raise RuntimeError(f"TinyTPU output buffer too small for VPU program elements={num_elems}")
-            sim = _sim_path()
-            out_offset = 0
-            for chunk_start in range(0, num_elems, _TILE_ELEMS):
-                chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
-                chunk_size = chunk_end - chunk_start
-                input_tiles: list[np.ndarray] = []
-                input_broadcasts: list[bool] = []
-                for spec in prog["inputs"]:
-                    if "const" in spec:
-                        input_tiles.append(np.full(chunk_size, int(spec["const"]), dtype=np.int32))
-                        input_broadcasts.append(False)
-                        continue
-                    is_bool = bool(spec.get("bool", False))
-                    broadcast = bool(spec.get("broadcast", False))
-                    raw = np.frombuffer(bytes(bufs[int(spec["arg"])]), dtype=np.bool_ if is_bool else "<i4")
-                    if raw.size == 1 and chunk_size > 1 and broadcast:
-                        chunk = raw[:1].astype(np.int32) if is_bool else raw[:1]
-                    else:
-                        chunk = raw[chunk_start:chunk_end].astype(np.int32) if is_bool else raw[chunk_start:chunk_end]
-                        if raw.size == 1 and chunk_size > 1:
-                            scalar = int(raw[0])
-                            chunk = np.full(chunk_size, scalar, dtype=np.int32)
-                    if chunk.size != chunk_size:
-                        if not (broadcast and chunk.size == 1):
-                            raise RuntimeError(f"TinyTPU VPU program input expected {chunk_size} elements, got {chunk.size}")
-                    input_tiles.append(np.asarray(chunk, dtype=np.int32))
-                    input_broadcasts.append(broadcast)
-                stdout = _run_bundle(sim, _build_vpu_program_bundle(input_tiles, chunk_size, prog["steps"], int(prog["output_reg"]),
-                                                                    input_broadcasts=input_broadcasts))
-                result = _parse_vmem_output(stdout)
-                if result is None:
-                    raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
-                chunk_out = np.array(result[:chunk_size], dtype="<i4")
-                out_buf[out_offset : out_offset + len(chunk_out) * _BYTES_PER_ELEM] = chunk_out.tobytes()
-                out_offset += len(chunk_out) * _BYTES_PER_ELEM
-            return 1e-3
+    def _exec_host_rowreduce(self, bufs):
+        prog = self.prog
+        # Row-wise reduction for non-standard column count (host numpy).
+        out_buf = bufs[prog["out"]]
+        src_i32 = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<i4")
+        nrows   = int(prog["nrows"])
+        ncols   = int(prog["ncols"])
+        if src_i32.size < nrows * ncols:
+            raise RuntimeError(
+                f"TinyTPU HOST_ROWREDUCE expected at least {nrows*ncols} elements, "
+                f"got {src_i32.size}")
+        mat = src_i32[:nrows * ncols].reshape(nrows, ncols)
+        host_op = prog["host_op"]
+        if host_op == "SUM":
+            result = mat.sum(axis=1).astype(np.int32)
+        elif host_op == "MAX":
+            result = mat.max(axis=1).astype(np.int32)
+        elif host_op == "MIN":
+            result = mat.min(axis=1).astype(np.int32)
+        else:
+            raise RuntimeError(f"Unknown HOST_ROWREDUCE op {host_op!r}")
+        out_buf[:nrows * _BYTES_PER_ELEM] = result.tobytes()
+        return 1e-3
 
-        if prog.get("op") == "HOST_BINARY":
-            out_buf = bufs[prog["out"]]
-            num_elems = int(prog["num_elems"])
-            lhs_i32 = np.full(num_elems, int(prog["lhs_const"]), dtype=np.int32) if prog.get("lhs_const") is not None else np.frombuffer(bytes(bufs[prog["lhs"]]), dtype="<i4")
-            rhs_i32 = np.full(num_elems, int(prog["rhs_const"]), dtype=np.int32) if prog.get("rhs_const") is not None else np.frombuffer(bytes(bufs[prog["rhs"]]), dtype="<i4")
-            if lhs_i32.size == 1 and num_elems > 1:
-                lhs_i32 = np.full(num_elems, int(lhs_i32[0]), dtype=np.int32)
-            if rhs_i32.size == 1 and num_elems > 1:
-                rhs_i32 = np.full(num_elems, int(rhs_i32[0]), dtype=np.int32)
-            if lhs_i32.size != num_elems or rhs_i32.size != num_elems:
-                raise RuntimeError(f"TinyTPU host binary op expected {num_elems} elements, got lhs={lhs_i32.size} rhs={rhs_i32.size}")
-            if np.any(rhs_i32 == 0):
-                raise ZeroDivisionError("TinyTPU host division fallback received divisor 0")
-            q = np.trunc(lhs_i32.astype(np.float64) / rhs_i32.astype(np.float64)).astype(np.int32)
-            if prog["host_op"] == "IDIV":
-                out_i32 = q
-            elif prog["host_op"] == "MOD":
-                out_i32 = lhs_i32 - q * rhs_i32
-            else:
-                raise RuntimeError(f"unknown TinyTPU host binary op {prog['host_op']}")
-            out_buf[: len(out_i32) * _BYTES_PER_ELEM] = np.asarray(out_i32, dtype="<i4").tobytes()
-            return 1e-3
+    def _exec_host_colreduce(self, bufs):
+        prog = self.prog
+        # Column-wise reduction (axis=0): compute sum/max/min across rows
+        # for each column, entirely on the host via numpy.
+        out_buf = bufs[prog["out"]]
+        src_i32 = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<i4")
+        nrows   = int(prog["nrows"])
+        ncols   = int(prog["ncols"])
+        if src_i32.size < nrows * ncols:
+            raise RuntimeError(
+                f"TinyTPU HOST_COLREDUCE expected at least {nrows*ncols} elements, "
+                f"got {src_i32.size}")
+        mat = src_i32[:nrows * ncols].reshape(nrows, ncols)
+        host_op = prog["host_op"]
+        if host_op == "SUM":
+            result = mat.sum(axis=0).astype(np.int32)
+        elif host_op == "MAX":
+            result = mat.max(axis=0).astype(np.int32)
+        elif host_op == "MIN":
+            result = mat.min(axis=0).astype(np.int32)
+        else:
+            raise RuntimeError(f"Unknown HOST_COLREDUCE op {host_op!r}")
+        out_buf[:ncols * _BYTES_PER_ELEM] = result.tobytes()
+        return 1e-3
 
-        if prog.get("op") == "HOST_UNARY":
-            out_buf = bufs[prog["out"]]
-            num_elems = int(prog["num_elems"])
-            if prog.get("dtype") != "float32":
-                raise RuntimeError(f"unsupported TinyTPU host unary dtype {prog.get('dtype')}")
-            src_f32 = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<f4")
-            if src_f32.size != num_elems:
-                raise RuntimeError(f"TinyTPU host unary op expected {num_elems} elements, got src={src_f32.size}")
-            if prog["host_op"] == "TRUNC":
-                out_f32 = np.trunc(src_f32).astype(np.float32)
-            elif prog["host_op"] == "RECIPROCAL":
-                out_f32 = np.reciprocal(src_f32.astype(np.float32))
-            else:
-                raise RuntimeError(f"unknown TinyTPU host unary op {prog['host_op']}")
-            out_buf[: len(out_f32) * 4] = np.asarray(out_f32, dtype="<f4").tobytes()
-            return 1e-3
+    def _exec_vpu_rowbc_binary(self, bufs):
+        prog = self.prog
+        # Row-broadcast binary op: apply ncols-element rhs to each row of
+        # nrows×ncols lhs.  e.g. bias-add: output[i*C:(i+1)*C] = lhs[i*C:(i+1)*C] + rhs.
+        out_buf  = bufs[prog["out"]]
+        lhs_i32  = np.frombuffer(bytes(bufs[prog["lhs"]]), dtype="<i4")
+        rhs_i32  = np.frombuffer(bytes(bufs[prog["rhs"]]), dtype="<i4")
+        num_elems = int(prog["num_elems"])
+        ncols    = int(prog["ncols"])
+        nrows    = int(prog["nrows"])
+        vpu_op   = int(prog["vpu_op"])
+        if lhs_i32.size < num_elems:
+            raise RuntimeError(f"TinyTPU VPU_ROWBC_BINARY lhs too small ({lhs_i32.size} < {num_elems})")
+        if rhs_i32.size < ncols:
+            raise RuntimeError(f"TinyTPU VPU_ROWBC_BINARY rhs too small ({rhs_i32.size} < {ncols})")
+        lhs_i32 = lhs_i32[:num_elems]
+        rhs_i32 = rhs_i32[:ncols]
+        out_offset = 0
+        for row in range(nrows):
+            lhs_chunk = lhs_i32[row * ncols : (row + 1) * ncols]
+            stdout = self._run(_build_vpu_binary_bundle(
+                lhs_chunk, rhs_i32, ncols, vpu_op))
+            result = _parse_vmem_output(stdout)
+            if result is None:
+                raise RuntimeError(f"TinyTPU VPU_ROWBC_BINARY row {row}: no vmem_result")
+            chunk_out = np.array(result[:ncols], dtype="<i4")
+            out_buf[out_offset : out_offset + ncols * _BYTES_PER_ELEM] = chunk_out.tobytes()
+            out_offset += ncols * _BYTES_PER_ELEM
+        return 1e-3
 
-        if prog.get("op") == "VPU_UNARY":
-            out_buf = bufs[prog["out"]]
-            src_i32 = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<i4")
-            num_elems = int(prog["num_elems"])
-            out_elems = int(prog["out_elems"])
-            if src_i32.size != num_elems:
-                raise RuntimeError(f"TinyTPU VPU unary op expected {num_elems} elements, got src={src_i32.size}")
-            if len(out_buf) < out_elems * _BYTES_PER_ELEM:
-                raise RuntimeError(f"TinyTPU output buffer too small for VPU unary op elements={out_elems}")
-            sim = _sim_path()
-            vpu_op = int(prog["vpu_op"])
-            is_sum_reduce = vpu_op == 4 and out_elems == 1
-            is_max_reduce = vpu_op == _VPU_OPS["MAX_REDUCE"] and out_elems == 1
-            is_min_reduce = vpu_op == _VPU_OPS["MIN_REDUCE"] and out_elems == 1
-            if is_sum_reduce:
-                # Sum reduction: chunk into tiles, sum each via VPU_SUM_REDUCE,
-                # then accumulate partial sums on the host.
-                total = np.int32(0)
-                for chunk_start in range(0, num_elems, _TILE_ELEMS):
-                    chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
-                    chunk_size = chunk_end - chunk_start
-                    src_chunk = src_i32[chunk_start:chunk_end]
-                    # Pad chunk to 4 elements minimum for VPU_SUM_REDUCE row
-                    padded = np.zeros(_TILE_ELEMS, dtype=np.int32)
-                    padded[:chunk_size] = src_chunk
-                    stdout = _run_bundle(sim, _build_vpu_unary_bundle(padded, _TILE_ELEMS, vpu_op))
-                    result = _parse_vmem_output(stdout)
-                    if result is None:
-                        raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
-                    # VPU_SUM_REDUCE broadcasts row sums; sum the 4 row sums
-                    row_sums = [result[r * _COLS] for r in range(_ROWS)]
-                    total += np.int32(sum(row_sums))
-                out_i32 = np.array([total], dtype="<i4")
-                out_buf[: _BYTES_PER_ELEM] = out_i32.tobytes()
-            elif is_max_reduce:
-                # Max reduction: chunk into tiles, max each via VPU_MAX_REDUCE,
-                # then take the running max across tiles on the host.
-                import sys
-                running_max = np.int32(-2**31)  # INT32_MIN
-                for chunk_start in range(0, num_elems, _TILE_ELEMS):
-                    chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
-                    chunk_size = chunk_end - chunk_start
-                    src_chunk = src_i32[chunk_start:chunk_end]
-                    padded = np.full(_TILE_ELEMS, -2**31, dtype=np.int32)
-                    padded[:chunk_size] = src_chunk
-                    stdout = _run_bundle(sim, _build_vpu_unary_bundle(padded, _TILE_ELEMS, vpu_op))
-                    result = _parse_vmem_output(stdout)
-                    if result is None:
-                        raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
-                    # VPU_MAX_REDUCE broadcasts row maxes; take max of all row maxes
-                    row_maxes = [np.int32(result[r * _COLS]) for r in range(_ROWS)]
-                    tile_max = max(row_maxes)
-                    running_max = max(running_max, tile_max)
-                out_i32 = np.array([running_max], dtype="<i4")
-                out_buf[: _BYTES_PER_ELEM] = out_i32.tobytes()
-            elif is_min_reduce:
-                running_min = np.int32(2**31 - 1)  # INT32_MAX
-                for chunk_start in range(0, num_elems, _TILE_ELEMS):
-                    chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
-                    chunk_size = chunk_end - chunk_start
-                    src_chunk = src_i32[chunk_start:chunk_end]
-                    padded = np.full(_TILE_ELEMS, 2**31 - 1, dtype=np.int32)
-                    padded[:chunk_size] = src_chunk
-                    stdout = _run_bundle(sim, _build_vpu_unary_bundle(padded, _TILE_ELEMS, vpu_op))
-                    result = _parse_vmem_output(stdout)
-                    if result is None:
-                        raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
-                    row_mins = [np.int32(result[r * _COLS]) for r in range(_ROWS)]
-                    tile_min = min(row_mins)
-                    running_min = min(running_min, tile_min)
-                out_i32 = np.array([running_min], dtype="<i4")
-                out_buf[: _BYTES_PER_ELEM] = out_i32.tobytes()
-            else:
-                out_offset = 0
-                for chunk_start in range(0, num_elems, _TILE_ELEMS):
-                    chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
-                    chunk_size = chunk_end - chunk_start
-                    out_chunk_size = min(out_elems - (chunk_start if out_elems == num_elems else 0), chunk_size)
-                    src_chunk = src_i32[chunk_start:chunk_end]
-                    stdout = _run_bundle(sim, _build_vpu_unary_bundle(src_chunk, chunk_size, vpu_op))
-                    result = _parse_vmem_output(stdout)
-                    if result is None:
-                        raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
-                    chunk_out = np.array(result[:out_chunk_size], dtype="<i4")
-                    out_buf[out_offset : out_offset + len(chunk_out) * _BYTES_PER_ELEM] = chunk_out.tobytes()
-                    out_offset += len(chunk_out) * _BYTES_PER_ELEM
-            return 1e-3
-
-        if prog.get("op") == "HOST_ROWREDUCE":
-            # Row-wise reduction for non-standard column count (host numpy).
-            out_buf = bufs[prog["out"]]
-            src_i32 = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<i4")
-            nrows   = int(prog["nrows"])
-            ncols   = int(prog["ncols"])
-            if src_i32.size < nrows * ncols:
+    def _exec_vpu_rowsum(self, bufs):
+        prog = self.prog
+        # Row-wise sum: for each row of a (nrows × ncols) tile, sum all
+        # columns using VPU_SUM_REDUCE (which broadcasts the row sum to all
+        # lane positions). Extract position 0 of each row from vmem_result.
+        out_buf  = bufs[prog["out"]]
+        src_i32  = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<i4")
+        num_rows = int(prog["num_rows"])
+        num_cols = int(prog["num_cols"])
+        if src_i32.size < num_rows * num_cols:
+            raise RuntimeError(
+                f"TinyTPU VPU_ROWSUM expected at least {num_rows*num_cols} elements, "
+                f"got {src_i32.size}")
+        src_i32 = src_i32[:num_rows * num_cols]  # trim tinygrad buffer padding
+        row_vpu_op = int(prog.get("vpu_op", 4))  # default 4=SUM_REDUCE
+        # Run VPU in _ROWS-row tiles; extract lane-0 per row across all tiles.
+        all_row_results: list[int] = []
+        for tile_start in range(0, num_rows, _ROWS):
+            tile_end = min(tile_start + _ROWS, num_rows)
+            tile_nrows = tile_end - tile_start
+            tile_padded = np.zeros(_TILE_ELEMS, dtype=np.int32)
+            tile_padded[:tile_nrows * num_cols] = src_i32[tile_start * num_cols:tile_end * num_cols]
+            tile_stdout = self._run(_build_vpu_unary_bundle(tile_padded, _TILE_ELEMS, row_vpu_op))
+            tile_result = _parse_vmem_output(tile_stdout)
+            if tile_result is None:
                 raise RuntimeError(
-                    f"TinyTPU HOST_ROWREDUCE expected at least {nrows*ncols} elements, "
-                    f"got {src_i32.size}")
-            mat = src_i32[:nrows * ncols].reshape(nrows, ncols)
-            host_op = prog["host_op"]
-            if host_op == "SUM":
-                result = mat.sum(axis=1).astype(np.int32)
-            elif host_op == "MAX":
-                result = mat.max(axis=1).astype(np.int32)
-            elif host_op == "MIN":
-                result = mat.min(axis=1).astype(np.int32)
-            else:
-                raise RuntimeError(f"Unknown HOST_ROWREDUCE op {host_op!r}")
-            out_buf[:nrows * _BYTES_PER_ELEM] = result.tobytes()
-            return 1e-3
+                    f"TinyTPU VPU_ROWSUM tile {tile_start}: no vmem_result\nstdout: {tile_stdout}")
+            all_row_results.extend(tile_result[r * _COLS] for r in range(tile_nrows))
+        row_sums = np.array(all_row_results, dtype=np.int32)
+        out_buf[:num_rows * _BYTES_PER_ELEM] = row_sums.tobytes()
+        return 1e-3
 
-        if prog.get("op") == "HOST_COLREDUCE":
-            # Column-wise reduction (axis=0): compute sum/max/min across rows
-            # for each column, entirely on the host via numpy.
-            out_buf = bufs[prog["out"]]
-            src_i32 = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<i4")
-            nrows   = int(prog["nrows"])
-            ncols   = int(prog["ncols"])
-            if src_i32.size < nrows * ncols:
-                raise RuntimeError(
-                    f"TinyTPU HOST_COLREDUCE expected at least {nrows*ncols} elements, "
-                    f"got {src_i32.size}")
-            mat = src_i32[:nrows * ncols].reshape(nrows, ncols)
-            host_op = prog["host_op"]
-            if host_op == "SUM":
-                result = mat.sum(axis=0).astype(np.int32)
-            elif host_op == "MAX":
-                result = mat.max(axis=0).astype(np.int32)
-            elif host_op == "MIN":
-                result = mat.min(axis=0).astype(np.int32)
-            else:
-                raise RuntimeError(f"Unknown HOST_COLREDUCE op {host_op!r}")
-            out_buf[:ncols * _BYTES_PER_ELEM] = result.tobytes()
-            return 1e-3
-
-        if prog.get("op") == "VPU_ROWBC_BINARY":
-            # Row-broadcast binary op: apply ncols-element rhs to each row of
-            # nrows×ncols lhs.  e.g. bias-add: output[i*C:(i+1)*C] = lhs[i*C:(i+1)*C] + rhs.
-            out_buf  = bufs[prog["out"]]
-            lhs_i32  = np.frombuffer(bytes(bufs[prog["lhs"]]), dtype="<i4")
-            rhs_i32  = np.frombuffer(bytes(bufs[prog["rhs"]]), dtype="<i4")
-            num_elems = int(prog["num_elems"])
-            ncols    = int(prog["ncols"])
-            nrows    = int(prog["nrows"])
-            vpu_op   = int(prog["vpu_op"])
-            if lhs_i32.size < num_elems:
-                raise RuntimeError(f"TinyTPU VPU_ROWBC_BINARY lhs too small ({lhs_i32.size} < {num_elems})")
-            if rhs_i32.size < ncols:
-                raise RuntimeError(f"TinyTPU VPU_ROWBC_BINARY rhs too small ({rhs_i32.size} < {ncols})")
-            lhs_i32 = lhs_i32[:num_elems]
-            rhs_i32 = rhs_i32[:ncols]
-            sim = _sim_path()
-            out_offset = 0
-            for row in range(nrows):
-                lhs_chunk = lhs_i32[row * ncols : (row + 1) * ncols]
-                stdout = _run_bundle(sim, _build_vpu_binary_bundle(
-                    lhs_chunk, rhs_i32, ncols, vpu_op))
-                result = _parse_vmem_output(stdout)
-                if result is None:
-                    raise RuntimeError(f"TinyTPU VPU_ROWBC_BINARY row {row}: no vmem_result")
-                chunk_out = np.array(result[:ncols], dtype="<i4")
-                out_buf[out_offset : out_offset + ncols * _BYTES_PER_ELEM] = chunk_out.tobytes()
-                out_offset += ncols * _BYTES_PER_ELEM
-            return 1e-3
-
-        if prog.get("op") == "VPU_ROWSUM":
-            # Row-wise sum: for each row of a (nrows × ncols) tile, sum all
-            # columns using VPU_SUM_REDUCE (which broadcasts the row sum to all
-            # lane positions). Extract position 0 of each row from vmem_result.
-            out_buf  = bufs[prog["out"]]
-            src_i32  = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<i4")
-            num_rows = int(prog["num_rows"])
-            num_cols = int(prog["num_cols"])
-            if src_i32.size < num_rows * num_cols:
-                raise RuntimeError(
-                    f"TinyTPU VPU_ROWSUM expected at least {num_rows*num_cols} elements, "
-                    f"got {src_i32.size}")
-            src_i32 = src_i32[:num_rows * num_cols]  # trim tinygrad buffer padding
-            sim = _sim_path()
-            row_vpu_op = int(prog.get("vpu_op", 4))  # default 4=SUM_REDUCE
-            # Run VPU in _ROWS-row tiles; extract lane-0 per row across all tiles.
-            all_row_results: list[int] = []
-            for tile_start in range(0, num_rows, _ROWS):
-                tile_end = min(tile_start + _ROWS, num_rows)
-                tile_nrows = tile_end - tile_start
-                tile_padded = np.zeros(_TILE_ELEMS, dtype=np.int32)
-                tile_padded[:tile_nrows * num_cols] = src_i32[tile_start * num_cols:tile_end * num_cols]
-                tile_stdout = _run_bundle(sim, _build_vpu_unary_bundle(tile_padded, _TILE_ELEMS, row_vpu_op))
-                tile_result = _parse_vmem_output(tile_stdout)
-                if tile_result is None:
-                    raise RuntimeError(
-                        f"TinyTPU VPU_ROWSUM tile {tile_start}: no vmem_result\nstdout: {tile_stdout}")
-                all_row_results.extend(tile_result[r * _COLS] for r in range(tile_nrows))
-            row_sums = np.array(all_row_results, dtype=np.int32)
-            out_buf[:num_rows * _BYTES_PER_ELEM] = row_sums.tobytes()
-            return 1e-3
-
+    def _exec_gemm4x4(self, bufs):
+        prog = self.prog
         out_buf    = bufs[prog["out"]]
         act_buf    = bufs[prog["act"]]
         weight_buf = bufs[prog["weight"]]
@@ -2297,7 +2308,6 @@ class TinyTPUProgram:
         # Downcast to int8 (hardware operand type)
         weight_matrix = weight_i32.reshape(k_cols, out_cols).astype(np.int8)
         act_rows = act_i32.reshape(num_vecs, k_cols).astype(np.int8)
-        sim = _sim_path()
 
         # Parse epilogue
         epilogue = prog.get("epilogue", [])
@@ -2313,7 +2323,7 @@ class TinyTPUProgram:
         bundle = _build_full_gemm_bundle(act_rows, weight_matrix,
                                          num_vecs, num_k_tiles, num_weight_tiles,
                                          bias_i32=hw_bias, relu=hw_relu)
-        stdout = _run_bundle(sim, bundle)
+        stdout = self._run(bundle)
         vmem_results = _parse_multi_vmem_output(stdout)
 
         expected_tiles = num_vecs * num_weight_tiles
