@@ -392,6 +392,9 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
     alu_op_types = sum(1 for k in _ALU_MAP if op_counts.get(k.name, 0) > 0)
     if alu_op_types > 1 and not is_neg_add:
         return None
+    # Don't handle bool-typed params yet (bool AND/OR/XOR need dtype-aware marshaling)
+    if any(not isinstance(p.dtype, PtrDType) or p.dtype.base.itemsize == 1 for p in params.values()):
+        return None
 
     # Build the VPU instruction sequence for ONE tile
     tile_instrs: list[str] = []
