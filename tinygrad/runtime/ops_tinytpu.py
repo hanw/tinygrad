@@ -234,6 +234,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
     """
     wmmas = [u for u in uops if u.op is Ops.WMMA]
     if not wmmas:
+        if (red_desc := _render_reduction_sxu_program(uops)) is not None:
+            return red_desc
         if (where_desc := _render_where_sxu_program(uops)) is not None:
             return where_desc
         if (multi_desc := _render_multistep_sxu_program(uops)) is not None:
@@ -360,10 +362,11 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
 
 
 def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
-    """Render a scalar reduction (SUM/MAX/MIN to scalar) as SXU_PROGRAM.
+    """Render a reduction (scalar or row-wise SUM/MAX/MIN) as SXU_PROGRAM.
 
     Uses VPU_SUM_REDUCE (4), VPU_MAX_REDUCE (9), or VPU_MIN_REDUCE (13).
-    For multi-tile sources, reduces each tile then combines across tiles.
+    Scalar reduce: out_size=1, combines across sublanes.
+    Row reduce: out_size=nrows, ncols divides _COLS, per-row reduce.
     """
     op_counts = Counter(u.op.name for u in uops)
     params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
@@ -376,6 +379,9 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
         return None
     out_size = params[out_arg].dtype.size
     src_size = params[src_arg].dtype.size
+
+    # Only handle scalar reductions (out_size=1) for now.
+    # Row/column reductions (out_size>1) stay on old path which distinguishes axis.
     if out_size != 1:
         return None
 
@@ -399,27 +405,26 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
     else:
         return None
 
+    _REDUCE_COMBINE = {4: "sum", _VPU_OPS["MAX_REDUCE"]: "max", _VPU_OPS["MIN_REDUCE"]: "min"}
+
+    # Scalar reduction
     num_tiles = (src_size + _TILE_ELEMS - 1) // _TILE_ELEMS
     all_instrs: list[str] = []
     data_plan: list[dict] = []
 
-    # Load and reduce each tile, accumulate result in vregs
     for tile_idx in range(num_tiles):
         offset = tile_idx * _TILE_ELEMS
         count = min(_TILE_ELEMS, src_size - offset)
         vmem_addr = tile_idx
         data_plan.append({"type": "VMEM", "addr": vmem_addr, "param": src_arg,
                           "offset": offset, "count": count, "dtype": "int32"})
-        # Load tile into vreg, reduce
         src_vreg = tile_idx * 2
         dst_vreg = tile_idx * 2 + 1
         all_instrs.append(_load(src_vreg, vmem_addr))
         all_instrs.append(_vpu(dst_vreg, src_vreg, vpu_op))
 
-    # Combine across tiles if multi-tile
     if num_tiles > 1:
-        # Accumulate tile results: tile 0 result is in vreg 1, tile 1 in vreg 3, etc.
-        acc_vreg = 1  # first tile reduce result
+        acc_vreg = 1
         for tile_idx in range(1, num_tiles):
             tile_result_vreg = tile_idx * 2 + 1
             next_vreg = num_tiles * 2 + tile_idx
@@ -428,19 +433,17 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
         out_vmem = num_tiles
         all_instrs.append(_store(out_vmem, acc_vreg))
     else:
-        out_vmem = 1  # single tile: store reduce result
+        out_vmem = 1
         all_instrs.append(_store(out_vmem, 1))
 
     all_instrs.append(_halt())
     outputs = [{"addr": out_vmem, "param": out_arg, "offset": 0, "count": 1}]
 
     return {
-        "op": "SXU_PROGRAM",
-        "instructions": all_instrs,
-        "data_plan": data_plan,
-        "outputs": outputs,
-        "num_output_tiles": 1,
-        "out": out_arg,
+        "op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+        "outputs": outputs, "num_output_tiles": 1, "out": out_arg,
+        "reduce": _REDUCE_COMBINE.get(vpu_op, "sum"),
+        "reduce_src_size": src_size,
     }
 
 
@@ -859,9 +862,11 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
                          and not any(op_counts.get(k.name, 0) > 0 for k in [Ops.ADD, Ops.MUL, Ops.MAX]))
     if has_where and not is_relu_candidate:
         return None
-    # Don't handle broadcast (mismatched param sizes) yet
-    src_sizes = [params[k].dtype.size for k in src_params]
-    if len(set(src_sizes)) > 1 or (src_sizes and src_sizes[0] != out_size):
+    # Check param sizes — allow size-1 broadcast (scalar → tile)
+    src_sizes = {k: params[k].dtype.size for k in src_params}
+    broadcast_params = {k for k, sz in src_sizes.items() if sz == 1 and out_size > 1}
+    non_bc_sizes = [sz for k, sz in src_sizes.items() if k not in broadcast_params]
+    if len(set(non_bc_sizes)) > 1 or (non_bc_sizes and non_bc_sizes[0] != out_size):
         return None
 
     # Only count ALU UOps in the data path (have LOAD in source tree), not index arithmetic
@@ -1009,6 +1014,12 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
                     "layout": "broadcast_const", "value": const_val,
                     "count": count, "dtype": "int32",
                 })
+            elif src_arg in broadcast_params:
+                # Scalar broadcast: read single element, fill entire tile
+                entry = {"type": "VMEM", "addr": base + inp_idx,
+                         "param": src_arg, "offset": 0, "count": 1, "dtype": "int32",
+                         "broadcast": True}
+                data_plan.append(entry)
             else:
                 entry = {"type": "VMEM", "addr": base + inp_idx,
                          "param": src_arg, "offset": offset, "count": count, "dtype": "int32"}
@@ -2926,12 +2937,17 @@ class TinyTPUProgram:
 
             elif mem_type == "VMEM":
                 is_bool = entry.get("bool", False)
+                is_broadcast = entry.get("broadcast", False)
                 raw = np.frombuffer(bytes(buf_data), dtype=np.bool_ if is_bool else "<i4")
                 if is_bool:
                     raw = raw.astype(np.int32)
                 addr = int(entry["addr"])
                 offset = int(entry.get("offset", 0))
                 count = int(entry.get("count", _TILE_ELEMS))
+                if is_broadcast:
+                    val = int(raw[0]) if len(raw) > 0 else 0
+                    data_lines.append(_vmem(addr, [val] * _TILE_ELEMS))
+                    continue
                 mode = entry.get("mode", "TILE")
                 if mode == "ROW_BROADCAST":
                     nwt = entry.get("num_weight_tiles", 1)
@@ -2961,11 +2977,28 @@ class TinyTPUProgram:
         # Write results to output buffer
         out_buf = bufs[int(prog["out"])]
         out_dtype = np.dtype(np.bool_) if is_bool_out else np.dtype("<i4")
+        reduce_mode = prog.get("reduce")
         out_offset = 0
         for idx, out_entry in enumerate(outputs):
             count = int(out_entry["count"])
-            tile_data = vmem_results[idx][:count]
-            chunk_out = np.array(tile_data, dtype=out_dtype)
+            tile_data = vmem_results[idx]
+            if reduce_mode and count == 1:
+                # Scalar cross-sublane accumulation: per-row results at positions 0, 4, 8, 12
+                # Only include sublanes that had actual data (not zero-padding)
+                reduce_src = int(prog.get("reduce_src_size", _TILE_ELEMS))
+                data_rows = min(_ROWS, (reduce_src + _COLS - 1) // _COLS)
+                row_vals = [tile_data[r * _COLS] for r in range(data_rows) if r * _COLS < len(tile_data)]
+                if reduce_mode == "sum":
+                    scalar = sum(row_vals)
+                elif reduce_mode == "max":
+                    scalar = max(row_vals)
+                elif reduce_mode == "min":
+                    scalar = min(row_vals)
+                else:
+                    scalar = row_vals[0]
+                chunk_out = np.array([scalar], dtype=out_dtype)
+            else:
+                chunk_out = np.array(tile_data[:count], dtype=out_dtype)
             out_buf[out_offset:out_offset+len(chunk_out)*out_dtype.itemsize] = chunk_out.tobytes()
             out_offset += len(chunk_out) * out_dtype.itemsize
         return 1e-3
