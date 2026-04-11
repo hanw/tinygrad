@@ -1338,167 +1338,8 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     _is_grouped_sc = (len(params) == 2 and op_counts.get("GROUP", 0) == 1
                       and op_counts.get("STORE", 0) == 4 and op_counts.get("LOAD", 0) == 4
                       and op_counts.get("RANGE", 0) == 1 and not _has_bool_logic_op)
-    # Row-wise reduction: generalised to any ncols >= 2 (LOAD=ncols per row).
-    _rw_ncols = (param_sizes.get(1, 0) // param_sizes.get(0, 1)
-                 if param_sizes.get(0, 0) > 0 else 0)
-    _is_rowwise = (len(params) == 2
-                   and op_counts.get("RANGE", 0) == 1
-                   and op_counts.get("MUL", 0) == 1
-                   and op_counts.get("STORE", 0) == 1
-                   and op_counts.get("LOAD", 0) == _rw_ncols
-                   and param_sizes.get(1) is not None
-                   and param_sizes.get(0) is not None
-                   and 1 < param_sizes.get(0, 0)
-                   and _rw_ncols >= 2                    # ncols=1 is not a meaningful reduction
-                   and param_sizes.get(1) == param_sizes.get(0, 0) * _rw_ncols)
-    # Column-wise reduction: same UOp shape as row-wise but MUL=0 (no stride
-    # multiply — each column accesses consecutive rows with fixed offsets).
-    _is_colwise = (len(params) == 2
-                   and op_counts.get("RANGE", 0) == 1
-                   and op_counts.get("MUL", 0) == 0
-                   and op_counts.get("STORE", 0) == 1
-                   and param_sizes.get(0) is not None and param_sizes.get(1) is not None
-                   and param_sizes.get(0, 0) > 1
-                   and param_sizes.get(1, 0) > param_sizes.get(0, 0)
-                   and param_sizes.get(1, 0) % param_sizes.get(0, 0) == 0)
-    if _is_colwise:
-        ncols = param_sizes[0]
-        nrows = param_sizes[1] // ncols
-        # Discriminate op by loop body (same discriminant as row-wise)
-        nloads = op_counts.get("LOAD", 0)
-        if op_counts.get("ADD", 0) > nloads - 1 and op_counts.get("MAX", 0) == 0:
-            col_host_op = "SUM"
-            col_reason = f"supported col-wise sum {nrows}x{ncols}"
-        elif op_counts.get("MAX", 0) >= nloads - 1 and op_counts.get("XOR", 0) == 0:
-            col_host_op = "MAX"
-            col_reason = f"supported col-wise max {nrows}x{ncols}"
-        elif op_counts.get("MAX", 0) >= nloads - 1 and op_counts.get("XOR", 0) > 0:
-            col_host_op = "MIN"
-            col_reason = f"supported col-wise min {nrows}x{ncols}"
-        else:
-            col_host_op = None
-            col_reason = None
-        if col_host_op is not None:
-            diag.update({
-                "supported": True,
-                "kind": "host_colreduce",
-                "reason": col_reason,
-                "out_arg": 0,
-                "src_arg": 1,
-                "nrows": nrows,
-                "ncols": ncols,
-                "host_op": col_host_op,
-            })
-            return diag
-    if _is_rowwise:
-        nrows    = param_sizes[0]
-        ncols_rw = _rw_ncols
-        nloads   = op_counts.get("LOAD", 0)
-        # Discriminate reduction op by loop body:
-        if op_counts.get("ADD", 0) > nloads - 1 and op_counts.get("MAX", 0) == 0:
-            rw_op = "SUM"
-        elif op_counts.get("MAX", 0) >= nloads - 1 and op_counts.get("XOR", 0) == 0:
-            rw_op = "MAX"
-        elif op_counts.get("MAX", 0) >= nloads - 1 and op_counts.get("XOR", 0) > 0:
-            rw_op = "MIN"
-        else:
-            rw_op = None
-        if rw_op is not None:
-            if ncols_rw == _COLS:
-                # Hardware path: VPU SUM/MAX/MIN REDUCE on 4-column tiles
-                vpu_ops_map = {"SUM": 4, "MAX": _VPU_OPS["MAX_REDUCE"], "MIN": _VPU_OPS["MIN_REDUCE"]}
-                diag.update({
-                    "supported": True,
-                    "kind": "vpu_rowsum",
-                    "reason": f"supported row-wise {rw_op.lower()} {nrows}x{ncols_rw}",
-                    "out_arg": 0,
-                    "src_arg": 1,
-                    "num_rows": nrows,
-                    "num_cols": ncols_rw,
-                    "vpu_op": vpu_ops_map[rw_op],
-                })
-            else:
-                # Host fallback for non-_COLS column count
-                diag.update({
-                    "supported": True,
-                    "kind": "host_rowreduce",
-                    "reason": f"supported host row-wise {rw_op.lower()} {nrows}x{ncols_rw}",
-                    "out_arg": 0,
-                    "src_arg": 1,
-                    "nrows": nrows,
-                    "ncols": ncols_rw,
-                    "host_op": rw_op,
-                })
-            return diag
-    if len(params) == 2 and op_counts.get("STORE", 0) == 1 and op_counts.get("ADD", 0) > 0 and param_sizes.get(0) == 1:
-        out_size = param_sizes.get(0)
-        src_size = param_sizes.get(1)
-        num_adds = op_counts.get("ADD", 0)
-        num_loads = op_counts.get("LOAD", 0)
-        is_sum_tree = (src_size is not None and src_size > 0
-                       and num_adds == src_size - 1 and num_loads == src_size)
-        if is_sum_tree:
-            diag.update({
-                "supported": True,
-                "kind": "vpu_unary",
-                "reason": "supported vpu sum_reduce",
-                "out_arg": 0,
-                "src_arg": 1,
-                "num_elems": src_size,
-                "out_elems": out_size,
-                "vpu_op": 4,
-            })
-            return diag
-        diag["reason"] = f"unsupported vpu sum_reduce sizes {dict(sorted(param_sizes.items()))}"
-        diag["notes"].append("Current TinyTPU VPU SUM_REDUCE lowering handles int32 sum reduction to scalar.")
-        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif (len(params) == 2 and op_counts.get("STORE", 0) == 1 and op_counts.get("MAX", 0) > 0
-          and op_counts.get("XOR", 0) == 0 and param_sizes.get(0) == 1):
-        out_size = param_sizes.get(0)
-        src_size = param_sizes.get(1)
-        num_maxes = op_counts.get("MAX", 0)
-        num_loads = op_counts.get("LOAD", 0)
-        is_max_tree = (src_size is not None and src_size > 0
-                       and num_maxes == src_size - 1 and num_loads == src_size)
-        if is_max_tree:
-            diag.update({
-                "supported": True,
-                "kind": "vpu_unary",
-                "reason": "supported vpu max_reduce",
-                "out_arg": 0,
-                "src_arg": 1,
-                "num_elems": src_size,
-                "out_elems": out_size,
-                "vpu_op": _VPU_OPS["MAX_REDUCE"],
-            })
-            return diag
-        diag["reason"] = f"unsupported vpu max_reduce sizes {dict(sorted(param_sizes.items()))}"
-        diag["notes"].append("Current TinyTPU VPU MAX_REDUCE lowering handles int32 max reduction to scalar.")
-        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif (len(params) == 2 and op_counts.get("STORE", 0) == 1 and op_counts.get("MAX", 0) > 0
-          and op_counts.get("XOR", 0) > 0 and param_sizes.get(0) == 1):
-        out_size = param_sizes.get(0)
-        src_size = param_sizes.get(1)
-        num_maxes = op_counts.get("MAX", 0)
-        num_loads = op_counts.get("LOAD", 0)
-        is_min_tree = (src_size is not None and src_size > 0
-                       and num_maxes == src_size - 1 and num_loads == src_size)
-        if is_min_tree:
-            diag.update({
-                "supported": True,
-                "kind": "vpu_unary",
-                "reason": "supported vpu min_reduce",
-                "out_arg": 0,
-                "src_arg": 1,
-                "num_elems": src_size,
-                "out_elems": out_size,
-                "vpu_op": _VPU_OPS["MIN_REDUCE"],
-            })
-            return diag
-        diag["reason"] = f"unsupported vpu min_reduce sizes {dict(sorted(param_sizes.items()))}"
-        diag["notes"].append("Current TinyTPU VPU MIN_REDUCE lowering handles int32 min reduction to scalar.")
-        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif (len(params) == 2 and op_counts.get("XOR", 0) > 0 and op_counts.get("MAX", 0) > 0
+    # Scalar-const MIN via XOR+MAX decomposition
+    if (len(params) == 2 and op_counts.get("XOR", 0) > 0 and op_counts.get("MAX", 0) > 0
           and not in_is_bool and op_counts.get("STORE", 0) >= 1):
         out_size = param_sizes.get(0)
         src_size = param_sizes.get(1)
@@ -1518,27 +1359,6 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
             })
             return diag
         diag["reason"] = f"unsupported vpu min const sizes {dict(sorted(param_sizes.items()))}"
-        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif (len(params) == 2 and op_counts.get("CMPLT", 0) > 0 and op_counts.get("WHERE", 0) > 0
-          and not _has_complex_op
-          and op_counts.get("WHERE", 0) == op_counts.get("CMPLT", 0)
-          and op_counts.get("WHERE", 0) <= op_counts.get("STORE", 0)):
-        out_size = param_sizes.get(0)
-        src_size = param_sizes.get(1)
-        if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size:
-            diag.update({
-                "supported": True,
-                "kind": "vpu_unary",
-                "reason": "supported vpu relu",
-                "out_arg": 0,
-                "src_arg": 1,
-                "num_elems": src_size,
-                "out_elems": out_size,
-                "vpu_op": 2,
-            })
-            return diag
-        diag["reason"] = f"unsupported vpu relu sizes {dict(sorted(param_sizes.items()))}"
-        diag["notes"].append("Current TinyTPU VPU RELU lowering handles one int32 VMEM tile with 1..16 elements.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
     elif len(params) in {2, 3} and divmod_pattern is not None and divmod_pattern[0] == "IDIV":
         _, rhs_const = divmod_pattern
@@ -2018,106 +1838,6 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
             return diag
         diag["reason"] = f"unsupported vpu or sizes {dict(sorted(param_sizes.items()))}"
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif len(params) == 4 and op_counts.get("WHERE", 0) > 0:
-        out_size = param_sizes.get(0)
-        input_args = [arg for arg in sorted(param_sizes) if arg != 0]
-        if out_size is not None and len(input_args) == 3 and 0 < out_size and all(param_sizes[arg] in {1, out_size} for arg in input_args):
-            diag.update({
-                "supported": True,
-                "kind": "vpu_where",
-                "reason": "supported vpu where",
-                "out_arg": 0,
-                "cond_arg": input_args[0],
-                "lhs_arg": input_args[1],
-                "rhs_arg": input_args[2],
-                "num_elems": out_size,
-            })
-            return diag
-        diag["reason"] = f"unsupported vpu where sizes {dict(sorted(param_sizes.items()))}"
-        diag["notes"].append("Current TinyTPU VPU WHERE lowering handles int32 VMEM tiles.")
-        diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif (len(params) == 2 and op_counts.get("TRUNC", 0) > 0 and "float" in str(params[0].dtype) and "float" in str(params[1].dtype)):
-        out_size = param_sizes.get(0)
-        src_size = param_sizes.get(1)
-        if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size:
-            diag.update({
-                "supported": True,
-                "kind": "host_unary",
-                "reason": "supported host trunc fallback",
-                "host_op": "TRUNC",
-                "host_dtype": "float32",
-                "out_arg": 0,
-                "src_arg": 1,
-                "num_elems": src_size,
-            })
-            return diag
-    elif (len(params) == 2 and op_counts.get("RECIPROCAL", 0) > 0 and "float" in str(params[0].dtype) and "float" in str(params[1].dtype)):
-        out_size = param_sizes.get(0)
-        src_size = param_sizes.get(1)
-        if out_size is not None and src_size is not None and out_size == src_size and 0 < src_size:
-            diag.update({
-                "supported": True,
-                "kind": "host_unary",
-                "reason": "supported host reciprocal fallback",
-                "host_op": "RECIPROCAL",
-                "host_dtype": "float32",
-                "out_arg": 0,
-                "src_arg": 1,
-                "num_elems": src_size,
-            })
-            return diag
-    elif len(params) == 3 and is_gemm and has_store and op_counts.get("GROUP", 0) == 0:
-        # GROUP=1 flags a vectorized elementwise binary, never a GEMM.
-        sizes = sorted(param_sizes.values())
-        candidate_weights = [arg for arg, sz in param_sizes.items() if sz >= 16 and sz % 16 == 0]
-        # For square GEMM all non-output params are the same size.  Tinygrad
-        # consistently emits PARAM 1 = activations, PARAM 2 = weight for
-        # matmul, so prefer higher param indices as the weight candidate.
-        candidate_weights = sorted(candidate_weights, reverse=True)
-        for weight_arg in candidate_weights:
-            weight_size = param_sizes[weight_arg]
-            non_weight = {arg: sz for arg, sz in param_sizes.items() if arg != weight_arg}
-            out_arg = 0
-            if out_arg not in non_weight:
-                continue
-            act_arg = next((arg for arg in non_weight if arg != out_arg), None)
-            if act_arg is None:
-                continue
-            out_size = non_weight.get(out_arg)
-            act_size = non_weight.get(act_arg)
-            tiling = _infer_tiling(out_size, act_size, weight_size)
-            if tiling is not None:
-                num_vecs, num_k_tiles, inferred_n_tiles = tiling
-                diag.update({
-                    "supported": True,
-                    "kind": "gemm",
-                    "reason": "supported gemm4x4",
-                    "out_arg": out_arg,
-                    "act_arg": act_arg,
-                    "weight_arg": weight_arg,
-                    "num_vecs": num_vecs,
-                    "num_k_tiles": num_k_tiles,
-                    "num_weight_tiles": inferred_n_tiles,
-                })
-                return diag
-        diag["reason"] = f"unexpected param sizes {sizes}"
-        diag["notes"].append("Current TinyTPU backend only handles int32 matmul cases whose flattened buffers can be factored into MxK, KxN, and MxN with K and N tiled in groups of 4.")
-        if len(candidate_weights) == 1:
-            weight_arg = candidate_weights[0]
-            non_weight = {arg: sz for arg, sz in param_sizes.items() if arg != weight_arg}
-            out_size = non_weight.get(0)
-            act_arg = next((arg for arg in non_weight if arg != 0), None)
-            act_size = non_weight.get(act_arg) if act_arg is not None else None
-            diag["notes"].append(_tiling_failure_note(out_size, act_size, param_sizes[weight_arg]))
-        else:
-            out_size = param_sizes.get(0)
-            remaining = {arg: sz for arg, sz in param_sizes.items() if arg != 0}
-            if len(remaining) == 2:
-                by_size = sorted(remaining.items(), key=lambda item: item[1])
-                act_size = by_size[0][1]
-                weight_size = by_size[1][1]
-                diag["notes"].append(_tiling_failure_note(out_size, act_size, weight_size))
-            diag["notes"].append("No buffer looked like a valid 4x4-tiled weight matrix.")
     else:
         diag["reason"] = f"params={len(params)} gemm={is_gemm}"
 
@@ -2377,35 +2097,6 @@ def _build_vpu_unary_bundle(src_i32: np.ndarray, num_elems: int, vpu_op: int) ->
         _end(),                               # END
     )
 
-
-def _build_vpu_where_bundle(cond_i32: np.ndarray, lhs_i32: np.ndarray, rhs_i32: np.ndarray, num_elems: int) -> str:
-    """WHERE(cond, lhs, rhs) = cond*lhs + (1-cond)*rhs.
-    VMEM[0]=cond, VMEM[1]=lhs, VMEM[2]=rhs, VMEM[3]=ones -> VMEM[4]=result."""
-    MUL, SUB, ADD = _VPU_OPS["MUL"], _VPU_OPS["SUB"], _VPU_OPS["ADD"]
-
-    def tile(vals: np.ndarray) -> list[int]:
-        padded = np.zeros(_ROWS * _COLS, dtype=np.int32)
-        padded[:num_elems] = vals[:num_elems]
-        return [int(x) for x in padded]
-
-    return _bundle(
-        _vmem(0, tile(cond_i32)),           # VMEM[0] = cond
-        _vmem(1, tile(lhs_i32)),            # VMEM[1] = lhs
-        _vmem(2, tile(rhs_i32)),            # VMEM[2] = rhs
-        _vmem(3, [1] * _ROWS * _COLS),      # VMEM[3] = ones
-        _load(0, 0),                        # LOAD v0, VMEM[0]  (cond)
-        _load(1, 1),                        # LOAD v1, VMEM[1]  (lhs)
-        _load(2, 2),                        # LOAD v2, VMEM[2]  (rhs)
-        _load(3, 3),                        # LOAD v3, VMEM[3]  (ones)
-        _vpu(4, 0, MUL, 1),                 # VPU v4 = MUL(v0, v1)   cond * lhs
-        _vpu(5, 3, SUB, 0),                 # VPU v5 = SUB(v3, v0)   1 - cond
-        _vpu(6, 5, MUL, 2),                 # VPU v6 = MUL(v5, v2)   (1-cond)*rhs
-        _vpu(7, 4, ADD, 6),                 # VPU v7 = ADD(v4, v6)   result
-        _store(4, 7),                       # STORE VMEM[4], v7
-        _halt(),                            # HALT
-        _output_vmem(4),                    # OUTPUT_VMEM VMEM[4]
-        _end(),                             # END
-    )
 
 
 def _build_vpu_program_bundle(inputs: list[np.ndarray], num_elems: int, steps: list[dict], output_reg: int,
@@ -2668,7 +2359,7 @@ def _unsupported_message(prog: dict) -> str:
 # ---------------------------------------------------------------------------
 # Program — drives the BSV simulator
 # ---------------------------------------------------------------------------
-_SUPPORTED_OPS = {"GEMM4x4", "SXU_PROGRAM", "VPU_BINARY", "VPU_UNARY", "VPU_WHERE", "VPU_PROGRAM", "VPU_ROWSUM", "VPU_ROWBC_BINARY", "HOST_ROWREDUCE", "HOST_COLREDUCE", "HOST_BINARY", "HOST_UNARY"}
+_SUPPORTED_OPS = {"GEMM4x4", "SXU_PROGRAM", "VPU_BINARY", "VPU_PROGRAM", "VPU_ROWSUM", "VPU_ROWBC_BINARY", "HOST_ROWREDUCE", "HOST_COLREDUCE", "HOST_BINARY", "HOST_UNARY"}
 
 class TinyTPUProgram:
     def __init__(self, name: str, lib: bytes, *args, **kwargs):
@@ -2735,15 +2426,7 @@ class TinyTPUProgram:
                 n, vpu_op, lhs_broadcast=lhs_bc, rhs_broadcast=rhs_bc),
             out_dtype=np.dtype(np.bool_) if is_bool else np.dtype("<i4"))
 
-    def _exec_vpu_where(self, bufs):
-        prog = self.prog
-        out_buf = bufs[prog["out"]]
-        num_elems = int(prog["num_elems"])
-        cond_i32 = np.frombuffer(bytes(bufs[prog["cond"]]), dtype=np.bool_)[:num_elems].astype(np.int32)
-        lhs_i32 = np.frombuffer(bytes(bufs[prog["lhs"]]), dtype="<i4")
-        rhs_i32 = np.frombuffer(bytes(bufs[prog["rhs"]]), dtype="<i4")
-        return self._run_tiled_vpu(out_buf, num_elems, lambda s, e, n:
-            _build_vpu_where_bundle(cond_i32[s:e], lhs_i32[s:e], rhs_i32[s:e], n))
+
 
     def _exec_vpu_program(self, bufs):
         prog = self.prog
@@ -2829,31 +2512,7 @@ class TinyTPUProgram:
         out_buf[: len(out_f32) * 4] = np.asarray(out_f32, dtype="<f4").tobytes()
         return 1e-3
 
-    def _exec_vpu_unary(self, bufs):
-        prog = self.prog
-        out_buf = bufs[prog["out"]]
-        src_i32 = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<i4")
-        num_elems = int(prog["num_elems"])
-        out_elems = int(prog["out_elems"])
-        vpu_op = int(prog["vpu_op"])
 
-        # Scalar reductions: chunk → VPU reduce → host accumulate
-        _REDUCE_OPS = {4: (np.int32(0), sum, 0), _VPU_OPS["MAX_REDUCE"]: (np.int32(-2**31), max, -2**31),
-                       _VPU_OPS["MIN_REDUCE"]: (np.int32(2**31-1), min, 2**31-1)}
-        if out_elems == 1 and vpu_op in _REDUCE_OPS:
-            acc, combine, pad_val = _REDUCE_OPS[vpu_op]
-            for chunk_start in range(0, num_elems, _TILE_ELEMS):
-                chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
-                padded = np.full(_TILE_ELEMS, pad_val, dtype=np.int32)
-                padded[:chunk_end - chunk_start] = src_i32[chunk_start:chunk_end]
-                result = self._run_vmem(_build_vpu_unary_bundle(padded, _TILE_ELEMS, vpu_op))
-                row_vals = [np.int32(result[r * _COLS]) for r in range(_ROWS)]
-                acc = np.int32(combine([acc, *row_vals]) if vpu_op != 4 else acc + sum(row_vals))
-            out_buf[:_BYTES_PER_ELEM] = np.array([acc], dtype="<i4").tobytes()
-        else:
-            return self._run_tiled_vpu(out_buf, num_elems, lambda s, e, n:
-                _build_vpu_unary_bundle(src_i32[s:e], n, vpu_op))
-        return 1e-3
 
     def _exec_host_rowreduce(self, bufs):
         prog = self.prog
