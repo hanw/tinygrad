@@ -30,6 +30,23 @@ _VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6, "SUB": 7, "CMP
 _VPU_BOOL_OPS = {_VPU_OPS["CMPLT"], _VPU_OPS["CMPNE"], _VPU_OPS["CMPEQ"]}
 _SXU_OPS = {"LOAD_VREG": 0, "STORE_VREG": 1, "DISPATCH_VPU": 2, "DISPATCH_XLU_BROADCAST": 3, "DISPATCH_MXU": 4, "WAIT_MXU": 5, "LOAD_MXU_RESULT": 6, "HALT": 7}
 
+_ALU_OPS = {Ops.ADD: "ADD", Ops.MUL: "MUL", Ops.SUB: "SUB", Ops.MAX: "MAX",
+            Ops.CMPLT: "CMPLT", Ops.CMPNE: "CMPNE", Ops.CMPEQ: "CMPEQ",
+            Ops.AND: "AND", Ops.OR: "OR", Ops.XOR: "XOR",
+            Ops.SHL: "SHL", Ops.SHR: "SHR", Ops.IDIV: "DIV"}
+
+def _has_load_src(u: UOp, visited: set | None = None) -> bool:
+    """Check if a UOp has a LOAD anywhere in its source tree (data-path, not index)."""
+    if visited is None: visited = set()
+    if id(u) in visited: return False
+    visited.add(id(u))
+    if u.op is Ops.LOAD: return True
+    return any(_has_load_src(s, visited) for s in u.src)
+
+def _data_alu_ops(uops: list[UOp]) -> Counter:
+    """Count only data-path ALU ops (ones with LOAD in their source tree)."""
+    return Counter(_ALU_OPS[u.op] for u in uops if u.op in _ALU_OPS and _has_load_src(u))
+
 def _sim_path() -> str:
     if (p := os.environ.get("TINYTPU_SIM")):
         return p
@@ -446,13 +463,14 @@ def _render_multistep_sxu_program(uops: list[UOp]) -> dict | None:
     out_size = params[out_arg].dtype.size
     src_params = sorted(k for k in params if k != out_arg)
 
-    # Detect which multi-step pattern this is
+    # Use data-path ALU counts (exclude index arithmetic MUL/ADD)
+    data_alu = _data_alu_ops(uops)
     has_where = op_counts.get("WHERE", 0) > 0
-    has_mul = op_counts.get("MUL", 0) > 0
-    has_max = op_counts.get("MAX", 0) > 0
-    has_cmplt = op_counts.get("CMPLT", 0) > 0
-    has_cmpne = op_counts.get("CMPNE", 0) > 0
-    has_idiv = op_counts.get("IDIV", 0) > 0
+    has_mul = data_alu.get("MUL", 0) > 0
+    has_max = data_alu.get("MAX", 0) > 0
+    has_cmplt = data_alu.get("CMPLT", 0) > 0 or op_counts.get("CMPLT", 0) > 0
+    has_cmpne = data_alu.get("CMPNE", 0) > 0 or op_counts.get("CMPNE", 0) > 0
+    has_idiv = data_alu.get("DIV", 0) > 0
     has_mod = op_counts.get("MOD", 0) > 0
 
     SUB_OP, MAX_OP, MIN_OP = _VPU_OPS["SUB"], _VPU_OPS["MAX"], _VPU_OPS["MIN"]
@@ -491,10 +509,10 @@ def _render_multistep_sxu_program(uops: list[UOp]) -> dict | None:
     store_count = op_counts.get("STORE", 0)
     if (len(src_params) == 1 and has_where and has_cmplt and not has_mul and not has_idiv
             and op_counts.get("WHERE", 0) > store_count):
-        # Find clip constants from the UOp graph
-        consts = sorted(set(u.arg for u in uops if u.op is Ops.CONST and isinstance(u.arg, int)))
-        # Filter out loop-bound constants (equal to out_size)
-        clip_consts = [c for c in consts if c != out_size]
+        # Find clip constants: CONST values used by CMPLT (the comparisons in clip)
+        cmplt_uops = [u for u in uops if u.op is Ops.CMPLT]
+        clip_consts = sorted(set(s.arg for u in cmplt_uops for s in u.src
+                                 if s.op is Ops.CONST and isinstance(s.arg, int)))
         if len(clip_consts) >= 2:
             lo_const = min(clip_consts)
             hi_const = max(clip_consts)
@@ -741,12 +759,7 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
     unary (RELU), bool-typed ops (AND/OR/XOR/NOT). Each tile chunk gets:
     LOAD inputs → VPU ops → STORE output.
     """
-    _ALU_MAP = {
-        Ops.ADD: "ADD", Ops.MUL: "MUL", Ops.SUB: "SUB", Ops.MAX: "MAX",
-        Ops.CMPLT: "CMPLT", Ops.CMPNE: "CMPNE", Ops.CMPEQ: "CMPEQ",
-        Ops.AND: "AND", Ops.OR: "OR", Ops.XOR: "XOR",
-        Ops.SHL: "SHL", Ops.SHR: "SHR", Ops.IDIV: "DIV",
-    }
+    _ALU_MAP = _ALU_OPS
 
     op_counts = Counter(u.op.name for u in uops)
     params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
@@ -781,12 +794,6 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
         return None
 
     # Only count ALU UOps in the data path (have LOAD in source tree), not index arithmetic
-    def _has_load_src(u: UOp, visited=None) -> bool:
-        if visited is None: visited = set()
-        if id(u) in visited: return False
-        visited.add(id(u))
-        if u.op is Ops.LOAD: return True
-        return any(_has_load_src(s, visited) for s in u.src)
     alu_uops = [u for u in uops if u.op in _ALU_MAP and _has_load_src(u)]
     alu_op_types = len(set(_ALU_MAP[u.op] for u in alu_uops))
 
@@ -805,8 +812,9 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
     if alu_op_types > 1 and not is_neg_add:
         return None
     # Don't handle compound patterns like CMPEQ (= NOT(CMPNE(x,y))) where data ALU ops chain
+    # Exception: is_neg_add (SUB = ADD(MUL(x,-1), y)) is an expected MUL→ADD chain
     data_alu_set = set(alu_uops)
-    if any(s in data_alu_set for u in data_alu_set for s in u.src):
+    if not is_neg_add and any(s in data_alu_set for u in data_alu_set for s in u.src):
         return None
 
     is_relu = is_relu_candidate and op_counts.get("CMPLT", 0) > 0
@@ -859,11 +867,11 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
         src_params = [lhs_param, rhs_param]
     elif len(src_params) == 1:
         # 1 source param: either unary RELU (handled above), or scalar-const binary
-        # Find the ALU op
+        # Find the ALU op from data-path UOps only
         vpu_name = None
         alu_op_enum = None
         for op_enum, name in _ALU_MAP.items():
-            if op_counts.get(op_enum.name, 0) > 0:
+            if any(u.op is op_enum for u in alu_uops):
                 alu_op_enum = op_enum
                 vpu_name = name
                 break
