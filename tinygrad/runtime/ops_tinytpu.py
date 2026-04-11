@@ -86,6 +86,103 @@ class TinyTPUCompiler(Compiler):
 
 
 # ---------------------------------------------------------------------------
+# Legacy descriptor renderer — handles patterns not yet migrated to SXU_PROGRAM
+# ---------------------------------------------------------------------------
+
+def _detect_reduce_op(op_counts: Counter) -> str | None:
+    """Detect SUM/MAX/MIN from UOp op counts."""
+    nloads = op_counts.get("LOAD", 0)
+    if op_counts.get("ADD", 0) > nloads - 1 and op_counts.get("MAX", 0) == 0:
+        return "SUM"
+    if op_counts.get("MAX", 0) >= nloads - 1 and op_counts.get("XOR", 0) == 0:
+        return "MAX"
+    if op_counts.get("MAX", 0) >= nloads - 1 and op_counts.get("XOR", 0) > 0:
+        return "MIN"
+    return None
+
+def _render_legacy_descriptor(uops: list[UOp]) -> dict | None:
+    """Slim fallback renderer for patterns not yet handled by SXU_PROGRAM.
+
+    Handles: HOST_COLREDUCE, HOST_ROWREDUCE, VPU_ROWSUM, HOST_UNARY, GEMM4x4,
+    and remaining scalar-const VPU_BINARY/VPU_PROGRAM patterns.
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    params = [u for u in uops if u.op is Ops.PARAM]
+    param_sizes: dict[int, int] = {}
+    for p in params:
+        if not isinstance(p.dtype, PtrDType):
+            return None
+        param_sizes[p.arg] = p.dtype.size
+
+    # --- HOST_UNARY: TRUNC or RECIPROCAL on float ---
+    if (len(params) == 2 and (op_counts.get("TRUNC", 0) > 0 or op_counts.get("RECIPROCAL", 0) > 0)
+            and "float" in str(params[0].dtype) and "float" in str(params[1].dtype)):
+        host_op = "TRUNC" if op_counts.get("TRUNC", 0) > 0 else "RECIPROCAL"
+        src_size = param_sizes.get(1, 0)
+        if src_size > 0:
+            return {"op": "HOST_UNARY", "host_op": host_op, "dtype": "float32",
+                    "out": 0, "src": 1, "num_elems": src_size}
+
+    # --- Reductions: col-wise, row-wise ---
+    if len(params) == 2 and op_counts.get("RANGE", 0) == 1 and op_counts.get("STORE", 0) == 1:
+        out_size = param_sizes.get(0, 0)
+        src_size = param_sizes.get(1, 0)
+        if out_size > 1 and src_size > out_size and src_size % out_size == 0:
+            # Column-wise: MUL=0 (no stride multiply)
+            if op_counts.get("MUL", 0) == 0:
+                ncols = out_size
+                nrows = src_size // ncols
+                reduce_op = _detect_reduce_op(op_counts)
+                if reduce_op:
+                    return {"op": "HOST_COLREDUCE", "out": 0, "src": 1,
+                            "nrows": nrows, "ncols": ncols, "host_op": reduce_op}
+            # Row-wise: MUL=1 (stride multiply)
+            elif op_counts.get("MUL", 0) == 1:
+                ncols = src_size // out_size
+                nrows = out_size
+                if ncols >= 2 and op_counts.get("LOAD", 0) == ncols:
+                    reduce_op = _detect_reduce_op(op_counts)
+                    if reduce_op:
+                        if ncols == _COLS:
+                            vpu_map = {"SUM": 4, "MAX": _VPU_OPS["MAX_REDUCE"], "MIN": _VPU_OPS["MIN_REDUCE"]}
+                            return {"op": "VPU_ROWSUM", "out": 0, "src": 1,
+                                    "num_rows": nrows, "num_cols": ncols, "vpu_op": vpu_map[reduce_op]}
+                        else:
+                            return {"op": "HOST_ROWREDUCE", "out": 0, "src": 1,
+                                    "nrows": nrows, "ncols": ncols, "host_op": reduce_op}
+
+    # --- GEMM fallback: 3 params with MULACC or scalar MUL+RANGE pattern ---
+    has_mulacc = any(u.op is Ops.MULACC for u in uops)
+    has_store = op_counts.get("STORE", 0) > 0
+    is_gemm = has_mulacc or (len(params) == 3 and op_counts.get("MUL", 0) > 0
+                              and op_counts.get("RANGE", 0) > 0 and has_store)
+    if is_gemm and len(param_sizes) == 3 and op_counts.get("GROUP", 0) == 0:
+        tiling = _infer_tiling(param_sizes.get(0), param_sizes.get(1), param_sizes.get(2, 0))
+        if tiling is not None:
+            num_vecs, num_k_tiles, num_weight_tiles = tiling
+            return {"op": "GEMM4x4", "out": 0, "act": 1, "weight": 2,
+                    "num_vecs": num_vecs, "num_k_tiles": num_k_tiles,
+                    "num_weight_tiles": num_weight_tiles}
+
+    # --- Remaining complex patterns: delegate to analyze_tinytpu_uops ---
+    diag = analyze_tinytpu_uops(uops)
+    if diag["supported"]:
+        _KIND_SCHEMA = {
+            "vpu_binary":      ("VPU_BINARY",       ["vpu_op", "out_arg:out", "lhs_arg:lhs", "lhs_const", "lhs_broadcast", "rhs_arg:rhs", "rhs_const", "rhs_broadcast", "num_elems", "bool_out", "bool_in"]),
+            "vpu_program":     ("VPU_PROGRAM",       ["out_arg:out", "num_elems", "inputs", "steps", "output_reg"]),
+            "vpu_rowbc_binary":("VPU_ROWBC_BINARY",  ["vpu_op", "out_arg:out", "lhs_arg:lhs", "rhs_arg:rhs", "num_elems", "ncols", "nrows"]),
+        }
+        if diag["kind"] in _KIND_SCHEMA:
+            op_name, keys = _KIND_SCHEMA[diag["kind"]]
+            desc: dict = {"op": op_name}
+            for key in keys:
+                src, dst = key.split(":") if ":" in key else (key, key)
+                desc[dst] = diag.get(src, False)
+            return desc
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Renderer — detects 4x4 GEMM from UOps, emits JSON descriptor
 # ---------------------------------------------------------------------------
 class TinyTPURenderer(Renderer):
@@ -113,43 +210,20 @@ class TinyTPURenderer(Renderer):
                  ((), ("u0", "u1", "r0", "r1"), ("u2", "u3"))),
     )]
 
-    # Map diag["kind"] → (op_name, list of diag keys to copy into descriptor)
-    _KIND_SCHEMA: dict[str, tuple[str, list[str | tuple[str, str]]]] = {
-        "gemm":            ("GEMM4x4",          ["out_arg:out", "act_arg:act", "weight_arg:weight", "num_vecs", "num_k_tiles", "num_weight_tiles"]),
-        "vpu_binary":      ("VPU_BINARY",       ["vpu_op", "out_arg:out", "lhs_arg:lhs", "lhs_const", "lhs_broadcast", "rhs_arg:rhs", "rhs_const", "rhs_broadcast", "num_elems", "bool_out", "bool_in"]),
-        "vpu_unary":       ("VPU_UNARY",        ["vpu_op", "out_arg:out", "src_arg:src", "num_elems", "out_elems"]),
-        "vpu_where":       ("VPU_WHERE",        ["out_arg:out", "cond_arg:cond", "lhs_arg:lhs", "rhs_arg:rhs", "num_elems"]),
-        "host_rowreduce":  ("HOST_ROWREDUCE",    ["out_arg:out", "src_arg:src", "nrows", "ncols", "host_op"]),
-        "host_colreduce":  ("HOST_COLREDUCE",    ["out_arg:out", "src_arg:src", "nrows", "ncols", "host_op"]),
-        "vpu_rowbc_binary":("VPU_ROWBC_BINARY",  ["vpu_op", "out_arg:out", "lhs_arg:lhs", "rhs_arg:rhs", "num_elems", "ncols", "nrows"]),
-        "vpu_rowsum":      ("VPU_ROWSUM",        ["out_arg:out", "src_arg:src", "num_rows", "num_cols", "vpu_op"]),
-        "vpu_program":     ("VPU_PROGRAM",       ["out_arg:out", "num_elems", "inputs", "steps", "output_reg"]),
-        "host_binary":     ("HOST_BINARY",       ["host_op", "out_arg:out", "lhs_arg:lhs", "lhs_const", "rhs_arg:rhs", "rhs_const", "num_elems"]),
-        "host_unary":      ("HOST_UNARY",        ["host_op", "host_dtype:dtype", "out_arg:out", "src_arg:src", "num_elems"]),
-    }
-
     def render(self, uops: list[UOp]) -> str:  # type: ignore[override]
         if (sxu_desc := _render_sxu_program(uops)) is not None:
             return _dump_lowering(json.dumps(sxu_desc))
         if (wmma_desc := _render_wmma_descriptor(uops)) is not None:
             return _dump_lowering(json.dumps(wmma_desc))
-        diag = analyze_tinytpu_uops(uops)
-        if diag["supported"] and diag["kind"] in self._KIND_SCHEMA:
-            op_name, keys = self._KIND_SCHEMA[diag["kind"]]
-            desc: dict = {"op": op_name}
-            for key in keys:
-                if ":" in key:
-                    src, dst = key.split(":")
-                else:
-                    src = dst = key
-                desc[dst] = diag.get(src, False)
-            return _dump_lowering(json.dumps(desc))
+        if (legacy := _render_legacy_descriptor(uops)) is not None:
+            return _dump_lowering(json.dumps(legacy))
+        op_counts = dict(sorted(Counter(u.op.name for u in uops).items()))
         return _dump_lowering(json.dumps({
             "op": "UNSUPPORTED",
-            "reason": diag["reason"],
-            "missing_instructions": diag["missing_instructions"],
-            "notes": diag["notes"],
-            "op_counts": diag["op_counts"],
+            "reason": "no SXU_PROGRAM or legacy renderer matched",
+            "missing_instructions": [],
+            "notes": [],
+            "op_counts": op_counts,
         }))
 
 
