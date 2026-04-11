@@ -1248,67 +1248,65 @@ def _build_vpu_unary_bundle(src_i32: np.ndarray, num_elems: int, vpu_op: int) ->
 
 
 def _build_vpu_where_bundle(cond_i32: np.ndarray, lhs_i32: np.ndarray, rhs_i32: np.ndarray, num_elems: int) -> str:
-    """WHERE(cond, lhs, rhs) = cond*lhs + (1-cond)*rhs via multi-instruction VPU bundle."""
+    """WHERE(cond, lhs, rhs) = cond*lhs + (1-cond)*rhs.
+    VMEM[0]=cond, VMEM[1]=lhs, VMEM[2]=rhs, VMEM[3]=ones -> VMEM[4]=result."""
+    MUL, SUB, ADD = _VPU_OPS["MUL"], _VPU_OPS["SUB"], _VPU_OPS["ADD"]
+
     def tile(vals: np.ndarray) -> list[int]:
         padded = np.zeros(_ROWS * _COLS, dtype=np.int32)
         padded[:num_elems] = vals[:num_elems]
         return [int(x) for x in padded]
 
-    ones = [1] * _ROWS * _COLS
-    lines: list[str] = []
-    # VMEM[0]=cond, VMEM[1]=lhs, VMEM[2]=rhs, VMEM[3]=ones
-    lines.append("5 0 " + " ".join(str(x) for x in tile(cond_i32)))
-    lines.append("5 1 " + " ".join(str(x) for x in tile(lhs_i32)))
-    lines.append("5 2 " + " ".join(str(x) for x in tile(rhs_i32)))
-    lines.append("5 3 " + " ".join(str(x) for x in ones))
-    # LOAD cond->v0, lhs->v1, rhs->v2, ones->v3
-    lines.append(f"2 {_SXU_OPS['LOAD_VREG']} 0 0 0 0 0 0 0 0")   # LOAD VMEM[0]->v0
-    lines.append(f"2 {_SXU_OPS['LOAD_VREG']} 1 1 0 0 0 0 0 0")   # LOAD VMEM[1]->v1
-    lines.append(f"2 {_SXU_OPS['LOAD_VREG']} 2 2 0 0 0 0 0 0")   # LOAD VMEM[2]->v2
-    lines.append(f"2 {_SXU_OPS['LOAD_VREG']} 3 3 0 0 0 0 0 0")   # LOAD VMEM[3]->v3
-    # v4 = cond * lhs (MUL v0, v1 -> v4)
-    lines.append(f"2 {_SXU_OPS['DISPATCH_VPU']} 0 4 0 {_VPU_OPS['MUL']} 1 0 0 0")
-    # v5 = 1 - cond (SUB v3, v0 -> v5)
-    lines.append(f"2 {_SXU_OPS['DISPATCH_VPU']} 0 5 3 {_VPU_OPS['SUB']} 0 0 0 0")
-    # v6 = (1-cond) * rhs (MUL v5, v2 -> v6)
-    lines.append(f"2 {_SXU_OPS['DISPATCH_VPU']} 0 6 5 {_VPU_OPS['MUL']} 2 0 0 0")
-    # v7 = cond*lhs + (1-cond)*rhs (ADD v4, v6 -> v7)
-    lines.append(f"2 {_SXU_OPS['DISPATCH_VPU']} 0 7 4 {_VPU_OPS['ADD']} 6 0 0 0")
-    # STORE v7 -> VMEM[4]
-    lines.append(f"2 {_SXU_OPS['STORE_VREG']} 4 0 7 0 0 0 0 0")
-    lines.append(f"2 {_SXU_OPS['HALT']} 0 0 0 0 0 0 0 0")   # HALT
-    lines.append("6 4")   # output VMEM[4]
-    lines.append("4")     # END
-    return "\n".join(lines) + "\n"
+    return _bundle(
+        _vmem(0, tile(cond_i32)),           # VMEM[0] = cond
+        _vmem(1, tile(lhs_i32)),            # VMEM[1] = lhs
+        _vmem(2, tile(rhs_i32)),            # VMEM[2] = rhs
+        _vmem(3, [1] * _ROWS * _COLS),      # VMEM[3] = ones
+        _load(0, 0),                        # LOAD v0, VMEM[0]  (cond)
+        _load(1, 1),                        # LOAD v1, VMEM[1]  (lhs)
+        _load(2, 2),                        # LOAD v2, VMEM[2]  (rhs)
+        _load(3, 3),                        # LOAD v3, VMEM[3]  (ones)
+        _vpu(4, 0, MUL, 1),                 # VPU v4 = MUL(v0, v1)   cond * lhs
+        _vpu(5, 3, SUB, 0),                 # VPU v5 = SUB(v3, v0)   1 - cond
+        _vpu(6, 5, MUL, 2),                 # VPU v6 = MUL(v5, v2)   (1-cond)*rhs
+        _vpu(7, 4, ADD, 6),                 # VPU v7 = ADD(v4, v6)   result
+        _store(4, 7),                       # STORE VMEM[4], v7
+        _halt(),                            # HALT
+        _output_vmem(4),                    # OUTPUT_VMEM VMEM[4]
+        _end(),                             # END
+    )
 
 
 def _build_vpu_program_bundle(inputs: list[np.ndarray], num_elems: int, steps: list[dict], output_reg: int,
                               input_broadcasts: list[bool] | None = None) -> str:
+    """Multi-step VPU program: VMEM[0..N-1]=inputs, execute steps, VMEM[N]=output_reg."""
     def tile(vals: np.ndarray) -> list[int]:
         padded = np.zeros(_TILE_ELEMS, dtype=np.int32)
         padded[:num_elems] = vals[:num_elems]
         return [int(x) for x in padded]
 
-    lines: list[str] = []
     if input_broadcasts is None:
         input_broadcasts = [False] * len(inputs)
+
+    lines: list[str] = []
     for idx, vals in enumerate(inputs):
-        lines.append("5 " + str(idx) + " " + " ".join(str(x) for x in tile(vals)))
+        lines.append(_vmem(idx, tile(vals)))          # VMEM[idx] = input
     for idx in range(len(inputs)):
-        lines.append(f"2 {_SXU_OPS['LOAD_VREG']} {idx} {idx} 0 0 0 0 0 0")
+        lines.append(_load(idx, idx))                 # LOAD v{idx}, VMEM[idx]
         if input_broadcasts[idx]:
-            lines.append(f"2 {_SXU_OPS['DISPATCH_XLU_BROADCAST']} 0 {idx} {idx} 0 0 0 0 0")
+            lines.append(_broadcast(idx))             # BROADCAST v{idx}
     for step in steps:
         lhs = int(step["lhs"])
         dst = int(step["dst"])
-        rhs = int(step.get("rhs", 0))
-        rhs_en = 1 if "rhs" in step else 0
-        lines.append(f"2 {_SXU_OPS['DISPATCH_VPU']} 0 {dst} {lhs} {int(step['op'])} {rhs} {rhs_en} 0 0")
-    lines.append(f"2 {_SXU_OPS['STORE_VREG']} {len(inputs)} 0 {output_reg} 0 0 0 0 0")
-    lines.append(f"2 {_SXU_OPS['HALT']} 0 0 0 0 0 0 0 0")
-    lines.append(f"6 {len(inputs)}")
-    lines.append("4")
-    return "\n".join(lines) + "\n"
+        vb  = int(step.get("rhs", 0))
+        lines.append(_vpu(dst, lhs, int(step["op"]), vb))  # VPU v{dst} = OP(v{lhs}, v{vb})
+    lines += [
+        _store(len(inputs), output_reg),  # STORE VMEM[N], v{output_reg}
+        _halt(),                          # HALT
+        _output_vmem(len(inputs)),        # OUTPUT_VMEM VMEM[N]
+        _end(),                           # END
+    ]
+    return _bundle(*lines)
 
 
 def _parse_sim_output(stdout: str) -> list[int] | None:
