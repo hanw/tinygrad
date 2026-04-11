@@ -26,7 +26,7 @@ _COLS   = 4
 _BYTES_PER_ELEM = 4           # Int#(32) = 4 bytes
 _TILE_ELEMS = _ROWS * _COLS   # 16 elements per VMEM tile
 _VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6, "SUB": 7, "CMPEQ": 8, "MAX_REDUCE": 9, "SHL": 10, "SHR": 11, "MIN": 12, "MIN_REDUCE": 13, "DIV": 14, "AND": 15, "OR": 16, "XOR": 17,
-             "FADD": 18, "FMUL": 19, "FSUB": 20, "FMAX": 21, "FCMPLT": 22, "FRECIP": 23, "I2F": 24, "F2I": 25, "NOT": 26}
+             "FADD": 18, "FMUL": 19, "FSUB": 20, "FMAX": 21, "FCMPLT": 22, "FRECIP": 23, "I2F": 24, "F2I": 25, "NOT": 26, "SELECT": 27, "COPY": 28}
 _VPU_BOOL_OPS = {_VPU_OPS["CMPLT"], _VPU_OPS["CMPNE"], _VPU_OPS["CMPEQ"]}
 _SXU_OPS = {"LOAD_VREG": 0, "STORE_VREG": 1, "DISPATCH_VPU": 2, "DISPATCH_XLU_BROADCAST": 3, "DISPATCH_MXU": 4, "WAIT_MXU": 5, "LOAD_MXU_RESULT": 6, "HALT": 7}
 
@@ -766,9 +766,9 @@ def _render_where_sxu_program(uops: list[UOp]) -> dict | None:
     if cond_arg is None or lhs_arg is None or rhs_arg is None:
         return None
 
-    MUL, SUB, ADD = _VPU_OPS["MUL"], _VPU_OPS["SUB"], _VPU_OPS["ADD"]
+    COPY_OP, SELECT_OP = _VPU_OPS["COPY"], _VPU_OPS["SELECT"]
     num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
-    addrs_per_tile = 5  # cond, lhs, rhs, ones, out
+    addrs_per_tile = 4  # cond, lhs, rhs, out
 
     all_instrs: list[str] = []
     data_plan: list[dict] = []
@@ -779,27 +779,21 @@ def _render_where_sxu_program(uops: list[UOp]) -> dict | None:
         offset = tile_idx * _TILE_ELEMS
         count = min(_TILE_ELEMS, out_size - offset)
 
-        # Data plan: cond, lhs, rhs, ones
         data_plan.append({"type": "VMEM", "addr": base, "param": cond_arg,
                           "offset": offset, "count": count, "dtype": "int32", "bool": True})
         data_plan.append({"type": "VMEM", "addr": base + 1, "param": lhs_arg,
                           "offset": offset, "count": count, "dtype": "int32"})
         data_plan.append({"type": "VMEM", "addr": base + 2, "param": rhs_arg,
                           "offset": offset, "count": count, "dtype": "int32"})
-        data_plan.append({"type": "VMEM", "addr": base + 3,
-                          "layout": "broadcast_const", "value": 1, "count": count, "dtype": "int32"})
 
-        out_vmem = base + 4
+        out_vmem = base + 3
         all_instrs += [
-            _load(0, base),        # v0 = cond
-            _load(1, base + 1),    # v1 = lhs
-            _load(2, base + 2),    # v2 = rhs
-            _load(3, base + 3),    # v3 = ones
-            _vpu(4, 0, MUL, 1),    # v4 = cond * lhs
-            _vpu(5, 3, SUB, 0),    # v5 = 1 - cond
-            _vpu(6, 5, MUL, 2),    # v6 = (1-cond) * rhs
-            _vpu(7, 4, ADD, 6),    # v7 = result
-            _store(out_vmem, 7),
+            _load(0, base),         # v0 = cond
+            _load(1, base + 1),     # v1 = lhs (true values)
+            _load(2, base + 2),     # v2 = rhs (false values)
+            _vpu(3, 2, COPY_OP),    # v3 = rhs, sets resultReg = rhs
+            _vpu(4, 0, SELECT_OP, 1),  # v4 = (cond!=0) ? lhs : resultReg(rhs)
+            _store(out_vmem, 4),
         ]
         outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
 
