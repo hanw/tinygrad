@@ -12,7 +12,7 @@ from __future__ import annotations
 import os, json, subprocess, tempfile, math
 from collections import Counter
 import numpy as np
-from tinygrad.device import Compiled, Allocator, BufferSpec
+from tinygrad.device import Compiled, Allocator, BufferSpec, Compiler
 from tinygrad.renderer import Renderer
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.dtype import PtrDType, dtypes
@@ -60,6 +60,17 @@ class TinytpuAllocator(Allocator["TinytpuDevice"]):
 
 
 # ---------------------------------------------------------------------------
+# Compiler — validates JSON descriptor, passes through as bytes
+# ---------------------------------------------------------------------------
+class TinyTPUCompiler(Compiler):
+    def compile(self, src: str) -> bytes:
+        prog = json.loads(src)
+        if prog.get("op") == "UNSUPPORTED":
+            pass  # let the runtime raise NotImplementedError with the full diagnostic
+        return src.encode()
+
+
+# ---------------------------------------------------------------------------
 # Renderer — detects 4x4 GEMM from UOps, emits JSON descriptor
 # ---------------------------------------------------------------------------
 class TinyTPURenderer(Renderer):
@@ -71,6 +82,7 @@ class TinyTPURenderer(Renderer):
 
     Emits a JSON descriptor that TinyTPUProgram uses at call time.
     """
+    compiler = TinyTPUCompiler()
     has_local   = False
     has_threads = False
     global_max  = (1,) * 3
