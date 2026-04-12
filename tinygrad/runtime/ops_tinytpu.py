@@ -690,8 +690,7 @@ def _render_copy_sxu_program(uops: list[UOp]) -> dict | None:
     src_arg = src_params[0]
     out_size = params[out_arg].dtype.size
     src_size = params[src_arg].dtype.size
-    # Shrink/slice: src_size >= out_size. Reshape: src_size == out_size.
-    if out_size <= 0 or src_size < out_size:
+    if out_size <= 0 or src_size <= 0:
         return None
     # Require matching element dtype — dtype conversions (bool<->int32 casts)
     # need the VPU_BINARY widening path.
@@ -719,6 +718,49 @@ def _render_copy_sxu_program(uops: list[UOp]) -> dict | None:
             if a.op is Ops.CONST and isinstance(a.arg, int):
                 return (b, a.arg)
         return (idx, 0)
+
+    # Detect scalar-broadcast: LOAD index is a literal CONST (no RANGE
+    # dependence). Emit a single load + BROADCAST_SCALAR per tile.
+    def _has_range(u, seen=None):
+        if seen is None: seen = set()
+        if id(u) in seen: return False
+        seen.add(id(u))
+        if u.op is Ops.RANGE: return True
+        return any(_has_range(s, seen) for s in u.src)
+
+    load_idxs = {_index_of(s.src[1].src[0]) for s in stores if s.src[1].op is Ops.LOAD}
+    if len(load_idxs) == 1:
+        li = next(iter(load_idxs))
+        if li is not None and not _has_range(li):
+            # Scalar broadcast path
+            load_const = li.arg if li.op is Ops.CONST else None
+            if load_const is not None:
+                num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+                data_plan = [{
+                    "type": "VMEM", "addr": 0, "param": src_arg,
+                    "offset": load_const, "count": 1, "dtype": "int32",
+                }]
+                all_instrs = [_load(0, 0), f"2 9 0 1 0 0 0 0 0 0"]  # SXU_BROADCAST_SCALAR vd=1 vs=0 row=0 col=0
+                outputs = []
+                for t in range(num_tiles):
+                    offset = t * _TILE_ELEMS
+                    count = min(_TILE_ELEMS, out_size - offset)
+                    out_addr = 1 + t
+                    all_instrs.append(_store(out_addr, 1))
+                    outputs.append({
+                        "addr": out_addr, "param": out_arg,
+                        "offset": offset, "count": count,
+                    })
+                all_instrs.append(_halt())
+                return {
+                    "op": "SXU_PROGRAM", "instructions": all_instrs,
+                    "data_plan": data_plan, "outputs": outputs,
+                    "num_output_tiles": num_tiles, "out": out_arg,
+                }
+
+    # Non-broadcast copy path requires src_size >= out_size.
+    if src_size < out_size:
+        return None
 
     src_offset = None  # constant offset (elements) from out to in
     for store in stores:
