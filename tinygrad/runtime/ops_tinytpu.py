@@ -1304,7 +1304,13 @@ def _render_multistep_sxu_program(uops: list[UOp]) -> dict | None:
                 const_src = next((s for s in first_cmpne.src if s.op is Ops.CONST), None)
                 if const_src is None:
                     return None
-                const_val = int(const_src.arg)
+                # For float operands, pack float bits so bit-level CMPEQ matches IEEE754 equality.
+                src_arg_tmp = src_params[0]
+                if "float" in str(params[src_arg_tmp].dtype):
+                    import struct
+                    const_val = struct.unpack("<i", struct.pack("<f", float(const_src.arg)))[0]
+                else:
+                    const_val = int(const_src.arg)
                 src_arg = src_params[0]
                 num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
                 addrs_per_tile = 3  # src, const, out
