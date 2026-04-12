@@ -494,8 +494,8 @@ def _render_colreduce_sxu_program(uops: list[UOp]) -> dict | None:
     if reduce_op is None: return None
     ncols = out_size
     nrows = src_size // ncols
-    # Iter 5 scope: single row-tile (nrows<=_ROWS), M=_COLS, SUM/MAX/MIN.
-    if ncols != _COLS or nrows > _ROWS: return None
+    # Iter 6 scope: single row-tile (nrows<=_ROWS), any M<=_COLS, SUM/MAX/MIN.
+    if ncols > _COLS or nrows > _ROWS: return None
 
     _INT32_MIN = -(1 << 31)
     _INT32_MAX = (1 << 31) - 1
@@ -515,6 +515,9 @@ def _render_colreduce_sxu_program(uops: list[UOp]) -> dict | None:
     ]
     entry = {
         "type": "VMEM", "addr": 0, "param": src_arg,
+        "mode": "MATRIX_TILE", "matrix_nrows": nrows, "matrix_ncols": ncols,
+        "row_base": 0, "col_base": 0,
+        "tile_rows": nrows, "tile_cols": ncols,
         "offset": 0, "count": nrows * ncols, "dtype": "int32",
     }
     if pad_value != 0:
@@ -2699,6 +2702,25 @@ class TinyTPUProgram:
                         for i in range(_COLS):
                             tile[i] = int(raw[t*_COLS+i])
                         data_lines.append(_vmem(addr+t, tile))
+                elif mode == "MATRIX_TILE":
+                    # Pack matrix[row_base:row_base+tile_rows, col_base:col_base+tile_cols]
+                    # into a 4x4 tile with pad_value fill for out-of-bounds cells.
+                    pad_val = int(entry.get("pad_value", 0))
+                    nrows_mat = int(entry["matrix_nrows"])
+                    ncols_mat = int(entry["matrix_ncols"])
+                    row_base  = int(entry.get("row_base", 0))
+                    col_base  = int(entry.get("col_base", 0))
+                    tile_rows = int(entry.get("tile_rows", _ROWS))
+                    tile_cols = int(entry.get("tile_cols", _COLS))
+                    tile = [pad_val] * _TILE_ELEMS
+                    for r in range(tile_rows):
+                        mr = row_base + r
+                        if mr >= nrows_mat: break
+                        for c in range(tile_cols):
+                            mc = col_base + c
+                            if mc >= ncols_mat: break
+                            tile[r * _COLS + c] = int(raw[mr * ncols_mat + mc])
+                    data_lines.append(_vmem(addr, tile))
                 else:
                     pad_val = int(entry.get("pad_value", 0))
                     tile = [pad_val] * _TILE_ELEMS
