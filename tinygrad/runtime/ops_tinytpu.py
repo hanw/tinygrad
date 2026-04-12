@@ -226,6 +226,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return colred_desc
         if (rowred_desc := _render_rowreduce_sxu_program(uops)) is not None:
             return rowred_desc
+        if (copy_desc := _render_copy_sxu_program(uops)) is not None:
+            return copy_desc
         return _render_elementwise_sxu_program(uops)
 
     wmma = wmmas[0]
@@ -619,6 +621,97 @@ def _render_rowreduce_sxu_program(uops: list[UOp]) -> dict | None:
     return {
         "op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
         "outputs": outputs, "num_output_tiles": num_row_tiles, "out": out_arg,
+    }
+
+
+_ALU_OP_NAMES = {"ADD", "SUB", "MUL", "MAX", "MIN", "IDIV", "MOD", "AND", "OR",
+                 "XOR", "NOT", "CMPLT", "CMPEQ", "CMPNE", "SHL", "SHR", "WHERE",
+                 "RECIP", "RECIPROCAL", "TRUNC", "SELECT", "WMMA", "MULACC"}
+
+
+def _render_copy_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render a pure data-movement kernel (no ALU) as a LOAD/STORE SXU_PROGRAM.
+
+    Covers the simple reshape-as-copy pattern tinygrad emits: 2 params (out, src),
+    matching sizes, a LOAD/STORE pair per tile with no arithmetic. Each tile
+    LOADs from VMEM[tile_in] and STOREs to VMEM[tile_out] without a VPU op.
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    if not op_counts.get("STORE") or not op_counts.get("LOAD"):
+        return None
+    # Only block on data-path ALU ops (index arithmetic is allowed).
+    data_alu = _data_alu_ops(uops)
+    if sum(data_alu.values()) > 0:
+        return None
+    # Guard against other op classes that must still block copy-detection.
+    for n in ("WHERE", "MOD", "RECIP", "RECIPROCAL", "TRUNC", "WMMA", "MULACC", "SELECT"):
+        if op_counts.get(n, 0):
+            return None
+
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2:
+        return None
+    stores = [u for u in uops if u.op is Ops.STORE]
+    out_params = {_find_unique_param_arg(s.src[0]) for s in stores}
+    out_params.discard(None)
+    if len(out_params) != 1:
+        return None
+    out_arg = next(iter(out_params))
+    src_params = [k for k in params if k != out_arg]
+    if len(src_params) != 1:
+        return None
+    src_arg = src_params[0]
+    out_size = params[out_arg].dtype.size
+    src_size = params[src_arg].dtype.size
+    if out_size != src_size or out_size <= 0:
+        return None
+    # Require matching element dtype — dtype conversions (bool<->int32 casts)
+    # need the VPU_BINARY widening path.
+    out_base = params[out_arg].dtype.base.itemsize
+    src_base = params[src_arg].dtype.base.itemsize
+    if out_base != src_base:
+        return None
+    # Require identity index mapping: each STORE must pair with a LOAD that
+    # reads from the same index expression. This rules out permute/transpose.
+    def _index_of(addr_uop):
+        # INDEX UOp: src[0] = PARAM, src[1] = offset (flat index expression).
+        if addr_uop.op is Ops.INDEX:
+            return addr_uop.src[1]
+        return None
+    for store in stores:
+        out_addr = store.src[0]
+        val = store.src[1]
+        if val.op is not Ops.LOAD:
+            return None
+        in_addr = val.src[0]
+        out_idx = _index_of(out_addr)
+        in_idx = _index_of(in_addr)
+        if out_idx is None or in_idx is None or out_idx is not in_idx:
+            return None
+
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    all_instrs: list[str] = []
+    data_plan: list[dict] = []
+    outputs: list[dict] = []
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count = min(_TILE_ELEMS, out_size - offset)
+        in_addr = tile_idx
+        out_addr = num_tiles + tile_idx
+        data_plan.append({
+            "type": "VMEM", "addr": in_addr, "param": src_arg,
+            "offset": offset, "count": count, "dtype": "int32",
+        })
+        all_instrs.append(_load(0, in_addr))
+        all_instrs.append(_store(out_addr, 0))
+        outputs.append({
+            "addr": out_addr, "param": out_arg,
+            "offset": offset, "count": count,
+        })
+    all_instrs.append(_halt())
+    return {
+        "op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+        "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg,
     }
 
 
