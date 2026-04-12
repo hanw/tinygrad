@@ -249,6 +249,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return multi_desc
         if (rowbc_desc := _render_rowbc_sxu_program(uops)) is not None:
             return rowbc_desc
+        if (colred_desc := _render_colreduce_sxu_program(uops)) is not None:
+            return colred_desc
         return _render_elementwise_sxu_program(uops)
 
     wmma = wmmas[0]
@@ -469,6 +471,47 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
         "reduce": _REDUCE_COMBINE.get(vpu_op, "sum"),
         "reduce_src_size": src_size,
         "reduce_layout": reduce_layout,
+    }
+
+
+def _render_colreduce_sxu_program(uops: list[UOp]) -> dict | None:
+    """Column-wise reduction (axis=0) via VPU_*_REDUCE_COL primitives.
+
+    Iter 4 scope: N<=4 rows, M=4 cols, single 4x4 tile, SUM only.
+    Tinygrad pattern: RANGE=1, STORE, out_size>1, MUL=0, LOAD=1.
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    params = [u for u in uops if u.op is Ops.PARAM]
+    if len(params) != 2: return None
+    for p in params:
+        if not isinstance(p.dtype, PtrDType): return None
+    out_size = params[0].dtype.size
+    src_size = params[1].dtype.size
+    if not (out_size > 1 and src_size > out_size and src_size % out_size == 0): return None
+    if op_counts.get("RANGE", 0) != 1 or op_counts.get("STORE", 0) != 1: return None
+    if op_counts.get("MUL", 0) != 0: return None  # col-reduce has no stride multiply
+    reduce_op = _detect_reduce_op(op_counts)
+    if reduce_op != "SUM": return None  # iter 4 scope
+    ncols = out_size
+    nrows = src_size // ncols
+    # Iter 4 scope: single-tile (N<=4, M=4)
+    if ncols != _COLS or nrows > _ROWS: return None
+
+    out_arg, src_arg = 0, 1
+    all_instrs = [
+        _load(0, 0),
+        _vpu(1, 0, _VPU_OPS["SUM_REDUCE_COL"]),
+        _store(1, 1),
+        _halt(),
+    ]
+    data_plan = [{
+        "type": "VMEM", "addr": 0, "param": src_arg,
+        "offset": 0, "count": nrows * ncols, "dtype": "int32",
+    }]
+    outputs = [{"addr": 1, "param": out_arg, "offset": 0, "count": ncols}]
+    return {
+        "op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+        "outputs": outputs, "num_output_tiles": 1, "out": out_arg,
     }
 
 
