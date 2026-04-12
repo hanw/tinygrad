@@ -995,6 +995,47 @@ def _render_multistep_sxu_program(uops: list[UOp]) -> dict | None:
             return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
                     "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
 
+    # --- Float MIN scalar const: minimum(x, c) = -max(-x, -c) → FCMPLT+SELECT with broadcast const ---
+    if (len(src_params) == 1 and has_max and has_mul and all_float
+            and not has_where and data_alu.get("XOR", 0) == 0 and not has_cmplt and not has_idiv):
+        # Find MAX UOp and extract the constant (it's stored as -c)
+        max_uops = [u for u in uops if u.op is Ops.MAX and _has_load_src(u)]
+        if max_uops:
+            max_uop = max_uops[0]
+            const_children = [s for s in max_uop.src if s.op is Ops.CONST
+                              and isinstance(s.arg, float)]
+            if len(const_children) == 1:
+                # Recover original const: stored as -c, actual c = -stored
+                import struct
+                actual_c = -float(const_children[0].arg)
+                # Convert to int32 bit representation for broadcast
+                const_bits = int(np.frombuffer(np.float32(actual_c).tobytes(), dtype=np.int32)[0])
+                src_arg = src_params[0]
+                num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+                addrs_per_tile = 3  # src, const, out
+                all_instrs, data_plan, outputs = [], [], []
+                for tile_idx in range(num_tiles):
+                    base = tile_idx * addrs_per_tile
+                    offset = tile_idx * _TILE_ELEMS
+                    count = min(_TILE_ELEMS, out_size - offset)
+                    data_plan.append({"type": "VMEM", "addr": base, "param": src_arg,
+                                      "offset": offset, "count": count, "dtype": "int32"})
+                    data_plan.append({"type": "VMEM", "addr": base + 1,
+                                      "layout": "broadcast_const", "value": const_bits,
+                                      "count": count, "dtype": "int32"})
+                    out_vmem = base + 2
+                    all_instrs += [
+                        _load(0, base),                # v0 = x
+                        _load(1, base + 1),            # v1 = const (broadcast)
+                        _vpu(2, 0, FCMPLT_OP, 1),      # v2 = (x < c) ? 1 : 0
+                        _select(3, 2, 0, 1),           # v3 = v2 ? x : c
+                        _store(out_vmem, 3),
+                    ]
+                    outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
+                all_instrs.append(_halt())
+                return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+                        "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
+
     # --- MIN decomposition: XOR+MAX pattern → emit VPU MIN ---
     has_xor = data_alu.get("XOR", 0) > 0
     if has_xor and has_max and not has_where and not has_cmplt and not has_idiv:
