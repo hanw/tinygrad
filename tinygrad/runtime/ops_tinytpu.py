@@ -728,35 +728,64 @@ def _render_copy_sxu_program(uops: list[UOp]) -> dict | None:
         if u.op is Ops.RANGE: return True
         return any(_has_range(s, seen) for s in u.src)
 
-    load_idxs = {_index_of(s.src[1].src[0]) for s in stores if s.src[1].op is Ops.LOAD}
-    if len(load_idxs) == 1:
-        li = next(iter(load_idxs))
-        if li is not None and not _has_range(li):
-            # Scalar broadcast path
-            load_const = li.arg if li.op is Ops.CONST else None
-            if load_const is not None:
-                num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
-                data_plan = [{
-                    "type": "VMEM", "addr": 0, "param": src_arg,
-                    "offset": load_const, "count": 1, "dtype": "int32",
-                }]
-                all_instrs = [_load(0, 0), f"2 9 0 1 0 0 0 0 0 0"]  # SXU_BROADCAST_SCALAR vd=1 vs=0 row=0 col=0
-                outputs = []
-                for t in range(num_tiles):
-                    offset = t * _TILE_ELEMS
-                    count = min(_TILE_ELEMS, out_size - offset)
-                    out_addr = 1 + t
-                    all_instrs.append(_store(out_addr, 1))
-                    outputs.append({
-                        "addr": out_addr, "param": out_arg,
-                        "offset": offset, "count": count,
-                    })
-                all_instrs.append(_halt())
-                return {
-                    "op": "SXU_PROGRAM", "instructions": all_instrs,
-                    "data_plan": data_plan, "outputs": outputs,
-                    "num_output_tiles": num_tiles, "out": out_arg,
-                }
+    load_idxs_all = [_index_of(s.src[1].src[0]) for s in stores if s.src[1].op is Ops.LOAD]
+    load_idxs = set(load_idxs_all)
+    all_loads_no_range = all(li is not None and not _has_range(li) for li in load_idxs_all)
+    if len(load_idxs) == 1 and all_loads_no_range:
+        li = load_idxs_all[0]
+        # Scalar broadcast path: single LOAD index, constant
+        load_const = li.arg if li.op is Ops.CONST else None
+        if load_const is not None:
+            num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+            data_plan = [{
+                "type": "VMEM", "addr": 0, "param": src_arg,
+                "offset": load_const, "count": 1, "dtype": "int32",
+            }]
+            all_instrs = [_load(0, 0), f"2 9 0 1 0 0 0 0 0 0"]  # SXU_BROADCAST_SCALAR vd=1 vs=0 row=0 col=0
+            outputs = []
+            for t in range(num_tiles):
+                offset = t * _TILE_ELEMS
+                count = min(_TILE_ELEMS, out_size - offset)
+                out_addr = 1 + t
+                all_instrs.append(_store(out_addr, 1))
+                outputs.append({
+                    "addr": out_addr, "param": out_arg,
+                    "offset": offset, "count": count,
+                })
+            all_instrs.append(_halt())
+            return {
+                "op": "SXU_PROGRAM", "instructions": all_instrs,
+                "data_plan": data_plan, "outputs": outputs,
+                "num_output_tiles": num_tiles, "out": out_arg,
+            }
+    # Row-broadcast: all LOAD indices are CONSTs (no RANGE), out_size is a
+    # multiple of src_size, and src_size is small (<=_COLS). Emit
+    # LOAD + BROADCAST_ROW + STOREs per tile. This handles
+    # Tensor([[v0, v1, ..., vM]]).expand(N, M).
+    if (all_loads_no_range and src_size <= _COLS and out_size % src_size == 0
+            and out_size > src_size):
+        num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+        data_plan = [{
+            "type": "VMEM", "addr": 0, "param": src_arg,
+            "offset": 0, "count": src_size, "dtype": "int32",
+        }]
+        all_instrs = [_load(0, 0), f"2 10 0 1 0 0 0 0 0 0"]  # SXU_BROADCAST_ROW vd=1 vs=0 srcRow=0
+        outputs = []
+        for t in range(num_tiles):
+            offset = t * _TILE_ELEMS
+            count = min(_TILE_ELEMS, out_size - offset)
+            out_addr = 1 + t
+            all_instrs.append(_store(out_addr, 1))
+            outputs.append({
+                "addr": out_addr, "param": out_arg,
+                "offset": offset, "count": count,
+            })
+        all_instrs.append(_halt())
+        return {
+            "op": "SXU_PROGRAM", "instructions": all_instrs,
+            "data_plan": data_plan, "outputs": outputs,
+            "num_output_tiles": num_tiles, "out": out_arg,
+        }
 
     # Non-broadcast copy path requires src_size >= out_size.
     if src_size < out_size:
