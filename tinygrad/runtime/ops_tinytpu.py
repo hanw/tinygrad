@@ -997,9 +997,13 @@ def _render_multistep_sxu_program(uops: list[UOp]) -> dict | None:
                         "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
 
     # --- ABS: 2 params, WHERE+CMPLT+CMPNE+MUL pattern → SUB(0,x), MAX(x, neg) ---
+    # For float tensors use FSUB/FMAX; bits for 0.0 and 0 are identical so broadcast const reuses 0.
     if (len(src_params) == 1 and has_where and has_cmplt and has_cmpne and has_mul
             and not has_idiv and not has_mod):
         src_arg = src_params[0]
+        src_is_float = "float" in str(params[src_arg].dtype)
+        sub_op = _VPU_OPS["FSUB"] if src_is_float else SUB_OP
+        max_op = _VPU_OPS["FMAX"] if src_is_float else MAX_OP
         num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
         addrs_per_tile = 3  # src, zeros, out
         all_instrs, data_plan, outputs = [], [], []
@@ -1015,8 +1019,8 @@ def _render_multistep_sxu_program(uops: list[UOp]) -> dict | None:
             all_instrs += [
                 _load(0, base),        # v0 = src
                 _load(1, base + 1),    # v1 = zeros
-                _vpu(2, 1, SUB_OP, 0), # v2 = 0 - src = -src
-                _vpu(3, 0, MAX_OP, 2), # v3 = max(src, -src) = abs(src)
+                _vpu(2, 1, sub_op, 0), # v2 = 0 - src = -src
+                _vpu(3, 0, max_op, 2), # v3 = max(src, -src) = abs(src)
                 _store(out_vmem, 3),
             ]
             outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
