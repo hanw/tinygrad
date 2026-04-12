@@ -128,9 +128,16 @@ def _render_legacy_descriptor(uops: list[UOp]) -> dict | None:
         param_sizes[p.arg] = p.dtype.size
 
     # --- HOST_UNARY: TRUNC or RECIPROCAL on float ---
-    if (len(params) == 2 and (op_counts.get("TRUNC", 0) > 0 or op_counts.get("RECIPROCAL", 0) > 0)
+    # Require a simple pattern: no additional compute ops beyond indexing.
+    # sqrt/log2/sin/etc. decompose into RECIPROCAL + many other ops and must NOT match.
+    _simple_unary_ops = {"TRUNC", "RECIPROCAL"}
+    _allowed_aux = {"CONST", "INDEX", "LOAD", "STORE", "PARAM", "SINK", "GROUP", "END", "RANGE",
+                    "MUL", "ADD", "CAST", "GEP", "VECTORIZE", "WMMA"}
+    _compute_ops = [n for n, c in op_counts.items() if c > 0 and n not in _allowed_aux]
+    only_simple_unary = (len(_compute_ops) == 1 and _compute_ops[0] in _simple_unary_ops)
+    if (len(params) == 2 and only_simple_unary
             and "float" in str(params[0].dtype) and "float" in str(params[1].dtype)):
-        host_op = "TRUNC" if op_counts.get("TRUNC", 0) > 0 else "RECIPROCAL"
+        host_op = _compute_ops[0]
         src_size = param_sizes.get(1, 0)
         if src_size > 0:
             return {"op": "HOST_UNARY", "host_op": host_op, "dtype": "float32",
@@ -1792,6 +1799,13 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     not yet migrated to SXU_PROGRAM (scalar-const DIV/MIN/MOD)."""
     params = [u for u in uops if u.op is Ops.PARAM]
     op_counts = Counter(u.op.name for u in uops)
+    # Reject complex float math (sqrt, log2, sin, exp2) — these decompose into
+    # many ops including BITCAST and would otherwise match DIV/RECIP patterns.
+    if op_counts.get("BITCAST", 0) > 0:
+        return {"supported": False, "kind": None, "reason": "complex float math not supported", "notes": [],
+                "out_arg": None, "lhs_arg": None, "lhs_const": None, "rhs_arg": None, "rhs_const": None,
+                "num_elems": None, "vpu_op": None, "inputs": None, "steps": None, "output_reg": None,
+                "lhs_broadcast": False, "rhs_broadcast": False}
 
     diag = {
         "supported": False, "kind": None, "reason": "", "notes": [],
