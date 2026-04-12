@@ -105,8 +105,9 @@ def _detect_reduce_op(op_counts: Counter) -> str | None:
 def _render_legacy_descriptor(uops: list[UOp]) -> dict | None:
     """Slim fallback renderer for patterns not yet handled by SXU_PROGRAM.
 
-    Handles: HOST_COLREDUCE, HOST_ROWREDUCE, VPU_ROWSUM, HOST_UNARY, GEMM4x4,
-    and remaining scalar-const VPU_BINARY/VPU_PROGRAM patterns.
+    Handles: HOST_UNARY, GEMM4x4, and remaining scalar-const VPU_BINARY /
+    VPU_PROGRAM patterns. Row/column reductions now go through the
+    SXU_PROGRAM renderers and no longer fall back to host numpy.
     """
     op_counts = Counter(u.op.name for u in uops)
     params = [u for u in uops if u.op is Ops.PARAM]
@@ -125,35 +126,7 @@ def _render_legacy_descriptor(uops: list[UOp]) -> dict | None:
             return {"op": "HOST_UNARY", "host_op": host_op, "dtype": "float32",
                     "out": 0, "src": 1, "num_elems": src_size}
 
-    # --- Reductions: col-wise, row-wise ---
-    if len(params) == 2 and op_counts.get("RANGE", 0) == 1 and op_counts.get("STORE", 0) == 1:
-        out_size = param_sizes.get(0, 0)
-        src_size = param_sizes.get(1, 0)
-        if out_size > 1 and src_size > out_size and src_size % out_size == 0:
-            # Column-wise: MUL=0 (no stride multiply)
-            if op_counts.get("MUL", 0) == 0:
-                ncols = out_size
-                nrows = src_size // ncols
-                reduce_op = _detect_reduce_op(op_counts)
-                if reduce_op:
-                    return {"op": "HOST_COLREDUCE", "out": 0, "src": 1,
-                            "nrows": nrows, "ncols": ncols, "host_op": reduce_op}
-            # Row-wise: MUL=1 (stride multiply)
-            elif op_counts.get("MUL", 0) == 1:
-                ncols = src_size // out_size
-                nrows = out_size
-                if ncols >= 2 and op_counts.get("LOAD", 0) == ncols:
-                    reduce_op = _detect_reduce_op(op_counts)
-                    if reduce_op:
-                        if ncols == _COLS:
-                            vpu_map = {"SUM": 4, "MAX": _VPU_OPS["MAX_REDUCE"], "MIN": _VPU_OPS["MIN_REDUCE"]}
-                            return {"op": "VPU_ROWSUM", "out": 0, "src": 1,
-                                    "num_rows": nrows, "num_cols": ncols, "vpu_op": vpu_map[reduce_op]}
-                        else:
-                            return {"op": "HOST_ROWREDUCE", "out": 0, "src": 1,
-                                    "nrows": nrows, "ncols": ncols, "host_op": reduce_op}
-
-    # --- GEMM fallback: 3 params with MULACC or scalar MUL+RANGE pattern ---
+# --- GEMM fallback: 3 params with MULACC or scalar MUL+RANGE pattern ---
     has_mulacc = any(u.op is Ops.MULACC for u in uops)
     has_store = op_counts.get("STORE", 0) > 0
     is_gemm = has_mulacc or (len(params) == 3 and op_counts.get("MUL", 0) > 0
@@ -2524,7 +2497,7 @@ def _unsupported_message(prog: dict) -> str:
 # ---------------------------------------------------------------------------
 # Program — drives the BSV simulator
 # ---------------------------------------------------------------------------
-_SUPPORTED_OPS = {"GEMM4x4", "SXU_PROGRAM", "VPU_BINARY", "VPU_PROGRAM", "VPU_ROWSUM", "HOST_ROWREDUCE", "HOST_COLREDUCE", "HOST_BINARY", "HOST_UNARY"}
+_SUPPORTED_OPS = {"GEMM4x4", "SXU_PROGRAM", "VPU_BINARY", "VPU_PROGRAM", "HOST_BINARY", "HOST_UNARY"}
 
 class TinyTPUProgram:
     def __init__(self, name: str, lib: bytes, *args, **kwargs):
@@ -2678,87 +2651,6 @@ class TinyTPUProgram:
         return 1e-3
 
 
-
-    def _exec_host_rowreduce(self, bufs):
-        prog = self.prog
-        # Row-wise reduction for non-standard column count (host numpy).
-        out_buf = bufs[prog["out"]]
-        src_i32 = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<i4")
-        nrows   = int(prog["nrows"])
-        ncols   = int(prog["ncols"])
-        if src_i32.size < nrows * ncols:
-            raise RuntimeError(
-                f"TinyTPU HOST_ROWREDUCE expected at least {nrows*ncols} elements, "
-                f"got {src_i32.size}")
-        mat = src_i32[:nrows * ncols].reshape(nrows, ncols)
-        host_op = prog["host_op"]
-        if host_op == "SUM":
-            result = mat.sum(axis=1).astype(np.int32)
-        elif host_op == "MAX":
-            result = mat.max(axis=1).astype(np.int32)
-        elif host_op == "MIN":
-            result = mat.min(axis=1).astype(np.int32)
-        else:
-            raise RuntimeError(f"Unknown HOST_ROWREDUCE op {host_op!r}")
-        out_buf[:nrows * _BYTES_PER_ELEM] = result.tobytes()
-        return 1e-3
-
-    def _exec_host_colreduce(self, bufs):
-        prog = self.prog
-        # Column-wise reduction (axis=0): compute sum/max/min across rows
-        # for each column, entirely on the host via numpy.
-        out_buf = bufs[prog["out"]]
-        src_i32 = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<i4")
-        nrows   = int(prog["nrows"])
-        ncols   = int(prog["ncols"])
-        if src_i32.size < nrows * ncols:
-            raise RuntimeError(
-                f"TinyTPU HOST_COLREDUCE expected at least {nrows*ncols} elements, "
-                f"got {src_i32.size}")
-        mat = src_i32[:nrows * ncols].reshape(nrows, ncols)
-        host_op = prog["host_op"]
-        if host_op == "SUM":
-            result = mat.sum(axis=0).astype(np.int32)
-        elif host_op == "MAX":
-            result = mat.max(axis=0).astype(np.int32)
-        elif host_op == "MIN":
-            result = mat.min(axis=0).astype(np.int32)
-        else:
-            raise RuntimeError(f"Unknown HOST_COLREDUCE op {host_op!r}")
-        out_buf[:ncols * _BYTES_PER_ELEM] = result.tobytes()
-        return 1e-3
-
-    def _exec_vpu_rowsum(self, bufs):
-        prog = self.prog
-        # Row-wise sum: for each row of a (nrows × ncols) tile, sum all
-        # columns using VPU_SUM_REDUCE (which broadcasts the row sum to all
-        # lane positions). Extract position 0 of each row from vmem_result.
-        out_buf  = bufs[prog["out"]]
-        src_i32  = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<i4")
-        num_rows = int(prog["num_rows"])
-        num_cols = int(prog["num_cols"])
-        if src_i32.size < num_rows * num_cols:
-            raise RuntimeError(
-                f"TinyTPU VPU_ROWSUM expected at least {num_rows*num_cols} elements, "
-                f"got {src_i32.size}")
-        src_i32 = src_i32[:num_rows * num_cols]  # trim tinygrad buffer padding
-        row_vpu_op = int(prog.get("vpu_op", 4))  # default 4=SUM_REDUCE
-        # Run VPU in _ROWS-row tiles; extract lane-0 per row across all tiles.
-        all_row_results: list[int] = []
-        for tile_start in range(0, num_rows, _ROWS):
-            tile_end = min(tile_start + _ROWS, num_rows)
-            tile_nrows = tile_end - tile_start
-            tile_padded = np.zeros(_TILE_ELEMS, dtype=np.int32)
-            tile_padded[:tile_nrows * num_cols] = src_i32[tile_start * num_cols:tile_end * num_cols]
-            tile_stdout = self._run(_build_vpu_unary_bundle(tile_padded, _TILE_ELEMS, row_vpu_op))
-            tile_result = _parse_vmem_output(tile_stdout)
-            if tile_result is None:
-                raise RuntimeError(
-                    f"TinyTPU VPU_ROWSUM tile {tile_start}: no vmem_result\nstdout: {tile_stdout}")
-            all_row_results.extend(tile_result[r * _COLS] for r in range(tile_nrows))
-        row_sums = np.array(all_row_results, dtype=np.int32)
-        out_buf[:num_rows * _BYTES_PER_ELEM] = row_sums.tobytes()
-        return 1e-3
 
     def _exec_sxu_program(self, bufs):
         prog = self.prog
