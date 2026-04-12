@@ -1489,8 +1489,13 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
     has_where = op_counts.get("WHERE", 0) > 0
     store_count = op_counts.get("STORE", 0)
     data_alu_counts = _data_alu_ops(uops)
+    # WHERE count may equal STORE count (GROUP lowering) or STORE * vector_width
+    # (VECTORIZE lowering, e.g. float). Allow both patterns.
+    vec_count = op_counts.get("VECTORIZE", 0)
+    where_ok = (op_counts.get("WHERE", 0) == store_count
+                or (vec_count > 0 and op_counts.get("WHERE", 0) == op_counts.get("CMPLT", 0)))
     is_relu_candidate = (has_where and len(params) == 2 and len(src_params) == 1
-                         and op_counts.get("WHERE", 0) == store_count
+                         and where_ok
                          and not any(data_alu_counts.get(n, 0) > 0 for n in ["ADD", "MUL", "MAX"]))
     if has_where and not is_relu_candidate:
         return None
