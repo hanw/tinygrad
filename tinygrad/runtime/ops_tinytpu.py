@@ -243,6 +243,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return colred_desc
         if (rowred_desc := _render_rowreduce_sxu_program(uops)) is not None:
             return rowred_desc
+        if (cast_desc := _render_cast_sxu_program(uops)) is not None:
+            return cast_desc
         if (copy_desc := _render_copy_sxu_program(uops)) is not None:
             return copy_desc
         return _render_elementwise_sxu_program(uops)
@@ -666,6 +668,67 @@ def _render_rowreduce_sxu_program(uops: list[UOp]) -> dict | None:
 _ALU_OP_NAMES = {"ADD", "SUB", "MUL", "MAX", "MIN", "IDIV", "MOD", "AND", "OR",
                  "XOR", "NOT", "CMPLT", "CMPEQ", "CMPNE", "SHL", "SHR", "WHERE",
                  "RECIP", "RECIPROCAL", "TRUNC", "SELECT", "WMMA", "MULACC"}
+
+
+def _render_cast_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render int32↔float32 CAST kernels as SXU_PROGRAM using VPU_I2F / VPU_F2I.
+
+    Pattern: 2 params (out, src), exactly one CAST op, int↔float type pair.
+    bool↔int casts are handled by the legacy analyzer (bit-level, not value conversion).
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    if op_counts.get("CAST", 0) == 0:
+        return None
+    # Reject if anything beyond CAST/movement/indexing ops is present
+    _allowed = {"CAST", "CONST", "INDEX", "LOAD", "STORE", "PARAM", "SINK", "GROUP",
+                "END", "RANGE", "VECTORIZE", "GEP", "MUL", "ADD"}
+    if any(c > 0 and n not in _allowed for n, c in op_counts.items()):
+        return None
+    # The MUL/ADD must be index arithmetic (no LOAD in source tree).
+    for u in uops:
+        if u.op in (Ops.MUL, Ops.ADD) and _has_load_src(u):
+            return None
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2 or 0 not in params:
+        return None
+    out_dtype = str(params[0].dtype)
+    src_arg = next((k for k in params if k != 0), None)
+    if src_arg is None:
+        return None
+    src_dtype = str(params[src_arg].dtype)
+    # Only handle the value-conversion cases (not bool/int bitwidth changes).
+    if "float" in out_dtype and ("int" in src_dtype and "bool" not in src_dtype):
+        vpu_op = _VPU_OPS["I2F"]
+    elif "int" in out_dtype and "bool" not in out_dtype and "float" in src_dtype:
+        vpu_op = _VPU_OPS["F2I"]
+    else:
+        return None
+
+    out_size = params[0].dtype.size
+    src_size = params[src_arg].dtype.size
+    if out_size != src_size or out_size <= 0:
+        return None
+
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    all_instrs: list[str] = []
+    data_plan: list[dict] = []
+    outputs: list[dict] = []
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count = min(_TILE_ELEMS, out_size - offset)
+        base = tile_idx * 2  # src, out
+        data_plan.append({"type": "VMEM", "addr": base, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        out_vmem = base + 1
+        all_instrs += [
+            _load(0, base),         # v0 = src (int bits)
+            _vpu(1, 0, vpu_op),     # v1 = I2F(v0) or F2I(v0)
+            _store(out_vmem, 1),
+        ]
+        outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
 
 
 def _render_copy_sxu_program(uops: list[UOp]) -> dict | None:
