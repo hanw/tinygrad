@@ -584,8 +584,8 @@ def _render_rowreduce_sxu_program(uops: list[UOp]) -> dict | None:
     # Tinygrad may fully unroll or keep a RANGE loop; match both.
     nloads = op_counts.get("LOAD", 0)
     if nloads != ncols and nloads != 1: return None
-    # Iter 2 scope: single tile (N<=4, M<=4), SUM/MAX/MIN.
-    if nrows > _ROWS or ncols > _COLS: return None
+    # Iter 3 scope: any N, M<=_COLS, SUM/MAX/MIN.
+    if ncols > _COLS: return None
 
     _INT32_MIN = -(1 << 31)
     _INT32_MAX = (1 << 31) - 1
@@ -597,29 +597,40 @@ def _render_rowreduce_sxu_program(uops: list[UOp]) -> dict | None:
     vpu_op, pad_value = _REDUCE_VPU[reduce_op]
 
     out_arg, src_arg = 0, 1
-    all_instrs = [
-        _load(0, 0),
-        _vpu(1, 0, vpu_op),
-        _store(1, 1),
-        _halt(),
-    ]
-    entry = {
-        "type": "VMEM", "addr": 0, "param": src_arg,
-        "mode": "MATRIX_TILE", "matrix_nrows": nrows, "matrix_ncols": ncols,
-        "row_base": 0, "col_base": 0,
-        "tile_rows": nrows, "tile_cols": ncols,
-        "offset": 0, "count": nrows * ncols, "dtype": "int32",
-    }
-    if pad_value != 0:
-        entry["pad_value"] = pad_value
-    data_plan = [entry]
-    outputs = [{
-        "addr": 1, "param": out_arg,
-        "offset": 0, "count": nrows, "extract": "row_heads",
-    }]
+    num_row_tiles = (nrows + _ROWS - 1) // _ROWS
+    data_plan: list[dict] = []
+    all_instrs: list[str] = []
+    outputs: list[dict] = []
+
+    for rt in range(num_row_tiles):
+        row_base = rt * _ROWS
+        tile_rows = min(_ROWS, nrows - row_base)
+        src_addr = rt * 2
+        out_addr = rt * 2 + 1
+        entry = {
+            "type": "VMEM", "addr": src_addr, "param": src_arg,
+            "mode": "MATRIX_TILE", "matrix_nrows": nrows, "matrix_ncols": ncols,
+            "row_base": row_base, "col_base": 0,
+            "tile_rows": tile_rows, "tile_cols": ncols,
+            "offset": 0, "count": tile_rows * ncols, "dtype": "int32",
+        }
+        if pad_value != 0:
+            entry["pad_value"] = pad_value
+        data_plan.append(entry)
+        src_vreg = rt * 2
+        red_vreg = rt * 2 + 1
+        all_instrs.append(_load(src_vreg, src_addr))
+        all_instrs.append(_vpu(red_vreg, src_vreg, vpu_op))
+        all_instrs.append(_store(out_addr, red_vreg))
+        outputs.append({
+            "addr": out_addr, "param": out_arg,
+            "offset": row_base, "count": tile_rows, "extract": "row_heads",
+        })
+
+    all_instrs.append(_halt())
     return {
         "op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
-        "outputs": outputs, "num_output_tiles": 1, "out": out_arg,
+        "outputs": outputs, "num_output_tiles": num_row_tiles, "out": out_arg,
     }
 
 
