@@ -402,16 +402,20 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
     if not has_store:
         return None
 
+    # INT32 identity bounds used as padding so tile-reduce produces correct
+    # results on partial last tiles.
+    _INT32_MIN = -(1 << 31)
+    _INT32_MAX = (1 << 31) - 1
+    pad_value = 0
     if has_add and not has_max:
-        # SUM: full-tile reduction. Zero padding is the additive identity so
-        # VPU_SUM_REDUCE_TILE is safe regardless of partial-tile counts.
         vpu_op = _VPU_OPS["SUM_REDUCE_TILE"]
         combine_op = _VPU_OPS["ADD"]
         reduce_layout = "tile"
     elif has_max and not has_xor:
-        vpu_op = _VPU_OPS["MAX_REDUCE"]
+        vpu_op = _VPU_OPS["MAX_REDUCE_TILE"]
         combine_op = _VPU_OPS["MAX"]
-        reduce_layout = "row"
+        reduce_layout = "tile"
+        pad_value = _INT32_MIN
     elif has_max and has_xor:
         vpu_op = _VPU_OPS["MIN_REDUCE"]
         combine_op = _VPU_OPS["MIN"]
@@ -420,7 +424,7 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
         return None
 
     _REDUCE_COMBINE = {_VPU_OPS["SUM_REDUCE_TILE"]: "sum",
-                      _VPU_OPS["MAX_REDUCE"]: "max",
+                      _VPU_OPS["MAX_REDUCE_TILE"]: "max",
                       _VPU_OPS["MIN_REDUCE"]: "min"}
 
     # Scalar reduction
@@ -432,8 +436,11 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
         offset = tile_idx * _TILE_ELEMS
         count = min(_TILE_ELEMS, src_size - offset)
         vmem_addr = tile_idx
-        data_plan.append({"type": "VMEM", "addr": vmem_addr, "param": src_arg,
-                          "offset": offset, "count": count, "dtype": "int32"})
+        entry = {"type": "VMEM", "addr": vmem_addr, "param": src_arg,
+                 "offset": offset, "count": count, "dtype": "int32"}
+        if pad_value != 0:
+            entry["pad_value"] = pad_value
+        data_plan.append(entry)
         src_vreg = tile_idx * 2
         dst_vreg = tile_idx * 2 + 1
         all_instrs.append(_load(src_vreg, vmem_addr))
@@ -2637,7 +2644,8 @@ class TinyTPUProgram:
                             tile[i] = int(raw[t*_COLS+i])
                         data_lines.append(_vmem(addr+t, tile))
                 else:
-                    tile = [0] * _TILE_ELEMS
+                    pad_val = int(entry.get("pad_value", 0))
+                    tile = [pad_val] * _TILE_ELEMS
                     chunk = raw[offset:offset+count]
                     for i in range(min(count, len(chunk))):
                         tile[i] = int(chunk[i])
