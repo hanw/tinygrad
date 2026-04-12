@@ -403,18 +403,25 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
         return None
 
     if has_add and not has_max:
-        vpu_op = 4  # VPU_SUM_REDUCE
+        # SUM: full-tile reduction. Zero padding is the additive identity so
+        # VPU_SUM_REDUCE_TILE is safe regardless of partial-tile counts.
+        vpu_op = _VPU_OPS["SUM_REDUCE_TILE"]
         combine_op = _VPU_OPS["ADD"]
+        reduce_layout = "tile"
     elif has_max and not has_xor:
         vpu_op = _VPU_OPS["MAX_REDUCE"]
         combine_op = _VPU_OPS["MAX"]
+        reduce_layout = "row"
     elif has_max and has_xor:
         vpu_op = _VPU_OPS["MIN_REDUCE"]
         combine_op = _VPU_OPS["MIN"]
+        reduce_layout = "row"
     else:
         return None
 
-    _REDUCE_COMBINE = {4: "sum", _VPU_OPS["MAX_REDUCE"]: "max", _VPU_OPS["MIN_REDUCE"]: "min"}
+    _REDUCE_COMBINE = {_VPU_OPS["SUM_REDUCE_TILE"]: "sum",
+                      _VPU_OPS["MAX_REDUCE"]: "max",
+                      _VPU_OPS["MIN_REDUCE"]: "min"}
 
     # Scalar reduction
     num_tiles = (src_size + _TILE_ELEMS - 1) // _TILE_ELEMS
@@ -453,6 +460,7 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
         "outputs": outputs, "num_output_tiles": 1, "out": out_arg,
         "reduce": _REDUCE_COMBINE.get(vpu_op, "sum"),
         "reduce_src_size": src_size,
+        "reduce_layout": reduce_layout,
     }
 
 
@@ -2655,19 +2663,24 @@ class TinyTPUProgram:
             count = int(out_entry["count"])
             tile_data = vmem_results[idx]
             if reduce_mode and count == 1:
-                # Scalar cross-sublane accumulation: per-row results at positions 0, 4, 8, 12
-                # Only include sublanes that had actual data (not zero-padding)
-                reduce_src = int(prog.get("reduce_src_size", _TILE_ELEMS))
-                data_rows = min(_ROWS, (reduce_src + _COLS - 1) // _COLS)
-                row_vals = [tile_data[r * _COLS] for r in range(data_rows) if r * _COLS < len(tile_data)]
-                if reduce_mode == "sum":
-                    scalar = sum(row_vals)
-                elif reduce_mode == "max":
-                    scalar = max(row_vals)
-                elif reduce_mode == "min":
-                    scalar = min(row_vals)
+                reduce_layout = prog.get("reduce_layout", "row")
+                if reduce_layout == "tile":
+                    # Tile-reduce: scalar is broadcast everywhere, just extract [0].
+                    scalar = tile_data[0]
                 else:
-                    scalar = row_vals[0]
+                    # Row-reduce: per-row results at positions 0, 4, 8, 12.
+                    # Only include sublanes that had actual data (not zero-padding).
+                    reduce_src = int(prog.get("reduce_src_size", _TILE_ELEMS))
+                    data_rows = min(_ROWS, (reduce_src + _COLS - 1) // _COLS)
+                    row_vals = [tile_data[r * _COLS] for r in range(data_rows) if r * _COLS < len(tile_data)]
+                    if reduce_mode == "sum":
+                        scalar = sum(row_vals)
+                    elif reduce_mode == "max":
+                        scalar = max(row_vals)
+                    elif reduce_mode == "min":
+                        scalar = min(row_vals)
+                    else:
+                        scalar = row_vals[0]
                 chunk_out = np.array([scalar], dtype=out_dtype)
             else:
                 chunk_out = np.array(tile_data[:count], dtype=out_dtype)
