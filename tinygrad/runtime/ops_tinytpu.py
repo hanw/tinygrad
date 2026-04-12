@@ -584,44 +584,59 @@ def _render_rowreduce_sxu_program(uops: list[UOp]) -> dict | None:
     # Tinygrad may fully unroll or keep a RANGE loop; match both.
     nloads = op_counts.get("LOAD", 0)
     if nloads != ncols and nloads != 1: return None
-    # Iter 3 scope: any N, M<=_COLS, SUM/MAX/MIN.
-    if ncols > _COLS: return None
-
     _INT32_MIN = -(1 << 31)
     _INT32_MAX = (1 << 31) - 1
     _REDUCE_VPU = {
-        "SUM": (_VPU_OPS["SUM_REDUCE"], 0),
-        "MAX": (_VPU_OPS["MAX_REDUCE"], _INT32_MIN),
-        "MIN": (_VPU_OPS["MIN_REDUCE"], _INT32_MAX),
+        "SUM": (_VPU_OPS["SUM_REDUCE"], _VPU_OPS["ADD"], 0),
+        "MAX": (_VPU_OPS["MAX_REDUCE"], _VPU_OPS["MAX"], _INT32_MIN),
+        "MIN": (_VPU_OPS["MIN_REDUCE"], _VPU_OPS["MIN"], _INT32_MAX),
     }
-    vpu_op, pad_value = _REDUCE_VPU[reduce_op]
+    vpu_op, combine_op, pad_value = _REDUCE_VPU[reduce_op]
 
     out_arg, src_arg = 0, 1
     num_row_tiles = (nrows + _ROWS - 1) // _ROWS
+    num_col_tiles = (ncols + _COLS - 1) // _COLS
     data_plan: list[dict] = []
     all_instrs: list[str] = []
     outputs: list[dict] = []
 
+    src_addr = 0
+    vreg = 0
     for rt in range(num_row_tiles):
         row_base = rt * _ROWS
         tile_rows = min(_ROWS, nrows - row_base)
-        src_addr = rt * 2
-        out_addr = rt * 2 + 1
-        entry = {
-            "type": "VMEM", "addr": src_addr, "param": src_arg,
-            "mode": "MATRIX_TILE", "matrix_nrows": nrows, "matrix_ncols": ncols,
-            "row_base": row_base, "col_base": 0,
-            "tile_rows": tile_rows, "tile_cols": ncols,
-            "offset": 0, "count": tile_rows * ncols, "dtype": "int32",
-        }
-        if pad_value != 0:
-            entry["pad_value"] = pad_value
-        data_plan.append(entry)
-        src_vreg = rt * 2
-        red_vreg = rt * 2 + 1
-        all_instrs.append(_load(src_vreg, src_addr))
-        all_instrs.append(_vpu(red_vreg, src_vreg, vpu_op))
-        all_instrs.append(_store(out_addr, red_vreg))
+        per_ct_red_vregs: list[int] = []
+        for ct in range(num_col_tiles):
+            col_base = ct * _COLS
+            tile_cols = min(_COLS, ncols - col_base)
+            entry = {
+                "type": "VMEM", "addr": src_addr, "param": src_arg,
+                "mode": "MATRIX_TILE", "matrix_nrows": nrows, "matrix_ncols": ncols,
+                "row_base": row_base, "col_base": col_base,
+                "tile_rows": tile_rows, "tile_cols": tile_cols,
+                "offset": 0, "count": tile_rows * tile_cols, "dtype": "int32",
+            }
+            if pad_value != 0:
+                entry["pad_value"] = pad_value
+            data_plan.append(entry)
+            src_vreg = vreg; vreg += 1
+            red_vreg = vreg; vreg += 1
+            all_instrs.append(_load(src_vreg, src_addr))
+            all_instrs.append(_vpu(red_vreg, src_vreg, vpu_op))
+            per_ct_red_vregs.append(red_vreg)
+            src_addr += 1
+        # Combine col-tile partial row-reductions (each broadcast across row).
+        if len(per_ct_red_vregs) == 1:
+            final_vreg = per_ct_red_vregs[0]
+        else:
+            acc = per_ct_red_vregs[0]
+            for nxt in per_ct_red_vregs[1:]:
+                out_vreg = vreg; vreg += 1
+                all_instrs.append(_vpu(out_vreg, acc, combine_op, nxt))
+                acc = out_vreg
+            final_vreg = acc
+        out_addr = src_addr; src_addr += 1
+        all_instrs.append(_store(out_addr, final_vreg))
         outputs.append({
             "addr": out_addr, "param": out_arg,
             "offset": row_base, "count": tile_rows, "extract": "row_heads",
