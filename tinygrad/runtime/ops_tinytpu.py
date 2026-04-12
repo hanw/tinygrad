@@ -28,7 +28,8 @@ _TILE_ELEMS = _ROWS * _COLS   # 16 elements per VMEM tile
 _VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "SUM_REDUCE": 4, "CMPLT": 5, "CMPNE": 6, "SUB": 7, "CMPEQ": 8, "MAX_REDUCE": 9, "SHL": 10, "SHR": 11, "MIN": 12, "MIN_REDUCE": 13, "DIV": 14, "AND": 15, "OR": 16, "XOR": 17,
              "FADD": 18, "FMUL": 19, "FSUB": 20, "FMAX": 21, "FCMPLT": 22, "FRECIP": 23, "I2F": 24, "F2I": 25, "NOT": 26, "SELECT": 27, "COPY": 28,
              "SUM_REDUCE_COL": 29, "MAX_REDUCE_COL": 30, "MIN_REDUCE_COL": 31,
-             "SUM_REDUCE_TILE": 32, "MAX_REDUCE_TILE": 33, "MIN_REDUCE_TILE": 34}
+             "SUM_REDUCE_TILE": 32, "MAX_REDUCE_TILE": 33, "MIN_REDUCE_TILE": 34,
+             "MUL_REDUCE": 35, "MUL_REDUCE_COL": 36, "MUL_REDUCE_TILE": 37}
 _VPU_BOOL_OPS = {_VPU_OPS["CMPLT"], _VPU_OPS["CMPNE"], _VPU_OPS["CMPEQ"]}
 _SXU_OPS = {"LOAD_VREG": 0, "STORE_VREG": 1, "DISPATCH_VPU": 2, "DISPATCH_XLU_BROADCAST": 3, "DISPATCH_MXU": 4, "WAIT_MXU": 5, "LOAD_MXU_RESULT": 6, "HALT": 7, "DISPATCH_SELECT": 8, "BROADCAST_SCALAR": 9, "BROADCAST_ROW": 10, "BROADCAST_COL": 11}
 
@@ -380,13 +381,20 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
     has_store = op_counts.get("STORE", 0) > 0
     if not has_store:
         return None
+    # Data-path MUL is the MUL-reduction signature (no index-arithmetic MULs).
+    data_alu = _data_alu_ops(uops)
+    has_data_mul = data_alu.get("MUL", 0) > 0
 
     # INT32 identity bounds used as padding so tile-reduce produces correct
     # results on partial last tiles.
     _INT32_MIN = -(1 << 31)
     _INT32_MAX = (1 << 31) - 1
     pad_value = 0
-    if has_add and not has_max:
+    if has_data_mul and not has_add and not has_max:
+        vpu_op = _VPU_OPS["MUL_REDUCE_TILE"]
+        combine_op = _VPU_OPS["MUL"]
+        pad_value = 1  # multiplicative identity
+    elif has_add and not has_max:
         vpu_op = _VPU_OPS["SUM_REDUCE_TILE"]
         combine_op = _VPU_OPS["ADD"]
     elif has_max and not has_xor:
@@ -402,7 +410,8 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
 
     _REDUCE_COMBINE = {_VPU_OPS["SUM_REDUCE_TILE"]: "sum",
                       _VPU_OPS["MAX_REDUCE_TILE"]: "max",
-                      _VPU_OPS["MIN_REDUCE_TILE"]: "min"}
+                      _VPU_OPS["MIN_REDUCE_TILE"]: "min",
+                      _VPU_OPS["MUL_REDUCE_TILE"]: "prod"}
 
     # Scalar reduction
     num_tiles = (src_size + _TILE_ELEMS - 1) // _TILE_ELEMS
