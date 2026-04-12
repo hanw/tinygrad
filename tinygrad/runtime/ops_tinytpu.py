@@ -417,15 +417,16 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
         reduce_layout = "tile"
         pad_value = _INT32_MIN
     elif has_max and has_xor:
-        vpu_op = _VPU_OPS["MIN_REDUCE"]
+        vpu_op = _VPU_OPS["MIN_REDUCE_TILE"]
         combine_op = _VPU_OPS["MIN"]
-        reduce_layout = "row"
+        reduce_layout = "tile"
+        pad_value = _INT32_MAX
     else:
         return None
 
     _REDUCE_COMBINE = {_VPU_OPS["SUM_REDUCE_TILE"]: "sum",
                       _VPU_OPS["MAX_REDUCE_TILE"]: "max",
-                      _VPU_OPS["MIN_REDUCE"]: "min"}
+                      _VPU_OPS["MIN_REDUCE_TILE"]: "min"}
 
     # Scalar reduction
     num_tiles = (src_size + _TILE_ELEMS - 1) // _TILE_ELEMS
