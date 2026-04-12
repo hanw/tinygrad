@@ -1484,6 +1484,14 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
 
         if lhs_param is None or rhs_param is None:
             return None
+        # Remap integer VPU ops to float variants when operating on float32 tensors
+        is_float = any("float" in str(params[p].dtype) for p in [out_arg, lhs_param, rhs_param])
+        if is_float:
+            _FLOAT_REMAP = {"ADD": "FADD", "MUL": "FMUL", "SUB": "FSUB", "MAX": "FMAX", "CMPLT": "FCMPLT"}
+            if vpu_name in _FLOAT_REMAP:
+                vpu_name = _FLOAT_REMAP[vpu_name]
+                tile_vpu_op = _VPU_OPS[vpu_name]
+                is_bool_out_flag = is_bool_out_flag or vpu_name == "FCMPLT"
         inputs_per_tile = 2
         src_params = [lhs_param, rhs_param]
     elif len(src_params) == 1:
@@ -1527,9 +1535,17 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
             alu_uop = next(u for u in alu_uops if u.op is alu_op_enum)
             src_is_lhs = _find_unique_param_arg(alu_uop.src[0]) is not None
 
+        # Remap integer VPU ops to float variants when operating on float32 tensors
+        is_float = any("float" in str(params[p].dtype) for p in [out_arg] + src_params)
+        if is_float:
+            _FLOAT_REMAP = {"ADD": "FADD", "MUL": "FMUL", "SUB": "FSUB", "MAX": "FMAX", "CMPLT": "FCMPLT"}
+            vpu_name = _FLOAT_REMAP.get(vpu_name, vpu_name)
         tile_vpu_op = _VPU_OPS[vpu_name]
-        is_bool_out_flag = is_bool_out_flag or vpu_name in {"CMPLT", "CMPNE", "CMPEQ"}
+        is_bool_out_flag = is_bool_out_flag or vpu_name in {"CMPLT", "CMPNE", "CMPEQ", "FCMPLT"}
         inputs_per_tile = 2  # src tile + const broadcast tile
+        # For float scalar const, bitcast to int32 representation
+        if is_float and const_val is not None and not isinstance(const_val, bool):
+            const_val = int(np.frombuffer(np.float32(const_val).tobytes(), dtype=np.int32)[0])
         if src_is_lhs:
             src_params = [src_params[0], None]  # None = const slot
         else:
