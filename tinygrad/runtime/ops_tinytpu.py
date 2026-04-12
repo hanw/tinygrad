@@ -875,6 +875,46 @@ def _render_multistep_sxu_program(uops: list[UOp]) -> dict | None:
     SUB_OP, MAX_OP, MIN_OP = _VPU_OPS["SUB"], _VPU_OPS["MAX"], _VPU_OPS["MIN"]
     DIV_OP, MUL_OP, ADD_OP = _VPU_OPS["DIV"], _VPU_OPS["MUL"], _VPU_OPS["ADD"]
     CMPNE_OP = _VPU_OPS["CMPNE"]
+    FMUL_OP, FRECIP_OP = _VPU_OPS["FMUL"], _VPU_OPS["FRECIP"]
+
+    # --- Float tensor-tensor divide: 3 params, MUL + RECIPROCAL, float dtypes ---
+    # Pattern: a / b = a * (1/b) = FMUL(FRECIP(b), a)
+    has_recip = op_counts.get("RECIPROCAL", 0) > 0
+    all_float = all("float" in str(params[p].dtype) for p in [out_arg] + src_params)
+    if (len(src_params) == 2 and has_recip and has_mul and all_float
+            and not has_where and not has_cmplt):
+        # Trace operands: RECIPROCAL applies to one LOAD, MUL combines that with the other LOAD
+        recip_uops = [u for u in uops if u.op is Ops.RECIPROCAL and _has_load_src(u)]
+        if recip_uops:
+            recip_src_param = _find_unique_param_arg(recip_uops[0])
+            # The other src param is the numerator
+            other_params = [p for p in src_params if p != recip_src_param]
+            if recip_src_param is not None and len(other_params) == 1:
+                num_arg = other_params[0]
+                denom_arg = recip_src_param
+                num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+                addrs_per_tile = 3  # num, denom, out
+                all_instrs, data_plan, outputs = [], [], []
+                for tile_idx in range(num_tiles):
+                    base = tile_idx * addrs_per_tile
+                    offset = tile_idx * _TILE_ELEMS
+                    count = min(_TILE_ELEMS, out_size - offset)
+                    data_plan.append({"type": "VMEM", "addr": base, "param": num_arg,
+                                      "offset": offset, "count": count, "dtype": "int32"})
+                    data_plan.append({"type": "VMEM", "addr": base + 1, "param": denom_arg,
+                                      "offset": offset, "count": count, "dtype": "int32"})
+                    out_vmem = base + 2
+                    all_instrs += [
+                        _load(0, base),              # v0 = numerator
+                        _load(1, base + 1),          # v1 = denominator
+                        _vpu(2, 1, FRECIP_OP),       # v2 = 1 / denominator (unary)
+                        _vpu(3, 0, FMUL_OP, 2),      # v3 = v0 * v2 = a / b
+                        _store(out_vmem, 3),
+                    ]
+                    outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
+                all_instrs.append(_halt())
+                return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+                        "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
 
     # --- ABS: 2 params, WHERE+CMPLT+CMPNE+MUL pattern → SUB(0,x), MAX(x, neg) ---
     if (len(src_params) == 1 and has_where and has_cmplt and has_cmpne and has_mul
