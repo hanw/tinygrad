@@ -251,6 +251,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return rowbc_desc
         if (colred_desc := _render_colreduce_sxu_program(uops)) is not None:
             return colred_desc
+        if (rowred_desc := _render_rowreduce_sxu_program(uops)) is not None:
+            return rowred_desc
         return _render_elementwise_sxu_program(uops)
 
     wmma = wmmas[0]
@@ -553,6 +555,59 @@ def _render_colreduce_sxu_program(uops: list[UOp]) -> dict | None:
     return {
         "op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
         "outputs": outputs, "num_output_tiles": num_col_tiles, "out": out_arg,
+    }
+
+
+def _render_rowreduce_sxu_program(uops: list[UOp]) -> dict | None:
+    """Row-wise reduction (axis=1) via VPU_{SUM,MAX,MIN}_REDUCE primitives.
+
+    Iter 1 scope: single-tile N<=4, M<=4, SUM only. Uses VPU_SUM_REDUCE which
+    broadcasts each row's sum to all lanes of that row; output parser extracts
+    position [r * _COLS] for r in range(tile_rows).
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    params = [u for u in uops if u.op is Ops.PARAM]
+    if len(params) != 2: return None
+    for p in params:
+        if not isinstance(p.dtype, PtrDType): return None
+    out_size = params[0].dtype.size
+    src_size = params[1].dtype.size
+    if not (out_size >= 1 and src_size > out_size and src_size % out_size == 0): return None
+    if op_counts.get("RANGE", 0) != 1 or op_counts.get("STORE", 0) != 1: return None
+    # Row-reduce has a stride-multiply in the index expression.
+    if op_counts.get("MUL", 0) != 1: return None
+    reduce_op = _detect_reduce_op(op_counts)
+    if reduce_op != "SUM": return None  # iter 1 scope
+    nrows = out_size
+    ncols = src_size // nrows
+    if ncols < 2: return None
+    # Tinygrad may fully unroll or keep a RANGE loop; match both.
+    nloads = op_counts.get("LOAD", 0)
+    if nloads != ncols and nloads != 1: return None
+    # Iter 1 scope: single tile (N<=4, M<=4).
+    if nrows > _ROWS or ncols > _COLS: return None
+
+    out_arg, src_arg = 0, 1
+    all_instrs = [
+        _load(0, 0),
+        _vpu(1, 0, _VPU_OPS["SUM_REDUCE"]),
+        _store(1, 1),
+        _halt(),
+    ]
+    data_plan = [{
+        "type": "VMEM", "addr": 0, "param": src_arg,
+        "mode": "MATRIX_TILE", "matrix_nrows": nrows, "matrix_ncols": ncols,
+        "row_base": 0, "col_base": 0,
+        "tile_rows": nrows, "tile_cols": ncols,
+        "offset": 0, "count": nrows * ncols, "dtype": "int32",
+    }]
+    outputs = [{
+        "addr": 1, "param": out_arg,
+        "offset": 0, "count": nrows, "extract": "row_heads",
+    }]
+    return {
+        "op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+        "outputs": outputs, "num_output_tiles": 1, "out": out_arg,
     }
 
 
@@ -2778,6 +2833,10 @@ class TinyTPUProgram:
                 # Scalar reductions use VPU_*_REDUCE_TILE, so the scalar is
                 # broadcast to every position of the output tile.
                 chunk_out = np.array([tile_data[0]], dtype=out_dtype)
+            elif out_entry.get("extract") == "row_heads":
+                # Row reductions: each sublane holds a reduction broadcast
+                # across its row; extract position [r * _COLS] for r in range(count).
+                chunk_out = np.array([tile_data[r * _COLS] for r in range(count)], dtype=out_dtype)
             else:
                 chunk_out = np.array(tile_data[:count], dtype=out_dtype)
             out_buf[out_offset:out_offset+len(chunk_out)*out_dtype.itemsize] = chunk_out.tobytes()
