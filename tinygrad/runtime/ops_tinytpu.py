@@ -494,9 +494,6 @@ def _render_colreduce_sxu_program(uops: list[UOp]) -> dict | None:
     if reduce_op is None: return None
     ncols = out_size
     nrows = src_size // ncols
-    # Iter 7 scope: any nrows, ncols<=_COLS, SUM/MAX/MIN. Multi row-tile combines
-    # per-tile col reductions with VPU_ADD/MAX/MIN.
-    if ncols > _COLS: return None
 
     _INT32_MIN = -(1 << 31)
     _INT32_MAX = (1 << 31) - 1
@@ -509,48 +506,58 @@ def _render_colreduce_sxu_program(uops: list[UOp]) -> dict | None:
 
     out_arg, src_arg = 0, 1
     num_row_tiles = (nrows + _ROWS - 1) // _ROWS
+    num_col_tiles = (ncols + _COLS - 1) // _COLS
     data_plan: list[dict] = []
     all_instrs: list[str] = []
+    outputs: list[dict] = []
 
-    # Load each row-tile and reduce its columns.
-    for t in range(num_row_tiles):
-        row_base = t * _ROWS
-        tile_rows = min(_ROWS, nrows - row_base)
-        entry = {
-            "type": "VMEM", "addr": t, "param": src_arg,
-            "mode": "MATRIX_TILE", "matrix_nrows": nrows, "matrix_ncols": ncols,
-            "row_base": row_base, "col_base": 0,
-            "tile_rows": tile_rows, "tile_cols": ncols,
-            "offset": 0, "count": tile_rows * ncols, "dtype": "int32",
-        }
-        if pad_value != 0:
-            entry["pad_value"] = pad_value
-        data_plan.append(entry)
-        src_vreg = t * 2
-        red_vreg = t * 2 + 1
-        all_instrs.append(_load(src_vreg, t))
-        all_instrs.append(_vpu(red_vreg, src_vreg, vpu_op))
+    src_addr = 0
+    vreg = 0
+    # Each col-tile gets its own output; within a col-tile we reduce all row-tiles.
+    for ct in range(num_col_tiles):
+        col_base = ct * _COLS
+        tile_cols = min(_COLS, ncols - col_base)
+        per_tile_red_vregs: list[int] = []
+        for rt in range(num_row_tiles):
+            row_base = rt * _ROWS
+            tile_rows = min(_ROWS, nrows - row_base)
+            entry = {
+                "type": "VMEM", "addr": src_addr, "param": src_arg,
+                "mode": "MATRIX_TILE", "matrix_nrows": nrows, "matrix_ncols": ncols,
+                "row_base": row_base, "col_base": col_base,
+                "tile_rows": tile_rows, "tile_cols": tile_cols,
+                "offset": 0, "count": tile_rows * tile_cols, "dtype": "int32",
+            }
+            if pad_value != 0:
+                entry["pad_value"] = pad_value
+            data_plan.append(entry)
+            src_vreg = vreg; vreg += 1
+            red_vreg = vreg; vreg += 1
+            all_instrs.append(_load(src_vreg, src_addr))
+            all_instrs.append(_vpu(red_vreg, src_vreg, vpu_op))
+            per_tile_red_vregs.append(red_vreg)
+            src_addr += 1
+        # Combine row-tile reductions for this col-tile.
+        if len(per_tile_red_vregs) == 1:
+            final_vreg = per_tile_red_vregs[0]
+        else:
+            acc = per_tile_red_vregs[0]
+            for nxt in per_tile_red_vregs[1:]:
+                out_vreg = vreg; vreg += 1
+                all_instrs.append(_vpu(out_vreg, acc, combine_op, nxt))
+                acc = out_vreg
+            final_vreg = acc
+        out_addr = src_addr; src_addr += 1
+        all_instrs.append(_store(out_addr, final_vreg))
+        outputs.append({
+            "addr": out_addr, "param": out_arg,
+            "offset": col_base, "count": tile_cols,
+        })
 
-    # Combine reductions across row-tiles via element-wise op (each tile
-    # already has its cols broadcast down the column).
-    if num_row_tiles == 1:
-        final_vreg = 1
-    else:
-        acc_vreg = 1  # red_vreg of tile 0
-        for t in range(1, num_row_tiles):
-            rhs_vreg = t * 2 + 1
-            next_vreg = 2 * num_row_tiles + t
-            all_instrs.append(_vpu(next_vreg, acc_vreg, combine_op, rhs_vreg))
-            acc_vreg = next_vreg
-        final_vreg = acc_vreg
-
-    out_addr = num_row_tiles
-    all_instrs.append(_store(out_addr, final_vreg))
     all_instrs.append(_halt())
-    outputs = [{"addr": out_addr, "param": out_arg, "offset": 0, "count": ncols}]
     return {
         "op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
-        "outputs": outputs, "num_output_tiles": 1, "out": out_arg,
+        "outputs": outputs, "num_output_tiles": num_col_tiles, "out": out_arg,
     }
 
 
