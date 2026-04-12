@@ -92,8 +92,13 @@ class TinyTPUCompiler(Compiler):
 # Legacy descriptor renderer — handles patterns not yet migrated to SXU_PROGRAM
 # ---------------------------------------------------------------------------
 
-def _detect_reduce_op(op_counts: Counter) -> str | None:
-    """Detect SUM/MAX/MIN from UOp op counts."""
+def _detect_reduce_op(op_counts: Counter, data_alu: Counter | None = None) -> str | None:
+    """Detect SUM/MAX/MIN/PROD from UOp op counts.
+
+    For PROD we consult data-path ALU counts (if provided) to avoid matching
+    the stride multiplies in row-reduce index arithmetic. The other reductions
+    keep their historical (op_counts, nloads) threshold rules.
+    """
     nloads = op_counts.get("LOAD", 0)
     if op_counts.get("ADD", 0) > nloads - 1 and op_counts.get("MAX", 0) == 0:
         return "SUM"
@@ -101,6 +106,10 @@ def _detect_reduce_op(op_counts: Counter) -> str | None:
         return "MAX"
     if op_counts.get("MAX", 0) >= nloads - 1 and op_counts.get("XOR", 0) > 0:
         return "MIN"
+    if data_alu is not None:
+        data_mul = data_alu.get("MUL", 0)
+        if data_mul > 0 and data_alu.get("ADD", 0) == 0 and data_alu.get("MAX", 0) == 0:
+            return "PROD"
     return None
 
 def _render_legacy_descriptor(uops: list[UOp]) -> dict | None:
@@ -470,8 +479,12 @@ def _render_colreduce_sxu_program(uops: list[UOp]) -> dict | None:
     src_size = params[1].dtype.size
     if not (out_size > 1 and src_size > out_size and src_size % out_size == 0): return None
     if op_counts.get("RANGE", 0) != 1 or op_counts.get("STORE", 0) != 1: return None
-    if op_counts.get("MUL", 0) != 0: return None  # col-reduce has no stride multiply
-    reduce_op = _detect_reduce_op(op_counts)
+    # Col-reduce has no stride multiply in the index path. PROD adds data-path
+    # MULs; accept either zero MUL (SUM/MAX/MIN) or data-path MULs only (PROD).
+    data_alu = _data_alu_ops(uops)
+    if op_counts.get("MUL", 0) != data_alu.get("MUL", 0):
+        return None
+    reduce_op = _detect_reduce_op(op_counts, data_alu)
     if reduce_op is None: return None
     ncols = out_size
     nrows = src_size // ncols
@@ -479,9 +492,10 @@ def _render_colreduce_sxu_program(uops: list[UOp]) -> dict | None:
     _INT32_MIN = -(1 << 31)
     _INT32_MAX = (1 << 31) - 1
     _REDUCE_VPU = {
-        "SUM": (_VPU_OPS["SUM_REDUCE_COL"], _VPU_OPS["ADD"], 0),
-        "MAX": (_VPU_OPS["MAX_REDUCE_COL"], _VPU_OPS["MAX"], _INT32_MIN),
-        "MIN": (_VPU_OPS["MIN_REDUCE_COL"], _VPU_OPS["MIN"], _INT32_MAX),
+        "SUM":  (_VPU_OPS["SUM_REDUCE_COL"], _VPU_OPS["ADD"], 0),
+        "MAX":  (_VPU_OPS["MAX_REDUCE_COL"], _VPU_OPS["MAX"], _INT32_MIN),
+        "MIN":  (_VPU_OPS["MIN_REDUCE_COL"], _VPU_OPS["MIN"], _INT32_MAX),
+        "PROD": (_VPU_OPS["MUL_REDUCE_COL"], _VPU_OPS["MUL"], 1),
     }
     vpu_op, combine_op, pad_value = _REDUCE_VPU[reduce_op]
 
@@ -558,9 +572,12 @@ def _render_rowreduce_sxu_program(uops: list[UOp]) -> dict | None:
     src_size = params[1].dtype.size
     if not (out_size >= 1 and src_size > out_size and src_size % out_size == 0): return None
     if op_counts.get("RANGE", 0) != 1 or op_counts.get("STORE", 0) != 1: return None
-    # Row-reduce has a stride-multiply in the index expression.
-    if op_counts.get("MUL", 0) != 1: return None
-    reduce_op = _detect_reduce_op(op_counts)
+    # Row-reduce has one stride-multiply in the index expression. PROD kernels
+    # add data-path MULs so total MUL = 1 + nloads-1 when fully unrolled, or
+    # 1 + 1 = 2 for a RANGE loop. Accept total MUL >= 1.
+    if op_counts.get("MUL", 0) < 1: return None
+    data_alu = _data_alu_ops(uops)
+    reduce_op = _detect_reduce_op(op_counts, data_alu)
     if reduce_op is None: return None
     nrows = out_size
     ncols = src_size // nrows
@@ -571,9 +588,10 @@ def _render_rowreduce_sxu_program(uops: list[UOp]) -> dict | None:
     _INT32_MIN = -(1 << 31)
     _INT32_MAX = (1 << 31) - 1
     _REDUCE_VPU = {
-        "SUM": (_VPU_OPS["SUM_REDUCE"], _VPU_OPS["ADD"], 0),
-        "MAX": (_VPU_OPS["MAX_REDUCE"], _VPU_OPS["MAX"], _INT32_MIN),
-        "MIN": (_VPU_OPS["MIN_REDUCE"], _VPU_OPS["MIN"], _INT32_MAX),
+        "SUM":  (_VPU_OPS["SUM_REDUCE"], _VPU_OPS["ADD"], 0),
+        "MAX":  (_VPU_OPS["MAX_REDUCE"], _VPU_OPS["MAX"], _INT32_MIN),
+        "MIN":  (_VPU_OPS["MIN_REDUCE"], _VPU_OPS["MIN"], _INT32_MAX),
+        "PROD": (_VPU_OPS["MUL_REDUCE"], _VPU_OPS["MUL"], 1),
     }
     vpu_op, combine_op, pad_value = _REDUCE_VPU[reduce_op]
 
