@@ -701,6 +701,11 @@ def _render_cast_sxu_program(uops: list[UOp]) -> dict | None:
         vpu_op = _VPU_OPS["I2F"]
     elif "int" in out_dtype and "bool" not in out_dtype and "float" in src_dtype:
         vpu_op = _VPU_OPS["F2I"]
+    elif ("float" in out_dtype and "float" in src_dtype) or (
+            "int" in out_dtype and "bool" not in out_dtype and
+            "int" in src_dtype and "bool" not in src_dtype):
+        # Same-dtype cast chain (e.g. int→float→int fused): emit identity via COPY
+        vpu_op = _VPU_OPS["COPY"]
     else:
         return None
 
