@@ -690,7 +690,8 @@ def _render_copy_sxu_program(uops: list[UOp]) -> dict | None:
     src_arg = src_params[0]
     out_size = params[out_arg].dtype.size
     src_size = params[src_arg].dtype.size
-    if out_size != src_size or out_size <= 0:
+    # Shrink/slice: src_size >= out_size. Reshape: src_size == out_size.
+    if out_size <= 0 or src_size < out_size:
         return None
     # Require matching element dtype — dtype conversions (bool<->int32 casts)
     # need the VPU_BINARY widening path.
@@ -698,13 +699,28 @@ def _render_copy_sxu_program(uops: list[UOp]) -> dict | None:
     src_base = params[src_arg].dtype.base.itemsize
     if out_base != src_base:
         return None
-    # Require identity index mapping: each STORE must pair with a LOAD that
-    # reads from the same index expression. This rules out permute/transpose.
+    # Require LOAD and STORE index expressions to differ by a constant offset
+    # (possibly zero). This accepts reshape (offset=0) and contiguous slice /
+    # shrink (offset=K) while rejecting permute/transpose/flip/stride.
     def _index_of(addr_uop):
-        # INDEX UOp: src[0] = PARAM, src[1] = offset (flat index expression).
         if addr_uop.op is Ops.INDEX:
             return addr_uop.src[1]
         return None
+
+    def _split_const(idx):
+        # Return (base_expr_or_None, const) if idx == ADD(base, CONST) or CONST.
+        if idx.op is Ops.CONST and isinstance(idx.arg, int):
+            return (None, idx.arg)
+        if idx.op is Ops.ADD:
+            # ADD(x, CONST) — tinygrad canonicalizes with const on the right.
+            a, b = idx.src
+            if b.op is Ops.CONST and isinstance(b.arg, int):
+                return (a, b.arg)
+            if a.op is Ops.CONST and isinstance(a.arg, int):
+                return (b, a.arg)
+        return (idx, 0)
+
+    src_offset = None  # constant offset (elements) from out to in
     for store in stores:
         out_addr = store.src[0]
         val = store.src[1]
@@ -713,8 +729,22 @@ def _render_copy_sxu_program(uops: list[UOp]) -> dict | None:
         in_addr = val.src[0]
         out_idx = _index_of(out_addr)
         in_idx = _index_of(in_addr)
-        if out_idx is None or in_idx is None or out_idx is not in_idx:
+        if out_idx is None or in_idx is None:
             return None
+        if out_idx is in_idx:
+            k = 0
+        else:
+            out_base, out_k = _split_const(out_idx)
+            in_base,  in_k  = _split_const(in_idx)
+            if out_base is not in_base:
+                return None
+            k = in_k - out_k
+        if src_offset is None:
+            src_offset = k
+        elif src_offset != k:
+            return None
+    if src_offset is None or src_offset < 0:
+        return None
 
     num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
     all_instrs: list[str] = []
@@ -727,7 +757,7 @@ def _render_copy_sxu_program(uops: list[UOp]) -> dict | None:
         out_addr = num_tiles + tile_idx
         data_plan.append({
             "type": "VMEM", "addr": in_addr, "param": src_arg,
-            "offset": offset, "count": count, "dtype": "int32",
+            "offset": offset + src_offset, "count": count, "dtype": "int32",
         })
         all_instrs.append(_load(0, in_addr))
         all_instrs.append(_store(out_addr, 0))
