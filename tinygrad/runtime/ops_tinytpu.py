@@ -577,30 +577,42 @@ def _render_rowreduce_sxu_program(uops: list[UOp]) -> dict | None:
     # Row-reduce has a stride-multiply in the index expression.
     if op_counts.get("MUL", 0) != 1: return None
     reduce_op = _detect_reduce_op(op_counts)
-    if reduce_op != "SUM": return None  # iter 1 scope
+    if reduce_op is None: return None
     nrows = out_size
     ncols = src_size // nrows
     if ncols < 2: return None
     # Tinygrad may fully unroll or keep a RANGE loop; match both.
     nloads = op_counts.get("LOAD", 0)
     if nloads != ncols and nloads != 1: return None
-    # Iter 1 scope: single tile (N<=4, M<=4).
+    # Iter 2 scope: single tile (N<=4, M<=4), SUM/MAX/MIN.
     if nrows > _ROWS or ncols > _COLS: return None
+
+    _INT32_MIN = -(1 << 31)
+    _INT32_MAX = (1 << 31) - 1
+    _REDUCE_VPU = {
+        "SUM": (_VPU_OPS["SUM_REDUCE"], 0),
+        "MAX": (_VPU_OPS["MAX_REDUCE"], _INT32_MIN),
+        "MIN": (_VPU_OPS["MIN_REDUCE"], _INT32_MAX),
+    }
+    vpu_op, pad_value = _REDUCE_VPU[reduce_op]
 
     out_arg, src_arg = 0, 1
     all_instrs = [
         _load(0, 0),
-        _vpu(1, 0, _VPU_OPS["SUM_REDUCE"]),
+        _vpu(1, 0, vpu_op),
         _store(1, 1),
         _halt(),
     ]
-    data_plan = [{
+    entry = {
         "type": "VMEM", "addr": 0, "param": src_arg,
         "mode": "MATRIX_TILE", "matrix_nrows": nrows, "matrix_ncols": ncols,
         "row_base": 0, "col_base": 0,
         "tile_rows": nrows, "tile_cols": ncols,
         "offset": 0, "count": nrows * ncols, "dtype": "int32",
-    }]
+    }
+    if pad_value != 0:
+        entry["pad_value"] = pad_value
+    data_plan = [entry]
     outputs = [{
         "addr": 1, "param": out_arg,
         "offset": 0, "count": nrows, "extract": "row_heads",
