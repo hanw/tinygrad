@@ -951,6 +951,50 @@ def _render_multistep_sxu_program(uops: list[UOp]) -> dict | None:
         return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
                 "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
 
+    # --- Float MIN decomposition: MUL(-1) + MAX pattern → emit FCMPLT + SELECT ---
+    # For float minimum(a, b), tinygrad emits -max(-a, -b) using MUL by -1.0 (no XOR).
+    # Lower as: cond = a < b; result = cond ? a : b
+    FCMPLT_OP = _VPU_OPS["FCMPLT"]
+    if (len(src_params) == 2 and has_max and has_mul and all_float
+            and not has_where and data_alu.get("XOR", 0) == 0 and not has_cmplt and not has_idiv):
+        # Find MUL(x, -1.0) UOps — trace to the params being negated
+        neg_params: list[int] = []
+        for u in uops:
+            if u.op is Ops.MUL and _has_load_src(u):
+                for s in u.src:
+                    if s.op is Ops.CONST and isinstance(s.arg, float) and s.arg == -1.0:
+                        other = next((o for o in u.src if o is not s), None)
+                        if other is not None:
+                            p = _find_unique_param_arg(other)
+                            if p is not None and p not in neg_params:
+                                neg_params.append(p)
+                        break
+        if len(neg_params) == 2:
+            lhs_arg, rhs_arg = neg_params[0], neg_params[1]
+            num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+            addrs_per_tile = 3
+            all_instrs, data_plan, outputs = [], [], []
+            for tile_idx in range(num_tiles):
+                base = tile_idx * addrs_per_tile
+                offset = tile_idx * _TILE_ELEMS
+                count = min(_TILE_ELEMS, out_size - offset)
+                data_plan.append({"type": "VMEM", "addr": base, "param": lhs_arg,
+                                  "offset": offset, "count": count, "dtype": "int32"})
+                data_plan.append({"type": "VMEM", "addr": base + 1, "param": rhs_arg,
+                                  "offset": offset, "count": count, "dtype": "int32"})
+                out_vmem = base + 2
+                all_instrs += [
+                    _load(0, base),                # v0 = a
+                    _load(1, base + 1),            # v1 = b
+                    _vpu(2, 0, FCMPLT_OP, 1),      # v2 = (a < b) ? 1 : 0
+                    _select(3, 2, 0, 1),           # v3 = v2 ? a : b
+                    _store(out_vmem, 3),
+                ]
+                outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
+            all_instrs.append(_halt())
+            return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+                    "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
+
     # --- MIN decomposition: XOR+MAX pattern → emit VPU MIN ---
     has_xor = data_alu.get("XOR", 0) > 0
     if has_xor and has_max and not has_where and not has_cmplt and not has_idiv:
