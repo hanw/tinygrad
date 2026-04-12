@@ -390,6 +390,11 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
     if out_size != 1:
         return None
 
+    # Float reductions are not supported: integer VPU_*_REDUCE ops treat bits as Int#(32).
+    # Reject so the caller reports unsupported rather than producing garbage.
+    if any("float" in str(params[p].dtype) for p in params):
+        return None
+
     # Detect reduction type from UOp tree
     has_add = op_counts.get("ADD", 0) > 0
     has_max = op_counts.get("MAX", 0) > 0
