@@ -491,23 +491,35 @@ def _render_colreduce_sxu_program(uops: list[UOp]) -> dict | None:
     if op_counts.get("RANGE", 0) != 1 or op_counts.get("STORE", 0) != 1: return None
     if op_counts.get("MUL", 0) != 0: return None  # col-reduce has no stride multiply
     reduce_op = _detect_reduce_op(op_counts)
-    if reduce_op != "SUM": return None  # iter 4 scope
+    if reduce_op is None: return None
     ncols = out_size
     nrows = src_size // ncols
-    # Iter 4 scope: single-tile (N<=4, M=4)
+    # Iter 5 scope: single row-tile (nrows<=_ROWS), M=_COLS, SUM/MAX/MIN.
     if ncols != _COLS or nrows > _ROWS: return None
+
+    _INT32_MIN = -(1 << 31)
+    _INT32_MAX = (1 << 31) - 1
+    _REDUCE_VPU = {
+        "SUM": (_VPU_OPS["SUM_REDUCE_COL"], 0),
+        "MAX": (_VPU_OPS["MAX_REDUCE_COL"], _INT32_MIN),
+        "MIN": (_VPU_OPS["MIN_REDUCE_COL"], _INT32_MAX),
+    }
+    vpu_op, pad_value = _REDUCE_VPU[reduce_op]
 
     out_arg, src_arg = 0, 1
     all_instrs = [
         _load(0, 0),
-        _vpu(1, 0, _VPU_OPS["SUM_REDUCE_COL"]),
+        _vpu(1, 0, vpu_op),
         _store(1, 1),
         _halt(),
     ]
-    data_plan = [{
+    entry = {
         "type": "VMEM", "addr": 0, "param": src_arg,
         "offset": 0, "count": nrows * ncols, "dtype": "int32",
-    }]
+    }
+    if pad_value != 0:
+        entry["pad_value"] = pad_value
+    data_plan = [entry]
     outputs = [{"addr": 1, "param": out_arg, "offset": 0, "count": ncols}]
     return {
         "op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
