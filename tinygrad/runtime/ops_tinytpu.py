@@ -2149,8 +2149,10 @@ def _render_chained_const_sxu_program(uops: list[UOp]) -> dict | None:
         all_instrs += [_vpu(4, va, outer_vpu, vb), _store(out_vmem, 4)]
         outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
     all_instrs.append(_halt())
+    bool_out = outer_name in {"CMPLT", "CMPNE", "CMPEQ", "FCMPLT"}
     return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
-            "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg,
+            "bool_out": bool_out}
 
 
 def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
