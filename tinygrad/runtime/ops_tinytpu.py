@@ -1614,24 +1614,49 @@ def _render_colbc_sxu_program(uops: list[UOp]) -> dict | None:
     if ncols > _COLS:
         return None
 
-    if op_counts.get("CMPLT", 0):
-        vpu_name = "CMPLT"
-    elif op_counts.get("CMPNE", 0):
-        vpu_name = "CMPNE"
-    elif op_counts.get("CMPEQ", 0):
-        vpu_name = "CMPEQ"
-    elif op_counts.get("MAX", 0):
-        vpu_name = "MAX"
-    elif op_counts.get("MIN", 0):
-        vpu_name = "MIN"
-    elif op_counts.get("SUB", 0):
+    # Detect SUB lowered as ADD(a, MUL(b, -1)). op_counts alone would pick
+    # MUL and silently emit the wrong kernel for col-broadcast subtract.
+    neg_mul = next((u for u in uops if u.op is Ops.MUL and _has_load_src(u)
+                    and any(s.op is Ops.CONST and s.arg == -1 for s in u.src)), None)
+    neg_add = None
+    if neg_mul is not None:
+        neg_add = next((u for u in uops if u.op is Ops.ADD and _has_load_src(u)
+                        and any(s is neg_mul for s in u.src)), None)
+
+    col_is_lhs = False
+    if neg_add is not None:
         vpu_name = "SUB"
-    elif op_counts.get("MUL", 0):
-        vpu_name = "MUL"
-    elif op_counts.get("ADD", 0):
-        vpu_name = "ADD"
+        unneg_src = next(s for s in neg_add.src if s is not neg_mul)
+        neg_src = next((s for s in neg_mul.src if s.op is not Ops.CONST), None)
+        unneg_param = _find_unique_param_arg(unneg_src)
+        neg_param = _find_unique_param_arg(neg_src) if neg_src is not None else None
+        if unneg_param == rhs_arg and neg_param == lhs_arg:
+            col_is_lhs = True
+        elif unneg_param == lhs_arg and neg_param == rhs_arg:
+            col_is_lhs = False
+        else:
+            return None
     else:
-        return None
+        non_comm_ops = {"CMPLT": Ops.CMPLT, "CMPNE": Ops.CMPNE, "SUB": Ops.SUB}
+        vpu_name = None
+        for name in ("CMPLT", "CMPNE", "CMPEQ", "MAX", "MIN", "SUB", "MUL", "ADD"):
+            if op_counts.get(name, 0):
+                vpu_name = name
+                break
+        if vpu_name is None:
+            return None
+        if vpu_name in non_comm_ops:
+            op_uop = next((u for u in uops if u.op is non_comm_ops[vpu_name] and _has_load_src(u)), None)
+            if op_uop is None:
+                return None
+            lhs_param = _find_unique_param_arg(op_uop.src[0])
+            rhs_param = _find_unique_param_arg(op_uop.src[1])
+            if lhs_param == rhs_arg and rhs_param == lhs_arg:
+                col_is_lhs = True
+            elif lhs_param == lhs_arg and rhs_param == rhs_arg:
+                col_is_lhs = False
+            else:
+                return None
 
     vpu_op = _VPU_OPS[vpu_name]
     data_plan: list[dict] = [
@@ -1640,11 +1665,12 @@ def _render_colbc_sxu_program(uops: list[UOp]) -> dict | None:
          "row_base": 0, "col_base": 0, "tile_rows": nrows, "tile_cols": 1},
         {"type": "VMEM", "addr": 1, "param": lhs_arg, "offset": 0, "count": out_size, "dtype": "int32"},
     ]
+    va, vb = (2, 0) if col_is_lhs else (0, 2)
     instructions = [
         _load(0, 1),
         _load(1, 0),
         _broadcast_col(2, 1, 0),
-        _vpu(3, 0, vpu_op, 2),
+        _vpu(3, va, vpu_op, vb),
         _store(2, 3),
         _halt(),
     ]
