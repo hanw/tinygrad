@@ -2074,6 +2074,8 @@ def _render_const_fill_sxu_program(uops: list[UOp]) -> dict | None:
     if any(c > 0 and n not in allowed for n, c in op_counts.items()):
         return None
 
+    is_bool_out = (isinstance(params[out_arg].dtype, PtrDType)
+                   and params[out_arg].dtype.base.itemsize == 1)
     num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
     data_plan = [{
         "type": "VMEM", "addr": 0, "layout": "broadcast_const",
@@ -2092,6 +2094,7 @@ def _render_const_fill_sxu_program(uops: list[UOp]) -> dict | None:
         "op": "SXU_PROGRAM", "primitive": "CONST_FILL",
         "instructions": instructions, "data_plan": data_plan,
         "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg,
+        "bool_out": is_bool_out,
     }
 
 
