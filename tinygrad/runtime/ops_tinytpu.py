@@ -259,6 +259,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return colred_desc
         if (rowred_desc := _render_rowreduce_sxu_program(uops)) is not None:
             return rowred_desc
+        if (trans_desc := _render_transpose_sxu_program(uops)) is not None:
+            return trans_desc
         if (cast_desc := _render_cast_sxu_program(uops)) is not None:
             return cast_desc
         if (copy_desc := _render_copy_sxu_program(uops)) is not None:
@@ -271,8 +273,6 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return divmod_desc
         if (chain_desc := _render_chained_const_sxu_program(uops)) is not None:
             return chain_desc
-        if (trans_desc := _render_transpose_sxu_program(uops)) is not None:
-            return trans_desc
         return _render_elementwise_sxu_program(uops)
 
     wmma = wmmas[0]
@@ -2051,10 +2051,15 @@ def _render_transpose_sxu_program(uops: list[UOp]) -> dict | None:
     if sum(data_alu.values()) > 0:
         return None
     op_counts = Counter(u.op.name for u in uops)
-    # Expect exactly the shape of a GROUP(4)-unrolled 4x4 transpose: 4 STOREs,
-    # 4 LOADs, 1 RANGE, 1 MUL in index arithmetic (for row*stride).
-    if (op_counts.get("STORE", 0) != 4 or op_counts.get("LOAD", 0) != 4
-            or op_counts.get("RANGE", 0) != 1 or op_counts.get("MUL", 0) != 1):
+    # Two shapes match:
+    #   - int32 GROUP(4)-unrolled: 4 STOREs + 4 LOADs + 1 RANGE + 1 MUL
+    #   - float32 VECTORIZE-unrolled: 1 STORE + 4 LOADs + 1 VECTORIZE + 1 RANGE + 1 MUL
+    shape_int = (op_counts.get("STORE", 0) == 4 and op_counts.get("LOAD", 0) == 4
+                 and op_counts.get("RANGE", 0) == 1 and op_counts.get("MUL", 0) == 1)
+    shape_float = (op_counts.get("STORE", 0) == 1 and op_counts.get("LOAD", 0) == 4
+                   and op_counts.get("VECTORIZE", 0) == 1 and op_counts.get("RANGE", 0) == 1
+                   and op_counts.get("MUL", 0) == 1)
+    if not (shape_int or shape_float):
         return None
 
     stores = [u for u in uops if u.op is Ops.STORE]
@@ -2073,24 +2078,58 @@ def _render_transpose_sxu_program(uops: list[UOp]) -> dict | None:
         return None
     if params[out_arg].dtype.base.itemsize != params[src_arg].dtype.base.itemsize:
         return None
-    # Each STORE value must be a plain LOAD of src_arg.
+    # Each STORE value must be a LOAD of src_arg, or a VECTORIZE of LOADs
+    # (possibly wrapped in CAST for float bitcasting).
+    loads = []
+    store_idx_uops = []
     for s in stores:
-        if s.src[1].op is not Ops.LOAD:
+        val = s.src[1]
+        store_idx_uops.append(s.src[0].src[1] if s.src[0].op is Ops.INDEX else None)
+        while val.op is Ops.CAST:
+            val = val.src[0]
+        if val.op is Ops.VECTORIZE:
+            for l in val.src:
+                while l.op is Ops.CAST:
+                    l = l.src[0]
+                if l.op is not Ops.LOAD or _find_unique_param_arg(l) != src_arg:
+                    return None
+                loads.append(l)
+        elif val.op is Ops.LOAD:
+            if _find_unique_param_arg(val) != src_arg:
+                return None
+            loads.append(val)
+        else:
             return None
-        if _find_unique_param_arg(s.src[1]) != src_arg:
-            return None
-    # Reject pure copies (store_idx is LOAD_idx shifted by a constant).
-    def _idx(addr_uop):
-        return addr_uop.src[1] if addr_uop.op is Ops.INDEX else None
-    differing = False
-    for s in stores:
-        si = _idx(s.src[0])
-        li = _idx(s.src[1].src[0])
-        if si is None or li is None:
-            return None
-        if si is not li and si.op != li.op:
-            differing = True
-    if not differing:
+    if len(loads) != 4:
+        return None
+
+    # Distinguish transpose from reshape/copy by comparing CONST offsets in
+    # load vs store index expressions. Reshape: matching const sets (e.g. 0/1/2/3
+    # each side). Transpose: store consts are {0,1,2,3} while load consts are
+    # multiples of row stride {0,4,8,12}.
+    def _consts_in(u, seen=None):
+        if seen is None: seen = set()
+        if id(u) in seen: return []
+        seen.add(id(u))
+        if u.op is Ops.CONST and isinstance(u.arg, int):
+            return [u.arg]
+        out = []
+        for s in u.src: out += _consts_in(s, seen)
+        return out
+    load_idx_uops = [l.src[0].src[1] if l.src[0].op is Ops.INDEX else None for l in loads]
+    if any(u is None for u in store_idx_uops) or any(u is None for u in load_idx_uops):
+        return None
+    store_consts = sorted(set(sum([_consts_in(u) for u in store_idx_uops], [])))
+    load_consts = sorted(set(sum([_consts_in(u) for u in load_idx_uops], [])))
+    # Transpose addressing signature: the four LOADs span different rows of
+    # the source (offsets include 4, 8, 12 — the row strides), and each LOAD
+    # accesses a distinct INDEX UOp.
+    if not ({4, 8, 12} <= set(load_consts)):
+        return None
+    if len({id(u) for u in load_idx_uops}) != 4:
+        return None
+    # Reject pure reshape/copy (load/store const sets match exactly).
+    if set(load_consts) == set(store_consts):
         return None
 
     # Emit: LOAD VMEM[0]→VREG 0, XLU_TRANSPOSE VREG 1 = transpose(VREG 0),
