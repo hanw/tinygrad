@@ -703,13 +703,18 @@ def _render_cast_sxu_program(uops: list[UOp]) -> dict | None:
         return None
     src_dtype = str(params[src_arg].dtype)
     # Only handle the value-conversion cases (not bool/int bitwidth changes).
-    if "float" in out_dtype and ("int" in src_dtype and "bool" not in src_dtype):
+    src_is_bool = "bool" in src_dtype
+    out_is_bool = "bool" in out_dtype
+    if "float" in out_dtype and ("int" in src_dtype and not src_is_bool):
         vpu_op = _VPU_OPS["I2F"]
-    elif "int" in out_dtype and "bool" not in out_dtype and "float" in src_dtype:
+    elif "int" in out_dtype and not out_is_bool and "float" in src_dtype:
         vpu_op = _VPU_OPS["F2I"]
+    elif "int" in out_dtype and not out_is_bool and src_is_bool:
+        # bool → int32: LOAD lifts the bool into an int32 register; COPY passes it through.
+        vpu_op = _VPU_OPS["COPY"]
     elif ("float" in out_dtype and "float" in src_dtype) or (
-            "int" in out_dtype and "bool" not in out_dtype and
-            "int" in src_dtype and "bool" not in src_dtype):
+            "int" in out_dtype and not out_is_bool and
+            "int" in src_dtype and not src_is_bool):
         # Same-dtype cast chain (e.g. int→float→int fused): emit identity via COPY
         vpu_op = _VPU_OPS["COPY"]
     else:
@@ -728,12 +733,15 @@ def _render_cast_sxu_program(uops: list[UOp]) -> dict | None:
         offset = tile_idx * _TILE_ELEMS
         count = min(_TILE_ELEMS, out_size - offset)
         base = tile_idx * 2  # src, out
-        data_plan.append({"type": "VMEM", "addr": base, "param": src_arg,
-                          "offset": offset, "count": count, "dtype": "int32"})
+        entry = {"type": "VMEM", "addr": base, "param": src_arg,
+                 "offset": offset, "count": count, "dtype": "int32"}
+        if src_is_bool:
+            entry["bool"] = True
+        data_plan.append(entry)
         out_vmem = base + 1
         all_instrs += [
             _load(0, base),         # v0 = src (int bits)
-            _vpu(1, 0, vpu_op),     # v1 = I2F(v0) or F2I(v0)
+            _vpu(1, 0, vpu_op),     # v1 = I2F(v0) or F2I(v0) or COPY(v0)
             _store(out_vmem, 1),
         ]
         outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
