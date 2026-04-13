@@ -419,6 +419,10 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
     # Row/column reductions (out_size>1) stay on old path which distinguishes axis.
     if out_size != 1:
         return None
+    # Reject trivial 1-elem-to-1-elem kernels (e.g. Tensor([5])+1): there is
+    # nothing to reduce and the elementwise path gives the correct result.
+    if src_size <= 1:
+        return None
 
     # Float reductions are not supported: integer VPU_*_REDUCE ops treat bits as Int#(32).
     # Reject so the caller reports unsupported rather than producing garbage.
