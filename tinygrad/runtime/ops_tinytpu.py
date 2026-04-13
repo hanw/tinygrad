@@ -127,23 +127,7 @@ def _render_legacy_descriptor(uops: list[UOp]) -> dict | None:
             return None
         param_sizes[p.arg] = p.dtype.size
 
-    # --- HOST_UNARY: TRUNC or RECIPROCAL on float ---
-    # Require a simple pattern: no additional compute ops beyond indexing.
-    # sqrt/log2/sin/etc. decompose into RECIPROCAL + many other ops and must NOT match.
-    _simple_unary_ops = {"TRUNC", "RECIPROCAL"}
-    _allowed_aux = {"CONST", "INDEX", "LOAD", "STORE", "PARAM", "SINK", "GROUP", "END", "RANGE",
-                    "MUL", "ADD", "CAST", "GEP", "VECTORIZE", "WMMA"}
-    _compute_ops = [n for n, c in op_counts.items() if c > 0 and n not in _allowed_aux]
-    only_simple_unary = (len(_compute_ops) == 1 and _compute_ops[0] in _simple_unary_ops)
-    if (len(params) == 2 and only_simple_unary
-            and "float" in str(params[0].dtype) and "float" in str(params[1].dtype)):
-        host_op = _compute_ops[0]
-        src_size = param_sizes.get(1, 0)
-        if src_size > 0:
-            return {"op": "HOST_UNARY", "host_op": host_op, "dtype": "float32",
-                    "out": 0, "src": 1, "num_elems": src_size}
-
-# --- GEMM fallback: 3 params with MULACC or scalar MUL+RANGE pattern ---
+    # --- GEMM fallback: 3 params with MULACC or scalar MUL+RANGE pattern ---
     has_mulacc = any(u.op is Ops.MULACC for u in uops)
     has_store = op_counts.get("STORE", 0) > 0
     is_gemm = has_mulacc or (len(params) == 3 and op_counts.get("MUL", 0) > 0
@@ -156,20 +140,6 @@ def _render_legacy_descriptor(uops: list[UOp]) -> dict | None:
                     "num_vecs": num_vecs, "num_k_tiles": num_k_tiles,
                     "num_weight_tiles": num_weight_tiles}
 
-    # --- Remaining complex patterns: delegate to analyze_tinytpu_uops ---
-    diag = analyze_tinytpu_uops(uops)
-    if diag["supported"]:
-        _KIND_SCHEMA = {
-            "vpu_binary":      ("VPU_BINARY",       ["vpu_op", "out_arg:out", "lhs_arg:lhs", "lhs_const", "lhs_broadcast", "rhs_arg:rhs", "rhs_const", "rhs_broadcast", "num_elems", "bool_out", "bool_in"]),
-            "vpu_program":     ("VPU_PROGRAM",       ["out_arg:out", "num_elems", "inputs", "steps", "output_reg"]),
-        }
-        if diag["kind"] in _KIND_SCHEMA:
-            op_name, keys = _KIND_SCHEMA[diag["kind"]]
-            desc: dict = {"op": op_name}
-            for key in keys:
-                src, dst = key.split(":") if ":" in key else (key, key)
-                desc[dst] = diag.get(src, False)
-            return desc
     return None
 
 
@@ -3437,7 +3407,7 @@ def _unsupported_message(prog: dict) -> str:
 # ---------------------------------------------------------------------------
 # Program — drives the BSV simulator
 # ---------------------------------------------------------------------------
-_SUPPORTED_OPS = {"GEMM4x4", "SXU_PROGRAM", "VPU_BINARY", "VPU_PROGRAM", "HOST_UNARY"}
+_SUPPORTED_OPS = {"GEMM4x4", "SXU_PROGRAM"}
 
 class TinyTPUProgram:
     def __init__(self, name: str, lib: bytes, *args, **kwargs):
@@ -3480,93 +3450,6 @@ class TinyTPUProgram:
         if op not in _SUPPORTED_OPS:
             raise NotImplementedError(_unsupported_message(prog))
         return getattr(self, f"_exec_{op.lower()}")(bufs)
-
-    def _exec_vpu_binary(self, bufs):
-        prog = self.prog
-        out_buf = bufs[prog["out"]]
-        num_elems = int(prog["num_elems"])
-        bool_inputs = prog.get("bool_in", False) or prog.get("bool_out", False)
-        def _read_operand(key, const_key):
-            if prog.get(const_key) is not None:
-                return np.full(num_elems, int(prog[const_key]), dtype="<i4")
-            raw = np.frombuffer(bytes(bufs[prog[key]]), dtype=np.bool_ if bool_inputs else "<i4")
-            return raw.astype(np.int32) if bool_inputs else raw
-        lhs_i32 = _read_operand("lhs", "lhs_const")
-        rhs_i32 = _read_operand("rhs", "rhs_const")
-        lhs_bc = bool(prog.get("lhs_broadcast", False)) and prog.get("lhs_const") is None
-        rhs_bc = bool(prog.get("rhs_broadcast", False)) and prog.get("rhs_const") is None
-        is_bool = int(prog["vpu_op"]) in _VPU_BOOL_OPS or prog.get("bool_out", False)
-        vpu_op = int(prog["vpu_op"])
-        return self._run_tiled_vpu(out_buf, num_elems,
-            lambda s, e, n: _build_vpu_binary_bundle(
-                lhs_i32[:1] if lhs_bc else lhs_i32[s:e],
-                rhs_i32[:1] if rhs_bc else rhs_i32[s:e],
-                n, vpu_op, lhs_broadcast=lhs_bc, rhs_broadcast=rhs_bc),
-            out_dtype=np.dtype(np.bool_) if is_bool else np.dtype("<i4"))
-
-
-
-    def _exec_vpu_program(self, bufs):
-        prog = self.prog
-        out_buf = bufs[prog["out"]]
-        num_elems = int(prog["num_elems"])
-        if len(out_buf) < num_elems * _BYTES_PER_ELEM:
-            raise RuntimeError(f"TinyTPU output buffer too small for VPU program elements={num_elems}")
-        out_offset = 0
-        for chunk_start in range(0, num_elems, _TILE_ELEMS):
-            chunk_end = min(chunk_start + _TILE_ELEMS, num_elems)
-            chunk_size = chunk_end - chunk_start
-            input_tiles: list[np.ndarray] = []
-            input_broadcasts: list[bool] = []
-            for spec in prog["inputs"]:
-                if "const" in spec:
-                    input_tiles.append(np.full(chunk_size, int(spec["const"]), dtype=np.int32))
-                    input_broadcasts.append(False)
-                    continue
-                is_bool = bool(spec.get("bool", False))
-                broadcast = bool(spec.get("broadcast", False))
-                raw = np.frombuffer(bytes(bufs[int(spec["arg"])]), dtype=np.bool_ if is_bool else "<i4")
-                if raw.size == 1 and chunk_size > 1 and broadcast:
-                    chunk = raw[:1].astype(np.int32) if is_bool else raw[:1]
-                else:
-                    chunk = raw[chunk_start:chunk_end].astype(np.int32) if is_bool else raw[chunk_start:chunk_end]
-                    if raw.size == 1 and chunk_size > 1:
-                        scalar = int(raw[0])
-                        chunk = np.full(chunk_size, scalar, dtype=np.int32)
-                if chunk.size != chunk_size:
-                    if not (broadcast and chunk.size == 1):
-                        raise RuntimeError(f"TinyTPU VPU program input expected {chunk_size} elements, got {chunk.size}")
-                input_tiles.append(np.asarray(chunk, dtype=np.int32))
-                input_broadcasts.append(broadcast)
-            stdout = self._run(_build_vpu_program_bundle(input_tiles, chunk_size, prog["steps"], int(prog["output_reg"]),
-                                                                input_broadcasts=input_broadcasts))
-            result = _parse_vmem_output(stdout)
-            if result is None:
-                raise RuntimeError(f"TinyTPU sim produced no vmem_result\nstdout: {stdout}")
-            chunk_out = np.array(result[:chunk_size], dtype="<i4")
-            out_buf[out_offset : out_offset + len(chunk_out) * _BYTES_PER_ELEM] = chunk_out.tobytes()
-            out_offset += len(chunk_out) * _BYTES_PER_ELEM
-        return 1e-3
-
-    def _exec_host_unary(self, bufs):
-        prog = self.prog
-        out_buf = bufs[prog["out"]]
-        num_elems = int(prog["num_elems"])
-        if prog.get("dtype") != "float32":
-            raise RuntimeError(f"unsupported TinyTPU host unary dtype {prog.get('dtype')}")
-        src_f32 = np.frombuffer(bytes(bufs[prog["src"]]), dtype="<f4")
-        if src_f32.size != num_elems:
-            raise RuntimeError(f"TinyTPU host unary op expected {num_elems} elements, got src={src_f32.size}")
-        if prog["host_op"] == "TRUNC":
-            out_f32 = np.trunc(src_f32).astype(np.float32)
-        elif prog["host_op"] == "RECIPROCAL":
-            out_f32 = np.reciprocal(src_f32.astype(np.float32))
-        else:
-            raise RuntimeError(f"unknown TinyTPU host unary op {prog['host_op']}")
-        out_buf[: len(out_f32) * 4] = np.asarray(out_f32, dtype="<f4").tobytes()
-        return 1e-3
-
-
 
     def _exec_sxu_program(self, bufs):
         prog = self.prog
