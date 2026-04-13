@@ -1435,7 +1435,7 @@ def _render_where_sxu_program(uops: list[UOp]) -> dict | None:
     if op_counts.get("WHERE", 0) == 0:
         return None
     params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
-    if len(params) != 4:
+    if len(params) not in (2, 4):
         return None
 
     # Find output param
@@ -1449,20 +1449,45 @@ def _render_where_sxu_program(uops: list[UOp]) -> dict | None:
     out_arg = next(iter(out_params))
     out_size = params[out_arg].dtype.size
     input_args = sorted(k for k in params if k != out_arg)
-    if len(input_args) != 3:
-        return None
 
     # All inputs must be same size or size 1 (broadcast)
     if not all(params[a].dtype.size in {1, out_size} for a in input_args):
         return None
 
-    # Identify cond (bool dtype), lhs, rhs from WHERE UOp sources
+    # Identify cond (bool dtype), lhs, rhs from WHERE UOp sources.
     where_uop = next(u for u in uops if u.op is Ops.WHERE)
     cond_arg = _find_unique_param_arg(where_uop.src[0])
     lhs_arg = _find_unique_param_arg(where_uop.src[1])
     rhs_arg = _find_unique_param_arg(where_uop.src[2])
-    if cond_arg is None or lhs_arg is None or rhs_arg is None:
-        return None
+    lhs_const = None
+    rhs_const = None
+    # Only the 2-param shape (out + cond) supports CONST lhs/rhs. For the
+    # 4-param shape we keep the original strict tensor requirement.
+    if len(params) == 2:
+        # Reject kernels with any data-path ALU (abs = MUL + WHERE, etc.).
+        if sum(_data_alu_ops(uops).values()) > 0:
+            return None
+        # All WHEREs must have CONST lhs/rhs (not a first-WHERE quirk).
+        where_consts = None
+        for w in uops:
+            if w.op is Ops.WHERE:
+                if w.src[1].op is not Ops.CONST or w.src[2].op is not Ops.CONST:
+                    return None
+                if isinstance(w.src[1].arg, bool) or isinstance(w.src[2].arg, bool):
+                    return None
+                pair = (w.src[1].arg, w.src[2].arg)
+                if where_consts is None:
+                    where_consts = pair
+                elif where_consts != pair:
+                    return None
+        if where_consts is None:
+            return None
+        lhs_const, rhs_const = where_consts
+        if cond_arg is None or cond_arg not in input_args:
+            return None
+    else:
+        if cond_arg is None or lhs_arg is None or rhs_arg is None:
+            return None
 
     num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
     addrs_per_tile = 4  # cond, lhs, rhs, out
@@ -1472,6 +1497,11 @@ def _render_where_sxu_program(uops: list[UOp]) -> dict | None:
     outputs: list[dict] = []
     uses_scalar_broadcast = False
 
+    def _const_bits(c):
+        if isinstance(c, bool): return int(c)
+        if isinstance(c, float): return int(np.frombuffer(np.float32(c).tobytes(), dtype=np.int32)[0])
+        return int(c)
+
     for tile_idx in range(num_tiles):
         base = tile_idx * addrs_per_tile
         offset = tile_idx * _TILE_ELEMS
@@ -1479,10 +1509,18 @@ def _render_where_sxu_program(uops: list[UOp]) -> dict | None:
 
         data_plan.append({"type": "VMEM", "addr": base, "param": cond_arg,
                           "offset": offset, "count": count, "dtype": "int32", "bool": True})
-        data_plan.append({"type": "VMEM", "addr": base + 1, "param": lhs_arg,
-                          "offset": offset, "count": count, "dtype": "int32"})
-        data_plan.append({"type": "VMEM", "addr": base + 2, "param": rhs_arg,
-                          "offset": offset, "count": count, "dtype": "int32"})
+        if lhs_arg is not None:
+            data_plan.append({"type": "VMEM", "addr": base + 1, "param": lhs_arg,
+                              "offset": offset, "count": count, "dtype": "int32"})
+        else:
+            data_plan.append({"type": "VMEM", "addr": base + 1, "layout": "broadcast_const",
+                              "value": _const_bits(lhs_const), "count": count, "dtype": "int32"})
+        if rhs_arg is not None:
+            data_plan.append({"type": "VMEM", "addr": base + 2, "param": rhs_arg,
+                              "offset": offset, "count": count, "dtype": "int32"})
+        else:
+            data_plan.append({"type": "VMEM", "addr": base + 2, "layout": "broadcast_const",
+                              "value": _const_bits(rhs_const), "count": count, "dtype": "int32"})
 
         out_vmem = base + 3
         all_instrs += [
