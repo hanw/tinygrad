@@ -2381,10 +2381,41 @@ def _classify_structured_broadcast_axis(uops: list[UOp], param_arg: int) -> str 
         uniq = sorted(set(vals))
         if uniq and len(vals) % len(uniq) == 0:
             chunk = len(vals) // len(uniq)
-            if vals == [v for u in uniq for v in [u] * chunk]:
+            if chunk > 1 and vals == [v for u in uniq for v in [u] * chunk]:
                 return "col"
-            if vals == uniq * chunk:
+            if chunk > 1 and vals == uniq * chunk:
                 return "row"
+        # chunk==1 (all-unique param indices) is ambiguous from val ordering
+        # alone. Correlate each bias CONST with the store addresses that
+        # consume it: bias[k] used at addrs satisfying addr % bias_size == k
+        # is a row broadcast; addr // stride == k is a col broadcast.
+        bias_size = len(uniq) if uniq else 0
+        idx_uops = [u for u in uops if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM
+                    and u.src[0].arg == param_arg and u.src[1].op is Ops.CONST]
+        stores = [s for s in uops if s.op is Ops.STORE and s.src[0].op is Ops.INDEX
+                  and s.src[0].src[1].op is Ops.CONST]
+        def _depends(u, target, seen=None):
+            if seen is None: seen = set()
+            if id(u) in seen: return False
+            seen.add(id(u))
+            if u is target: return True
+            return any(_depends(s, target, seen) for s in u.src)
+        pairs: list[tuple[int, int]] = []  # (bias_idx, output_addr)
+        for idx_uop in idx_uops:
+            k = int(idx_uop.src[1].arg)
+            for s in stores:
+                if _depends(s.src[1], idx_uop):
+                    pairs.append((k, int(s.src[0].src[1].arg)))
+        if bias_size > 0 and pairs:
+            row_ok = all(a % bias_size == k for k, a in pairs)
+            all_addrs = [a for _, a in pairs]
+            col_stride_candidates = {a // k for k, a in pairs if k != 0 and a >= k and a % k == 0}
+            col_stride_candidates |= {(max(all_addrs) + 1) // bias_size} if all_addrs else set()
+            col_ok = any(stride > 0 and all(a // stride == k for k, a in pairs) for stride in col_stride_candidates)
+            if row_ok and not col_ok:
+                return "row"
+            if col_ok and not row_ok:
+                return "col"
         return "row"
 
     store = next((u for u in uops if u.op is Ops.STORE and u.src[0].op is Ops.INDEX), None)
