@@ -251,6 +251,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return cast_desc
         if (copy_desc := _render_copy_sxu_program(uops)) is not None:
             return copy_desc
+        if (divmod_desc := _render_scalar_const_divmod_sxu_program(uops)) is not None:
+            return divmod_desc
         return _render_elementwise_sxu_program(uops)
 
     wmma = wmmas[0]
@@ -1789,6 +1791,76 @@ def _find_alu_const(data_alu_uops: list[UOp], alu_op) -> int | None:
                     return int(src.arg)
     return None
 
+def _render_scalar_const_divmod_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render scalar-const int32 IDIV/MOD as SXU_PROGRAM.
+
+    Replaces the legacy VPU_BINARY (IDIV) and VPU_PROGRAM (MOD) paths:
+    - IDIV: broadcast divisor, dispatch VPU_DIV.
+    - MOD: DIV, MUL, SUB sequence (x - (x//c)*c).
+    """
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if 0 not in params:
+        return None
+    pattern = _classify_divmod_pattern(uops)
+    if pattern is None or pattern[1] is None or pattern[0] not in ("IDIV", "MOD"):
+        return None
+    kind, rhs_const = pattern
+
+    out_arg = 0
+    out_size = params[out_arg].dtype.size
+    src_args = [a for a in sorted(params) if a != out_arg]
+    if out_size <= 0 or len(src_args) != 1:
+        return None
+    src_arg = src_args[0]
+    src_size = params[src_arg].dtype.size
+    if src_size not in {1, out_size}:
+        return None
+    # Refuse float operands — IDIV/MOD are integer opcodes.
+    if any("float" in str(params[a].dtype) for a in [out_arg, src_arg]):
+        return None
+
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    addrs_per_tile = 3  # src, const, out
+    all_instrs, data_plan, outputs = [], [], []
+    DIV_OP = _VPU_OPS["DIV"]
+    MUL_OP = _VPU_OPS["MUL"]
+    SUB_OP = _VPU_OPS["SUB"]
+    for tile_idx in range(num_tiles):
+        base = tile_idx * addrs_per_tile
+        offset = tile_idx * _TILE_ELEMS
+        count = min(_TILE_ELEMS, out_size - offset)
+        if src_size == 1:
+            data_plan.append({"type": "VMEM", "addr": base, "param": src_arg,
+                              "offset": 0, "count": 1, "dtype": "int32"})
+        else:
+            data_plan.append({"type": "VMEM", "addr": base, "param": src_arg,
+                              "offset": offset, "count": count, "dtype": "int32"})
+        data_plan.append({"type": "VMEM", "addr": base + 1,
+                          "layout": "broadcast_const", "value": int(rhs_const),
+                          "count": count, "dtype": "int32"})
+        out_vmem = base + 2
+        if kind == "IDIV":
+            all_instrs += [
+                _load(0, base),
+                _load(1, base + 1),
+                _vpu(2, 0, DIV_OP, 1),
+                _store(out_vmem, 2),
+            ]
+        else:  # MOD: x - (x // c) * c
+            all_instrs += [
+                _load(0, base),
+                _load(1, base + 1),
+                _vpu(2, 0, DIV_OP, 1),   # v2 = x // c
+                _vpu(3, 2, MUL_OP, 1),   # v3 = v2 * c
+                _vpu(4, 0, SUB_OP, 3),   # v4 = x - v3
+                _store(out_vmem, 4),
+            ]
+        outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
+
+
 def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
     """Render an elementwise kernel as an SXU_PROGRAM.
 
@@ -3241,7 +3313,7 @@ def _unsupported_message(prog: dict) -> str:
 # ---------------------------------------------------------------------------
 # Program — drives the BSV simulator
 # ---------------------------------------------------------------------------
-_SUPPORTED_OPS = {"GEMM4x4", "SXU_PROGRAM", "VPU_BINARY", "VPU_PROGRAM", "HOST_BINARY", "HOST_UNARY"}
+_SUPPORTED_OPS = {"GEMM4x4", "SXU_PROGRAM", "VPU_BINARY", "VPU_PROGRAM", "HOST_UNARY"}
 
 class TinyTPUProgram:
     def __init__(self, name: str, lib: bytes, *args, **kwargs):
@@ -3350,30 +3422,6 @@ class TinyTPUProgram:
             chunk_out = np.array(result[:chunk_size], dtype="<i4")
             out_buf[out_offset : out_offset + len(chunk_out) * _BYTES_PER_ELEM] = chunk_out.tobytes()
             out_offset += len(chunk_out) * _BYTES_PER_ELEM
-        return 1e-3
-
-    def _exec_host_binary(self, bufs):
-        prog = self.prog
-        out_buf = bufs[prog["out"]]
-        num_elems = int(prog["num_elems"])
-        lhs_i32 = np.full(num_elems, int(prog["lhs_const"]), dtype=np.int32) if prog.get("lhs_const") is not None else np.frombuffer(bytes(bufs[prog["lhs"]]), dtype="<i4")
-        rhs_i32 = np.full(num_elems, int(prog["rhs_const"]), dtype=np.int32) if prog.get("rhs_const") is not None else np.frombuffer(bytes(bufs[prog["rhs"]]), dtype="<i4")
-        if lhs_i32.size == 1 and num_elems > 1:
-            lhs_i32 = np.full(num_elems, int(lhs_i32[0]), dtype=np.int32)
-        if rhs_i32.size == 1 and num_elems > 1:
-            rhs_i32 = np.full(num_elems, int(rhs_i32[0]), dtype=np.int32)
-        if lhs_i32.size != num_elems or rhs_i32.size != num_elems:
-            raise RuntimeError(f"TinyTPU host binary op expected {num_elems} elements, got lhs={lhs_i32.size} rhs={rhs_i32.size}")
-        if np.any(rhs_i32 == 0):
-            raise ZeroDivisionError("TinyTPU host division fallback received divisor 0")
-        q = np.trunc(lhs_i32.astype(np.float64) / rhs_i32.astype(np.float64)).astype(np.int32)
-        if prog["host_op"] == "IDIV":
-            out_i32 = q
-        elif prog["host_op"] == "MOD":
-            out_i32 = lhs_i32 - q * rhs_i32
-        else:
-            raise RuntimeError(f"unknown TinyTPU host binary op {prog['host_op']}")
-        out_buf[: len(out_i32) * _BYTES_PER_ELEM] = np.asarray(out_i32, dtype="<i4").tobytes()
         return 1e-3
 
     def _exec_host_unary(self, bufs):
