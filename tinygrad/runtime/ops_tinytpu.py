@@ -1000,6 +1000,50 @@ def _render_multistep_sxu_program(uops: list[UOp]) -> dict | None:
                 return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
                         "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
 
+    # --- Float scalar-numerator divide: 2 params (x, out), MUL + RECIPROCAL, float const numerator ---
+    # Pattern: c / x = c * (1/x) = FMUL(broadcast(c_bits), FRECIP(x))
+    if (len(src_params) == 1 and has_recip and has_mul and all_float
+            and not has_where and not has_cmplt):
+        recip_uops = [u for u in uops if u.op is Ops.RECIPROCAL and _has_load_src(u)]
+        # Find float const used as MUL operand alongside the RECIPROCAL
+        num_const = None
+        for u in uops:
+            if u.op is Ops.MUL and any(s.op is Ops.RECIPROCAL for s in u.src):
+                for s in u.src:
+                    if s.op is Ops.CONST and isinstance(s.arg, float):
+                        num_const = float(s.arg)
+                        break
+                if num_const is not None:
+                    break
+        if recip_uops and num_const is not None:
+            import struct
+            denom_arg = src_params[0]
+            const_bits = struct.unpack("<i", struct.pack("<f", num_const))[0]
+            num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+            addrs_per_tile = 3  # const, denom, out
+            all_instrs, data_plan, outputs = [], [], []
+            for tile_idx in range(num_tiles):
+                base = tile_idx * addrs_per_tile
+                offset = tile_idx * _TILE_ELEMS
+                count = min(_TILE_ELEMS, out_size - offset)
+                data_plan.append({"type": "VMEM", "addr": base,
+                                  "layout": "broadcast_const", "value": const_bits,
+                                  "count": count, "dtype": "int32"})
+                data_plan.append({"type": "VMEM", "addr": base + 1, "param": denom_arg,
+                                  "offset": offset, "count": count, "dtype": "int32"})
+                out_vmem = base + 2
+                all_instrs += [
+                    _load(0, base),
+                    _load(1, base + 1),
+                    _vpu(2, 1, FRECIP_OP),
+                    _vpu(3, 0, FMUL_OP, 2),
+                    _store(out_vmem, 3),
+                ]
+                outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
+            all_instrs.append(_halt())
+            return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+                    "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
+
     # --- ABS: 2 params, WHERE+CMPLT+CMPNE+MUL pattern → SUB(0,x), MAX(x, neg) ---
     # For float tensors use FSUB/FMAX; bits for 0.0 and 0 are identical so broadcast const reuses 0.
     if (len(src_params) == 1 and has_where and has_cmplt and has_cmpne and has_mul
