@@ -1608,7 +1608,9 @@ def _render_colbc_sxu_program(uops: list[UOp]) -> dict | None:
     lhs_arg = full_args[0]
     rhs_arg = col_args[0]
     nrows = params[rhs_arg].dtype.size
-    if nrows <= 0 or out_size % nrows != 0:
+    # A size-1 broadcast operand is a scalar broadcast, not a column broadcast.
+    # Let the elementwise renderer emit BROADCAST_SCALAR for it.
+    if nrows <= 1 or out_size % nrows != 0:
         return None
     ncols = out_size // nrows
     if ncols > _COLS:
