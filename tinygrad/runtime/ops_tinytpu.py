@@ -251,6 +251,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return cast_desc
         if (copy_desc := _render_copy_sxu_program(uops)) is not None:
             return copy_desc
+        if (recip_desc := _render_reciprocal_sxu_program(uops)) is not None:
+            return recip_desc
         if (divmod_desc := _render_scalar_const_divmod_sxu_program(uops)) is not None:
             return divmod_desc
         return _render_elementwise_sxu_program(uops)
@@ -1799,6 +1801,56 @@ def _find_alu_const(data_alu_uops: list[UOp], alu_op) -> int | None:
                     return int(src.arg)
     return None
 
+def _render_reciprocal_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render plain float32 reciprocal (1/x) as SXU_PROGRAM using VPU_FRECIP.
+
+    Replaces the legacy HOST_UNARY RECIPROCAL path. Pattern: single RECIPROCAL UOp
+    on a float source, no other compute ops in the data path.
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    if op_counts.get("RECIPROCAL", 0) < 1:
+        return None
+    _allowed = {"RECIPROCAL", "CONST", "INDEX", "LOAD", "STORE", "PARAM", "SINK",
+                "GROUP", "END", "RANGE", "VECTORIZE", "GEP", "MUL", "ADD", "CAST"}
+    if any(c > 0 and n not in _allowed for n, c in op_counts.items()):
+        return None
+    for u in uops:
+        if u.op in (Ops.MUL, Ops.ADD) and _has_load_src(u):
+            return None
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2 or 0 not in params:
+        return None
+    src_arg = next((k for k in params if k != 0), None)
+    if src_arg is None:
+        return None
+    if not ("float" in str(params[0].dtype) and "float" in str(params[src_arg].dtype)):
+        return None
+    out_size = params[0].dtype.size
+    src_size = params[src_arg].dtype.size
+    if out_size != src_size or out_size <= 0:
+        return None
+
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    all_instrs, data_plan, outputs = [], [], []
+    FRECIP_OP = _VPU_OPS["FRECIP"]
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count = min(_TILE_ELEMS, out_size - offset)
+        base = tile_idx * 2
+        data_plan.append({"type": "VMEM", "addr": base, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        out_vmem = base + 1
+        all_instrs += [
+            _load(0, base),
+            _vpu(1, 0, FRECIP_OP),
+            _store(out_vmem, 1),
+        ]
+        outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
+
+
 def _render_scalar_const_divmod_sxu_program(uops: list[UOp]) -> dict | None:
     """Render scalar-const int32 IDIV/MOD as SXU_PROGRAM.
 
@@ -1810,25 +1862,29 @@ def _render_scalar_const_divmod_sxu_program(uops: list[UOp]) -> dict | None:
     if 0 not in params:
         return None
     pattern = _classify_divmod_pattern(uops)
-    if pattern is None or pattern[1] is None or pattern[0] not in ("IDIV", "MOD"):
+    if pattern is None or pattern[0] not in ("IDIV", "MOD"):
         return None
     kind, rhs_const = pattern
 
     out_arg = 0
     out_size = params[out_arg].dtype.size
     src_args = [a for a in sorted(params) if a != out_arg]
-    if out_size <= 0 or len(src_args) != 1:
+    if out_size <= 0 or len(src_args) not in (1, 2):
         return None
-    src_arg = src_args[0]
-    src_size = params[src_arg].dtype.size
-    if src_size not in {1, out_size}:
+    # Float operands are not supported — IDIV/MOD are integer opcodes.
+    if any("float" in str(params[a].dtype) for a in [out_arg] + src_args):
         return None
-    # Refuse float operands — IDIV/MOD are integer opcodes.
-    if any("float" in str(params[a].dtype) for a in [out_arg, src_arg]):
+    # Scalar-const case needs rhs_const; tensor-tensor case needs two size-matching src params.
+    if len(src_args) == 1 and rhs_const is None:
         return None
+    if len(src_args) == 2:
+        for a in src_args:
+            sz = params[a].dtype.size
+            if sz not in {1, out_size}:
+                return None
 
     num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
-    addrs_per_tile = 3  # src, const, out
+    addrs_per_tile = 3  # lhs, rhs, out
     all_instrs, data_plan, outputs = [], [], []
     DIV_OP = _VPU_OPS["DIV"]
     MUL_OP = _VPU_OPS["MUL"]
@@ -1837,15 +1893,22 @@ def _render_scalar_const_divmod_sxu_program(uops: list[UOp]) -> dict | None:
         base = tile_idx * addrs_per_tile
         offset = tile_idx * _TILE_ELEMS
         count = min(_TILE_ELEMS, out_size - offset)
-        if src_size == 1:
-            data_plan.append({"type": "VMEM", "addr": base, "param": src_arg,
-                              "offset": 0, "count": 1, "dtype": "int32"})
+        if len(src_args) == 1:
+            src_arg = src_args[0]
+            src_size = params[src_arg].dtype.size
+            lhs_entry = {"type": "VMEM", "addr": base, "param": src_arg,
+                         "offset": 0 if src_size == 1 else offset,
+                         "count": 1 if src_size == 1 else count, "dtype": "int32"}
+            data_plan.append(lhs_entry)
+            data_plan.append({"type": "VMEM", "addr": base + 1,
+                              "layout": "broadcast_const", "value": int(rhs_const),
+                              "count": count, "dtype": "int32"})
         else:
-            data_plan.append({"type": "VMEM", "addr": base, "param": src_arg,
+            lhs_arg, rhs_arg = src_args
+            data_plan.append({"type": "VMEM", "addr": base, "param": lhs_arg,
                               "offset": offset, "count": count, "dtype": "int32"})
-        data_plan.append({"type": "VMEM", "addr": base + 1,
-                          "layout": "broadcast_const", "value": int(rhs_const),
-                          "count": count, "dtype": "int32"})
+            data_plan.append({"type": "VMEM", "addr": base + 1, "param": rhs_arg,
+                              "offset": offset, "count": count, "dtype": "int32"})
         out_vmem = base + 2
         if kind == "IDIV":
             all_instrs += [
@@ -1854,12 +1917,12 @@ def _render_scalar_const_divmod_sxu_program(uops: list[UOp]) -> dict | None:
                 _vpu(2, 0, DIV_OP, 1),
                 _store(out_vmem, 2),
             ]
-        else:  # MOD: x - (x // c) * c
+        else:  # MOD: x - (x // y) * y
             all_instrs += [
                 _load(0, base),
                 _load(1, base + 1),
-                _vpu(2, 0, DIV_OP, 1),   # v2 = x // c
-                _vpu(3, 2, MUL_OP, 1),   # v3 = v2 * c
+                _vpu(2, 0, DIV_OP, 1),   # v2 = x // y
+                _vpu(3, 2, MUL_OP, 1),   # v3 = v2 * y
                 _vpu(4, 0, SUB_OP, 3),   # v4 = x - v3
                 _store(out_vmem, 4),
             ]
