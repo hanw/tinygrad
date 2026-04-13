@@ -271,6 +271,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return divmod_desc
         if (chain_desc := _render_chained_const_sxu_program(uops)) is not None:
             return chain_desc
+        if (trans_desc := _render_transpose_sxu_program(uops)) is not None:
+            return trans_desc
         return _render_elementwise_sxu_program(uops)
 
     wmma = wmmas[0]
@@ -2032,6 +2034,87 @@ def _render_scalar_const_divmod_sxu_program(uops: list[UOp]) -> dict | None:
     all_instrs.append(_halt())
     return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
             "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
+
+
+def _render_transpose_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render a 4x4 2D permute(1,0) as LOAD + XLU_TRANSPOSE + STORE.
+
+    Detects the GROUP-of-4-STOREs kernel tinygrad emits for contiguous
+    .permute(1,0) over a 4x4 tile: one RANGE loop over rows, 4 STOREs per
+    iteration. Each STORE writes a LOAD whose index transposes the store
+    index. No data-path ALU ops.
+    """
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2:
+        return None
+    data_alu = _data_alu_ops(uops)
+    if sum(data_alu.values()) > 0:
+        return None
+    op_counts = Counter(u.op.name for u in uops)
+    # Expect exactly the shape of a GROUP(4)-unrolled 4x4 transpose: 4 STOREs,
+    # 4 LOADs, 1 RANGE, 1 MUL in index arithmetic (for row*stride).
+    if (op_counts.get("STORE", 0) != 4 or op_counts.get("LOAD", 0) != 4
+            or op_counts.get("RANGE", 0) != 1 or op_counts.get("MUL", 0) != 1):
+        return None
+
+    stores = [u for u in uops if u.op is Ops.STORE]
+    out_params = {_find_unique_param_arg(s.src[0]) for s in stores}
+    out_params.discard(None)
+    if len(out_params) != 1:
+        return None
+    out_arg = next(iter(out_params))
+    src_params = [k for k in params if k != out_arg]
+    if len(src_params) != 1:
+        return None
+    src_arg = src_params[0]
+    out_size = params[out_arg].dtype.size
+    src_size = params[src_arg].dtype.size
+    if out_size != 16 or src_size != 16:
+        return None
+    if params[out_arg].dtype.base.itemsize != params[src_arg].dtype.base.itemsize:
+        return None
+    # Each STORE value must be a plain LOAD of src_arg.
+    for s in stores:
+        if s.src[1].op is not Ops.LOAD:
+            return None
+        if _find_unique_param_arg(s.src[1]) != src_arg:
+            return None
+    # Reject pure copies (store_idx is LOAD_idx shifted by a constant).
+    def _idx(addr_uop):
+        return addr_uop.src[1] if addr_uop.op is Ops.INDEX else None
+    differing = False
+    for s in stores:
+        si = _idx(s.src[0])
+        li = _idx(s.src[1].src[0])
+        if si is None or li is None:
+            return None
+        if si is not li and si.op != li.op:
+            differing = True
+    if not differing:
+        return None
+
+    # Emit: LOAD VMEM[0]→VREG 0, XLU_TRANSPOSE VREG 1 = transpose(VREG 0),
+    # STORE VREG 1 → VMEM[1].
+    data_plan = [{
+        "type": "VMEM", "addr": 0, "param": src_arg,
+        "offset": 0, "count": 16, "dtype": "int32",
+    }]
+    instructions = [
+        _load(0, 0),
+        f"2 12 0 1 0 0 0 0 0 0",  # SXU_DISPATCH_XLU_TRANSPOSE vd=1, vs=0
+        _store(1, 1),
+        _halt(),
+    ]
+    outputs = [{"addr": 1, "param": out_arg, "offset": 0, "count": 16}]
+    return {
+        "op": "SXU_PROGRAM",
+        "primitive": "TRANSPOSE",
+        "instructions": instructions,
+        "data_plan": data_plan,
+        "outputs": outputs,
+        "num_output_tiles": 1,
+        "out": out_arg,
+    }
 
 
 def _render_chained_const_sxu_program(uops: list[UOp]) -> dict | None:
