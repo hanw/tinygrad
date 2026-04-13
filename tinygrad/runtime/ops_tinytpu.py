@@ -38,6 +38,14 @@ _ALU_OPS = {Ops.ADD: "ADD", Ops.MUL: "MUL", Ops.SUB: "SUB", Ops.MAX: "MAX",
             Ops.AND: "AND", Ops.OR: "OR", Ops.XOR: "XOR",
             Ops.SHL: "SHL", Ops.SHR: "SHR", Ops.IDIV: "DIV"}
 
+def _uop_contains(u: UOp, target_op, seen: set | None = None) -> bool:
+    """True if the UOp's source tree contains any UOp with op == target_op."""
+    if seen is None: seen = set()
+    if id(u) in seen: return False
+    seen.add(id(u))
+    if u.op is target_op: return True
+    return any(_uop_contains(s, target_op, seen) for s in u.src)
+
 def _has_load_src(u: UOp, visited: set | None = None) -> bool:
     """Check if a UOp has a LOAD anywhere in its source tree (data-path, not index)."""
     if visited is None: visited = set()
@@ -1139,8 +1147,15 @@ def _render_multistep_sxu_program(uops: list[UOp]) -> dict | None:
                     "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
 
     # --- Float MIN scalar const: minimum(x, c) = -max(-x, -c) → FCMPLT+SELECT with broadcast const ---
+    # Reject chained max/min patterns (e.g. maximum(x,a).minimum(b)) where a
+    # MAX has another MAX-derived value as an input — those need the multi-step
+    # clip lowering, not a single-op min_const kernel.
+    _has_chained_max = any(u.op is Ops.MAX and _has_load_src(u)
+                           and any(_uop_contains(s, Ops.MAX) for s in u.src)
+                           for u in uops)
     if (len(src_params) == 1 and has_max and has_mul and all_float
-            and not has_where and data_alu.get("XOR", 0) == 0 and not has_cmplt and not has_idiv):
+            and not has_where and data_alu.get("XOR", 0) == 0 and not has_cmplt and not has_idiv
+            and not _has_chained_max):
         # Find MAX UOp and extract the constant (it's stored as -c)
         max_uops = [u for u in uops if u.op is Ops.MAX and _has_load_src(u)]
         if max_uops:
