@@ -1608,10 +1608,16 @@ def _render_colbc_sxu_program(uops: list[UOp]) -> dict | None:
     lhs_arg = full_args[0]
     rhs_arg = col_args[0]
     nrows = params[rhs_arg].dtype.size
-    if nrows <= 0 or out_size % nrows != 0:
+    # nrows == 1 is a size-1 scalar, not a true column tile — let BROADCAST_SCALAR handle it
+    # via the elementwise renderer. Also reject tinygrad's SUB decomposition (ADD + MUL(-1))
+    # since column-broadcast SUB needs operand-order-aware emission this renderer doesn't do.
+    if nrows <= 1 or out_size % nrows != 0:
         return None
     ncols = out_size // nrows
     if ncols > _COLS:
+        return None
+    has_neg_const = any(u.op is Ops.CONST and u.arg == -1 for u in uops)
+    if op_counts.get("ADD", 0) > 0 and op_counts.get("MUL", 0) > 0 and has_neg_const:
         return None
 
     if op_counts.get("CMPLT", 0):
@@ -2346,33 +2352,45 @@ def _classify_structured_broadcast_axis(uops: list[UOp], param_arg: int) -> str 
                      if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and u.src[0].arg == param_arg]
     if not param_indices:
         return None
+
+    # First, extract the output's row_range and col_range from the STORE index, so we can
+    # check which range any RANGE-typed param index corresponds to.
+    store = next((u for u in uops if u.op is Ops.STORE and u.src[0].op is Ops.INDEX), None)
+    row_range = col_range = None
+    if store is not None:
+        out_idx = store.src[0].src[1]
+        if out_idx.op is Ops.ADD:
+            for src in out_idx.src:
+                if src.op is Ops.MUL:
+                    row_range = next((s for s in src.src if s.op is Ops.RANGE), None)
+                elif src.op is Ops.RANGE:
+                    col_range = src
+
     if all(idx.op is Ops.RANGE for idx in param_indices):
+        # Only classify when we can match the range to row or col; otherwise ambiguous.
+        uses_row = any(idx is row_range for idx in param_indices) if row_range is not None else False
+        uses_col = any(idx is col_range for idx in param_indices) if col_range is not None else False
+        if uses_row and not uses_col:
+            return "col"   # indexes only by row range → varies per row, constant per col = column broadcast
+        if uses_col and not uses_row:
+            return "row"   # indexes only by col range → varies per col, constant per row = row broadcast
+        # Conservative default preserved: treat pure-RANGE index with unknown mapping as "col".
         return "col"
     if all(idx.op is Ops.CONST for idx in param_indices):
         vals = [int(idx.arg) for idx in param_indices]
         uniq = sorted(set(vals))
         if uniq and len(vals) % len(uniq) == 0:
             chunk = len(vals) // len(uniq)
-            if vals == [v for u in uniq for v in [u] * chunk]:
+            # chunk > 1 with grouped values (e.g. [0,0,1,1,2,2,3,3]) → column broadcast
+            if chunk > 1 and vals == [v for u in uniq for v in [u] * chunk]:
                 return "col"
+            # Cycled values (e.g. [0,1,2,3,0,1,2,3]) or chunk==1 single cycle → row broadcast
             if vals == uniq * chunk:
                 return "row"
         return "row"
 
-    store = next((u for u in uops if u.op is Ops.STORE and u.src[0].op is Ops.INDEX), None)
-    if store is None:
-        return None
-    out_idx = store.src[0].src[1]
-    row_range = col_range = None
-    if out_idx.op is Ops.ADD:
-        for src in out_idx.src:
-            if src.op is Ops.MUL:
-                row_range = next((s for s in src.src if s.op is Ops.RANGE), None)
-            elif src.op is Ops.RANGE:
-                col_range = src
     if row_range is None or col_range is None:
         return None
-
     uses_row = any(idx is row_range for idx in param_indices)
     uses_col = any(idx is col_range for idx in param_indices)
     if uses_row and not uses_col:
