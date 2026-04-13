@@ -436,6 +436,36 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
     has_store = op_counts.get("STORE", 0) > 0
     if not has_store:
         return None
+
+    # If the stored value is ADD(tree, CONST) or MUL(tree, CONST) where the tree
+    # does the reduction and the CONST is a post-reduction scalar op, detect
+    # and emit reduction + post-op. Otherwise use the original path which
+    # treats any ADD as part of the reduction tree.
+    post_op = None  # ("ADD"|"MUL", const_val) applied after reduction
+    stores = [u for u in uops if u.op is Ops.STORE]
+    if len(stores) == 1:
+        val = stores[0].src[1]
+        if val.op in (Ops.ADD, Ops.MUL):
+            const_src = next((s for s in val.src if s.op is Ops.CONST
+                              and not isinstance(s.arg, bool)), None)
+            tree_src = next((s for s in val.src if s is not const_src), None)
+            if const_src is not None and tree_src is not None and _has_load_src(tree_src):
+                # Tree must itself be a reduction expression (contains the src LOAD
+                # plus ADD/MAX/XOR per reduction kind) but *not* another ADD/MUL
+                # that references the same const again. Heuristic: the CONST
+                # should be used by exactly one ALU op in the whole kernel.
+                const_uses = sum(1 for u in uops
+                                 if any(s is const_src for s in u.src))
+                if const_uses == 1 and val.op is Ops.ADD:
+                    post_op = ("ADD", const_src.arg)
+                elif const_uses == 1 and val.op is Ops.MUL:
+                    post_op = ("MUL", const_src.arg)
+    # When the outer op is ADD(reduce, const) we must NOT count it as part of
+    # the reduction (it is the post-op). Adjust op_counts for detection.
+    if post_op is not None and post_op[0] == "ADD":
+        has_add = (op_counts.get("ADD", 0) - 1) > 0
+    if post_op is not None and post_op[0] == "MUL":
+        pass  # leave has_add alone (MUL reduction detection uses data_alu)
     # Data-path MUL is the MUL-reduction signature (no index-arithmetic MULs).
     data_alu = _data_alu_ops(uops)
     has_data_mul = data_alu.get("MUL", 0) > 0
@@ -494,12 +524,28 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
             next_vreg = num_tiles * 2 + tile_idx
             all_instrs.append(_vpu(next_vreg, acc_vreg, combine_op, tile_result_vreg))
             acc_vreg = next_vreg
-        out_vmem = num_tiles
-        all_instrs.append(_store(out_vmem, acc_vreg))
     else:
-        out_vmem = 1
-        all_instrs.append(_store(out_vmem, 1))
+        acc_vreg = 1
 
+    # Post-reduction scalar op: reduce_result (op) const
+    if post_op is not None:
+        op_name, const_val = post_op
+        c_bits = int(np.frombuffer(np.float32(const_val).tobytes(), dtype=np.int32)[0]) \
+                 if isinstance(const_val, float) else int(const_val)
+        const_addr = num_tiles  # next VMEM slot
+        data_plan.append({"type": "VMEM", "addr": const_addr, "layout": "broadcast_const",
+                          "value": c_bits, "count": _TILE_ELEMS, "dtype": "int32"})
+        const_vreg = num_tiles * 2 + 10
+        result_vreg = const_vreg + 1
+        all_instrs.append(_load(const_vreg, const_addr))
+        post_vpu = _VPU_OPS["ADD"] if op_name == "ADD" else _VPU_OPS["MUL"]
+        all_instrs.append(_vpu(result_vreg, acc_vreg, post_vpu, const_vreg))
+        acc_vreg = result_vreg
+        out_vmem = num_tiles + 1
+    else:
+        out_vmem = num_tiles if num_tiles > 1 else 1
+
+    all_instrs.append(_store(out_vmem, acc_vreg))
     all_instrs.append(_halt())
     outputs = [{"addr": out_vmem, "param": out_arg, "offset": 0, "count": 1}]
 
