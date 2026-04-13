@@ -231,12 +231,16 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
     if not wmmas:
         if (red_desc := _render_reduction_sxu_program(uops)) is not None:
             return red_desc
+        if (colbc_where_desc := _render_colbc_where_sxu_program(uops)) is not None:
+            return colbc_where_desc
         if (where_desc := _render_where_sxu_program(uops)) is not None:
             return where_desc
         if (min_const_desc := _render_min_const_sxu_program(uops)) is not None:
             return min_const_desc
         if (multi_desc := _render_multistep_sxu_program(uops)) is not None:
             return multi_desc
+        if (colbc_desc := _render_colbc_sxu_program(uops)) is not None:
+            return colbc_desc
         if (rowbc_desc := _render_rowbc_sxu_program(uops)) is not None:
             return rowbc_desc
         if (colred_desc := _render_colreduce_sxu_program(uops)) is not None:
@@ -1518,6 +1522,165 @@ def _render_rowbc_sxu_program(uops: list[UOp]) -> dict | None:
     }
 
 
+def _render_colbc_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render column-broadcast binary ops as SXU_PROGRAM for single-tile 2D kernels."""
+    op_counts = Counter(u.op.name for u in uops)
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 3:
+        return None
+
+    out_arg = 0
+    out_size = params[out_arg].dtype.size
+    input_args = sorted(arg for arg in params if arg != out_arg)
+    if out_size <= 0 or len(input_args) != 2 or out_size > _TILE_ELEMS:
+        return None
+
+    full_args = [arg for arg in input_args if params[arg].dtype.size == out_size]
+    col_args = [arg for arg in input_args
+                if 0 < params[arg].dtype.size < out_size
+                and params[arg].dtype.size <= _ROWS
+                and _classify_structured_broadcast_axis(uops, arg) == "col"]
+    if len(full_args) != 1 or len(col_args) != 1:
+        return None
+
+    lhs_arg = full_args[0]
+    rhs_arg = col_args[0]
+    nrows = params[rhs_arg].dtype.size
+    if nrows <= 0 or out_size % nrows != 0:
+        return None
+    ncols = out_size // nrows
+    if ncols > _COLS:
+        return None
+
+    if op_counts.get("CMPLT", 0):
+        vpu_name = "CMPLT"
+    elif op_counts.get("CMPNE", 0):
+        vpu_name = "CMPNE"
+    elif op_counts.get("CMPEQ", 0):
+        vpu_name = "CMPEQ"
+    elif op_counts.get("MAX", 0):
+        vpu_name = "MAX"
+    elif op_counts.get("MIN", 0):
+        vpu_name = "MIN"
+    elif op_counts.get("SUB", 0):
+        vpu_name = "SUB"
+    elif op_counts.get("MUL", 0):
+        vpu_name = "MUL"
+    elif op_counts.get("ADD", 0):
+        vpu_name = "ADD"
+    else:
+        return None
+
+    vpu_op = _VPU_OPS[vpu_name]
+    data_plan: list[dict] = [
+        {"type": "VMEM", "addr": 0, "param": rhs_arg, "offset": 0, "count": nrows, "dtype": "int32",
+         "mode": "MATRIX_TILE", "matrix_nrows": nrows, "matrix_ncols": 1,
+         "row_base": 0, "col_base": 0, "tile_rows": nrows, "tile_cols": 1},
+        {"type": "VMEM", "addr": 1, "param": lhs_arg, "offset": 0, "count": out_size, "dtype": "int32"},
+    ]
+    instructions = [
+        _load(0, 1),
+        _load(1, 0),
+        _broadcast_col(2, 1, 0),
+        _vpu(3, 0, vpu_op, 2),
+        _store(2, 3),
+        _halt(),
+    ]
+    outputs = [{"addr": 2, "param": out_arg, "offset": 0, "count": out_size}]
+    return {
+        "op": "SXU_PROGRAM",
+        "primitive": "BROADCAST_COL",
+        "instructions": instructions,
+        "data_plan": data_plan,
+        "outputs": outputs,
+        "num_output_tiles": 1,
+        "out": out_arg,
+        "bool_out": vpu_op in _VPU_BOOL_OPS,
+    }
+
+
+def _render_colbc_where_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render WHERE(full < col_broadcast, full, full * const) as SXU_PROGRAM."""
+    op_counts = Counter(u.op.name for u in uops)
+    if op_counts.get("WHERE", 0) == 0 or op_counts.get("CMPLT", 0) == 0 or op_counts.get("MUL", 0) == 0:
+        return None
+
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 3:
+        return None
+    out_arg = 0
+    out_size = params[out_arg].dtype.size
+    if out_size <= 0 or out_size > _TILE_ELEMS:
+        return None
+
+    input_args = sorted(arg for arg in params if arg != out_arg)
+    full_args = [arg for arg in input_args if params[arg].dtype.size == out_size]
+    col_args = [arg for arg in input_args
+                if 0 < params[arg].dtype.size < out_size
+                and params[arg].dtype.size <= _ROWS
+                and _classify_structured_broadcast_axis(uops, arg) == "col"]
+    if len(full_args) != 1 or len(col_args) != 1:
+        return None
+    full_arg, col_arg = full_args[0], col_args[0]
+
+    where_uops = [u for u in uops if u.op is Ops.WHERE]
+    if not where_uops:
+        return None
+
+    mul_consts: set[int] = set()
+    for where_uop in where_uops:
+        if len(where_uop.src) != 3:
+            return None
+        cond_uop, true_uop, false_uop = where_uop.src
+        if cond_uop.op is not Ops.CMPLT or true_uop.op is not Ops.LOAD or false_uop.op is not Ops.MUL:
+            return None
+        if _find_unique_param_arg(true_uop) != full_arg:
+            return None
+        mul_loads = [src for src in false_uop.src if src.op is Ops.LOAD]
+        mul_const_nodes = [src for src in false_uop.src if src.op is Ops.CONST and isinstance(src.arg, int)]
+        if len(mul_loads) != 1 or len(mul_const_nodes) != 1 or _find_unique_param_arg(mul_loads[0]) != full_arg:
+            return None
+        mul_consts.add(int(mul_const_nodes[0].arg))
+
+        cmplt_full = [src for src in cond_uop.src if src.op is Ops.LOAD and _find_unique_param_arg(src) == full_arg]
+        cmplt_col = [src for src in cond_uop.src if src.op is Ops.LOAD and _find_unique_param_arg(src) == col_arg]
+        if len(cmplt_full) != 1 or len(cmplt_col) != 1:
+            return None
+
+    if len(mul_consts) != 1:
+        return None
+    mul_const = next(iter(mul_consts))
+
+    data_plan: list[dict] = [
+        {"type": "VMEM", "addr": 0, "param": col_arg, "offset": 0, "count": params[col_arg].dtype.size, "dtype": "int32",
+         "mode": "MATRIX_TILE", "matrix_nrows": params[col_arg].dtype.size, "matrix_ncols": 1,
+         "row_base": 0, "col_base": 0, "tile_rows": params[col_arg].dtype.size, "tile_cols": 1},
+        {"type": "VMEM", "addr": 1, "param": full_arg, "offset": 0, "count": out_size, "dtype": "int32"},
+        {"type": "VMEM", "addr": 2, "layout": "broadcast_const", "value": mul_const, "count": out_size, "dtype": "int32"},
+    ]
+    instructions = [
+        _load(0, 1),
+        _load(1, 0),
+        _broadcast_col(2, 1, 0),
+        _vpu(3, 0, _VPU_OPS["CMPLT"], 2),
+        _load(4, 2),
+        _vpu(5, 0, _VPU_OPS["MUL"], 4),
+        _select(6, 3, 0, 5),
+        _store(3, 6),
+        _halt(),
+    ]
+    outputs = [{"addr": 3, "param": out_arg, "offset": 0, "count": out_size}]
+    return {
+        "op": "SXU_PROGRAM",
+        "primitive": "BROADCAST_COL_SELECT",
+        "instructions": instructions,
+        "data_plan": data_plan,
+        "outputs": outputs,
+        "num_output_tiles": 1,
+        "out": out_arg,
+    }
+
+
 def _render_min_const_sxu_program(uops: list[UOp]) -> dict | None:
     """Render minimum(x, const) through native VPU MIN in SXU_PROGRAM."""
     op_counts = Counter(u.op.name for u in uops)
@@ -1623,11 +1786,20 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
                          and not any(data_alu_counts.get(n, 0) > 0 for n in ["ADD", "MUL", "MAX"]))
     if has_where and not is_relu_candidate:
         return None
-    # Check param sizes — allow size-1 broadcast (scalar → tile)
+    # Check param sizes — allow size-1 scalar broadcast and single-tile
+    # structured row/column broadcast.
     src_sizes = {k: params[k].dtype.size for k in src_params}
     broadcast_params = {k for k, sz in src_sizes.items() if sz == 1 and out_size > 1}
-    non_bc_sizes = [sz for k, sz in src_sizes.items() if k not in broadcast_params]
-    if len(set(non_bc_sizes)) > 1 or (non_bc_sizes and non_bc_sizes[0] != out_size):
+    structured_broadcasts = {
+        k: _classify_structured_broadcast_axis(uops, k)
+        for k, sz in src_sizes.items()
+        if k not in broadcast_params and 0 < sz < out_size and out_size <= _TILE_ELEMS and sz <= _ROWS
+    }
+    structured_broadcasts = {k: axis for k, axis in structured_broadcasts.items() if axis is not None}
+    regular_sizes = [sz for k, sz in src_sizes.items() if k not in broadcast_params and k not in structured_broadcasts]
+    if len(set(regular_sizes)) > 1 or (regular_sizes and regular_sizes[0] != out_size):
+        return None
+    if any(k not in broadcast_params and k not in structured_broadcasts and sz != out_size for k, sz in src_sizes.items()):
         return None
 
     # Only count ALU UOps in the data path (have LOAD in source tree), not index arithmetic
@@ -1659,7 +1831,7 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
     # --- Determine VPU op, operand sources, and inputs_per_tile ---
     const_val = None  # set if one operand is a scalar constant
     is_bool_out_flag = has_bool_out
-    uses_scalar_broadcast = False
+    primitive_tags: set[str] = set()
 
     if is_relu and len(src_params) == 1:
         tile_vpu_op = 2  # VPU_RELU
@@ -1802,7 +1974,25 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
                          "param": src_arg, "offset": 0, "count": 1, "dtype": "int32",
                          "broadcast": False}
                 data_plan.append(entry)
-                uses_scalar_broadcast = True
+                primitive_tags.add("BROADCAST_SCALAR")
+            elif src_arg in structured_broadcasts:
+                axis = structured_broadcasts[src_arg]
+                if axis == "row":
+                    data_plan.append({
+                        "type": "VMEM", "addr": base + inp_idx,
+                        "param": src_arg, "offset": 0, "count": src_sizes[src_arg], "dtype": "int32",
+                    })
+                    primitive_tags.add("BROADCAST_ROW")
+                elif axis == "col":
+                    data_plan.append({
+                        "type": "VMEM", "addr": base + inp_idx,
+                        "param": src_arg, "offset": 0, "count": src_sizes[src_arg], "dtype": "int32",
+                        "mode": "MATRIX_TILE", "matrix_nrows": src_sizes[src_arg], "matrix_ncols": 1,
+                        "row_base": 0, "col_base": 0, "tile_rows": src_sizes[src_arg], "tile_cols": 1,
+                    })
+                    primitive_tags.add("BROADCAST_COL")
+                else:
+                    return None
             else:
                 entry = {"type": "VMEM", "addr": base + inp_idx,
                          "param": src_arg, "offset": offset, "count": count, "dtype": "int32"}
@@ -1817,8 +2007,12 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
             tile_instrs = [_load(0, base), _load(1, base + 1)]
             if src_params[0] in broadcast_params:
                 tile_instrs.append(_broadcast_scalar(0, 0, 0, 0))
+            elif src_params[0] in structured_broadcasts:
+                tile_instrs.append(_broadcast_row(0, 0, 0) if structured_broadcasts[src_params[0]] == "row" else _broadcast_col(0, 0, 0))
             if src_params[1] in broadcast_params:
                 tile_instrs.append(_broadcast_scalar(1, 1, 0, 0))
+            elif src_params[1] in structured_broadcasts:
+                tile_instrs.append(_broadcast_row(1, 1, 0) if structured_broadcasts[src_params[1]] == "row" else _broadcast_col(1, 1, 0))
             tile_instrs += [_vpu(2, 0, tile_vpu_op, 1), _store(out_vmem, 2)]
             all_instrs += tile_instrs
 
@@ -1828,7 +2022,7 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
 
     return {
         "op": "SXU_PROGRAM",
-        **({"primitive": "BROADCAST_SCALAR"} if uses_scalar_broadcast else {}),
+        **({"primitive": next(iter(sorted(primitive_tags)))} if len(primitive_tags) == 1 else {}),
         "instructions": all_instrs,
         "data_plan": data_plan,
         "outputs": outputs,
@@ -1900,6 +2094,48 @@ def _find_unique_param_arg(u: UOp) -> int | None:
         return None
     arg = next(iter(params))
     return arg if isinstance(arg, int) else None
+
+
+def _classify_structured_broadcast_axis(uops: list[UOp], param_arg: int) -> str | None:
+    """Infer row/column broadcast orientation for a short 2D operand."""
+    param_indices = [u.src[1] for u in uops
+                     if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and u.src[0].arg == param_arg]
+    if not param_indices:
+        return None
+    if all(idx.op is Ops.RANGE for idx in param_indices):
+        return "col"
+    if all(idx.op is Ops.CONST for idx in param_indices):
+        vals = [int(idx.arg) for idx in param_indices]
+        uniq = sorted(set(vals))
+        if uniq and len(vals) % len(uniq) == 0:
+            chunk = len(vals) // len(uniq)
+            if vals == [v for u in uniq for v in [u] * chunk]:
+                return "col"
+            if vals == uniq * chunk:
+                return "row"
+        return "row"
+
+    store = next((u for u in uops if u.op is Ops.STORE and u.src[0].op is Ops.INDEX), None)
+    if store is None:
+        return None
+    out_idx = store.src[0].src[1]
+    row_range = col_range = None
+    if out_idx.op is Ops.ADD:
+        for src in out_idx.src:
+            if src.op is Ops.MUL:
+                row_range = next((s for s in src.src if s.op is Ops.RANGE), None)
+            elif src.op is Ops.RANGE:
+                col_range = src
+    if row_range is None or col_range is None:
+        return None
+
+    uses_row = any(idx is row_range for idx in param_indices)
+    uses_col = any(idx is col_range for idx in param_indices)
+    if uses_row and not uses_col:
+        return "col"
+    if uses_col and not uses_row:
+        return "row"
+    return None
 
 
 def _extract_wmma_epilogue(uops: list[UOp], params: dict[int, UOp], out_arg: int, act_arg: int, weight_arg: int,
