@@ -128,6 +128,8 @@ def _render_legacy_descriptor(uops: list[UOp]) -> dict | None:
         param_sizes[p.arg] = p.dtype.size
 
     # --- GEMM fallback: 3 params with MULACC or scalar MUL+RANGE pattern ---
+    # Emit as SXU_PROGRAM (same structure as the WMMA SXU path) instead of the
+    # legacy GEMM4x4 descriptor.
     has_mulacc = any(u.op is Ops.MULACC for u in uops)
     has_store = op_counts.get("STORE", 0) > 0
     is_gemm = has_mulacc or (len(params) == 3 and op_counts.get("MUL", 0) > 0
@@ -136,9 +138,44 @@ def _render_legacy_descriptor(uops: list[UOp]) -> dict | None:
         tiling = _infer_tiling(param_sizes.get(0), param_sizes.get(1), param_sizes.get(2, 0))
         if tiling is not None:
             num_vecs, num_k_tiles, num_weight_tiles = tiling
-            return {"op": "GEMM4x4", "out": 0, "act": 1, "weight": 2,
-                    "num_vecs": num_vecs, "num_k_tiles": num_k_tiles,
-                    "num_weight_tiles": num_weight_tiles}
+            out_arg, act_arg, weight_arg = 0, 1, 2
+            out_cols = num_weight_tiles * _COLS
+            k_cols = num_k_tiles * _ROWS
+            total_weight_tiles = num_k_tiles * num_weight_tiles
+            data_plan = [
+                {"type": "WMEM", "addr": 0, "param": weight_arg,
+                 "offset": 0, "count": total_weight_tiles * _ROWS * _COLS,
+                 "dtype": "int8", "layout": "weight_tiles",
+                 "num_k_tiles": num_k_tiles, "num_weight_tiles": num_weight_tiles},
+                {"type": "AMEM", "addr": 0, "param": act_arg,
+                 "offset": 0, "count": num_vecs * k_cols,
+                 "dtype": "int8", "layout": "act_tiles",
+                 "num_vecs": num_vecs, "num_k_tiles": num_k_tiles},
+            ]
+            instructions = _generate_gemm_sxu_instructions(
+                num_vecs, num_k_tiles, num_weight_tiles,
+                has_bias=False, bias_vmem_base=0, has_relu=False,
+            )
+            outputs = []
+            for row in range(num_vecs):
+                for tile_idx in range(num_weight_tiles):
+                    out_addr = row * num_weight_tiles + tile_idx
+                    outputs.append({
+                        "addr": out_addr, "param": out_arg,
+                        "offset": row * out_cols + tile_idx * _COLS,
+                        "count": _COLS,
+                    })
+            return {
+                "op": "SXU_PROGRAM",
+                "instructions": instructions,
+                "data_plan": data_plan,
+                "outputs": outputs,
+                "num_output_tiles": num_vecs * num_weight_tiles,
+                "num_vecs": num_vecs,
+                "num_k_tiles": num_k_tiles,
+                "num_weight_tiles": num_weight_tiles,
+                "out": out_arg,
+            }
 
     return None
 
@@ -3407,7 +3444,7 @@ def _unsupported_message(prog: dict) -> str:
 # ---------------------------------------------------------------------------
 # Program — drives the BSV simulator
 # ---------------------------------------------------------------------------
-_SUPPORTED_OPS = {"GEMM4x4", "SXU_PROGRAM"}
+_SUPPORTED_OPS = {"SXU_PROGRAM"}
 
 class TinyTPUProgram:
     def __init__(self, name: str, lib: bytes, *args, **kwargs):
@@ -3571,70 +3608,6 @@ class TinyTPUProgram:
             out_buf[out_offset:out_offset+len(chunk_out)*out_dtype.itemsize] = chunk_out.tobytes()
             out_offset += len(chunk_out) * out_dtype.itemsize
         return 1e-3
-
-    def _exec_gemm4x4(self, bufs):
-        prog = self.prog
-        out_buf    = bufs[prog["out"]]
-        act_buf    = bufs[prog["act"]]
-        weight_buf = bufs[prog["weight"]]
-
-        # Decode int32 data from the raw bytearrays
-        act_i32    = np.frombuffer(bytes(act_buf),    dtype="<i4")
-        weight_i32 = np.frombuffer(bytes(weight_buf), dtype="<i4")
-        num_vecs   = int(prog.get("num_vecs", max(1, act_i32.size // _ROWS)))
-        num_k_tiles = int(prog.get("num_k_tiles", max(1, act_i32.size // max(1, num_vecs * _ROWS))))
-        num_weight_tiles = int(prog.get("num_weight_tiles", max(1, weight_i32.size // (_ROWS * _COLS))))
-        out_cols = num_weight_tiles * _COLS
-        k_cols = num_k_tiles * _ROWS
-
-        if act_i32.size != num_vecs * k_cols:
-            raise RuntimeError(f"TinyTPU activation buffer size {act_i32.size} does not match shape=({num_vecs}, {k_cols})")
-        if weight_i32.size != num_k_tiles * num_weight_tiles * _ROWS * _COLS:
-            raise RuntimeError(f"TinyTPU weight buffer size {weight_i32.size} does not match tiling=({num_k_tiles}, {num_weight_tiles})")
-        if len(out_buf) < num_vecs * out_cols * _BYTES_PER_ELEM:
-            raise RuntimeError(f"TinyTPU output buffer too small for shape=({num_vecs}, {out_cols})")
-
-        _require_int8_range("weight", weight_i32)
-        _require_int8_range("activation", act_i32)
-
-        # Downcast to int8 (hardware operand type)
-        weight_matrix = weight_i32.reshape(k_cols, out_cols).astype(np.int8)
-        act_rows = act_i32.reshape(num_vecs, k_cols).astype(np.int8)
-
-        # Parse epilogue
-        epilogue = prog.get("epilogue", [])
-        hw_bias: np.ndarray | None = None
-        hw_relu = False
-        for step in epilogue:
-            if step["op"] == "ADD":
-                hw_bias = np.frombuffer(bytes(bufs[int(step["arg"])]), dtype="<i4")
-            elif step["op"] == "RELU":
-                hw_relu = True
-
-        # Build one bundle for the entire GEMM (all rows × tiles)
-        bundle = _build_full_gemm_bundle(act_rows, weight_matrix,
-                                         num_vecs, num_k_tiles, num_weight_tiles,
-                                         bias_i32=hw_bias, relu=hw_relu)
-        stdout = self._run(bundle)
-        vmem_results = _parse_multi_vmem_output(stdout)
-
-        expected_tiles = num_vecs * num_weight_tiles
-        if len(vmem_results) != expected_tiles:
-            raise RuntimeError(
-                f"TinyTPU full GEMM expected {expected_tiles} vmem_result lines, got {len(vmem_results)}\n"
-                f"stdout: {stdout[:500]}")
-
-        # Assemble output from VMEM tiles (row-major: row0_tile0, row0_tile1, ..., row1_tile0, ...)
-        out_i32 = np.empty(num_vecs * out_cols, dtype="<i4")
-        for row in range(num_vecs):
-            for tile_idx in range(num_weight_tiles):
-                tile_data = vmem_results[row * num_weight_tiles + tile_idx]
-                col_base = row * out_cols + tile_idx * _COLS
-                out_i32[col_base : col_base + _COLS] = tile_data[:_COLS]
-
-        out_buf[: len(out_i32) * _BYTES_PER_ELEM] = out_i32.tobytes()
-        return 1e-3  # placeholder timing (seconds)
-
 
 # ---------------------------------------------------------------------------
 # Device — top-level tinygrad device
