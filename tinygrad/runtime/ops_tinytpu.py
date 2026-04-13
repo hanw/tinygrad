@@ -112,12 +112,12 @@ def _detect_reduce_op(op_counts: Counter, data_alu: Counter | None = None) -> st
             return "PROD"
     return None
 
-def _render_legacy_descriptor(uops: list[UOp]) -> dict | None:
-    """Slim fallback renderer for patterns not yet handled by SXU_PROGRAM.
+def _render_gemm_fallback_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render MULACC or scalar MUL+RANGE GEMMs (no WMMA UOp) as SXU_PROGRAM.
 
-    Handles: HOST_UNARY, GEMM4x4, and remaining scalar-const VPU_BINARY /
-    VPU_PROGRAM patterns. Row/column reductions now go through the
-    SXU_PROGRAM renderers and no longer fall back to host numpy.
+    Same structure as the WMMA SXU path but triggered by the non-WMMA lowering
+    pattern. No epilogue support (bias/relu) — that still requires the WMMA
+    UOp path in `_render_sxu_program`.
     """
     op_counts = Counter(u.op.name for u in uops)
     params = [u for u in uops if u.op is Ops.PARAM]
@@ -127,9 +127,6 @@ def _render_legacy_descriptor(uops: list[UOp]) -> dict | None:
             return None
         param_sizes[p.arg] = p.dtype.size
 
-    # --- GEMM fallback: 3 params with MULACC or scalar MUL+RANGE pattern ---
-    # Emit as SXU_PROGRAM (same structure as the WMMA SXU path) instead of the
-    # legacy GEMM4x4 descriptor.
     has_mulacc = any(u.op is Ops.MULACC for u in uops)
     has_store = op_counts.get("STORE", 0) > 0
     is_gemm = has_mulacc or (len(params) == 3 and op_counts.get("MUL", 0) > 0
@@ -211,12 +208,12 @@ class TinyTPURenderer(Renderer):
     def render(self, uops: list[UOp]) -> str:  # type: ignore[override]
         if (sxu_desc := _render_sxu_program(uops)) is not None:
             return _dump_lowering(json.dumps(sxu_desc))
-        if (legacy := _render_legacy_descriptor(uops)) is not None:
-            return _dump_lowering(json.dumps(legacy))
+        if (gemm_desc := _render_gemm_fallback_sxu_program(uops)) is not None:
+            return _dump_lowering(json.dumps(gemm_desc))
         op_counts = dict(sorted(Counter(u.op.name for u in uops).items()))
         return _dump_lowering(json.dumps({
             "op": "UNSUPPORTED",
-            "reason": "no SXU_PROGRAM or legacy renderer matched",
+            "reason": "no SXU_PROGRAM renderer matched",
             "missing_instructions": [],
             "notes": [],
             "op_counts": op_counts,
