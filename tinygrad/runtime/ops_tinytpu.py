@@ -259,6 +259,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return colred_desc
         if (rowred_desc := _render_rowreduce_sxu_program(uops)) is not None:
             return rowred_desc
+        if (fill_desc := _render_const_fill_sxu_program(uops)) is not None:
+            return fill_desc
         if (trans_desc := _render_transpose_sxu_program(uops)) is not None:
             return trans_desc
         if (cast_desc := _render_cast_sxu_program(uops)) is not None:
@@ -2034,6 +2036,63 @@ def _render_scalar_const_divmod_sxu_program(uops: list[UOp]) -> dict | None:
     all_instrs.append(_halt())
     return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
             "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
+
+
+def _render_const_fill_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render a pure STORE-CONST kernel (Tensor.zeros/ones/full) as broadcast store."""
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 1:
+        return None
+    out_arg = next(iter(params))
+    out_size = params[out_arg].dtype.size
+    if out_size <= 0:
+        return None
+    stores = [u for u in uops if u.op is Ops.STORE]
+    if not stores:
+        return None
+    # Every STORE must write the same CONST (directly or through CAST).
+    values = set()
+    for s in stores:
+        v = s.src[1]
+        while v.op in (Ops.CAST, Ops.VECTORIZE):
+            v = v.src[0] if len(v.src) > 0 else v
+        if v.op is not Ops.CONST:
+            return None
+        values.add(v.arg)
+    if len(values) != 1:
+        return None
+    const_val = next(iter(values))
+    if isinstance(const_val, bool):
+        const_bits = int(const_val)
+    elif isinstance(const_val, float):
+        const_bits = int(np.frombuffer(np.float32(const_val).tobytes(), dtype=np.int32)[0])
+    else:
+        const_bits = int(const_val)
+    # Reject anything besides STORE/CONST/PARAM/INDEX/CAST/VECTORIZE/GROUP/SINK/END/RANGE.
+    allowed = {"STORE", "CONST", "PARAM", "INDEX", "CAST", "VECTORIZE", "GROUP", "SINK", "END", "RANGE"}
+    op_counts = Counter(u.op.name for u in uops)
+    if any(c > 0 and n not in allowed for n, c in op_counts.items()):
+        return None
+
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    data_plan = [{
+        "type": "VMEM", "addr": 0, "layout": "broadcast_const",
+        "value": const_bits, "count": _TILE_ELEMS, "dtype": "int32",
+    }]
+    instructions = [_load(0, 0)]
+    outputs = []
+    for t in range(num_tiles):
+        offset = t * _TILE_ELEMS
+        count = min(_TILE_ELEMS, out_size - offset)
+        out_addr = 1 + t
+        instructions.append(_store(out_addr, 0))
+        outputs.append({"addr": out_addr, "param": out_arg, "offset": offset, "count": count})
+    instructions.append(_halt())
+    return {
+        "op": "SXU_PROGRAM", "primitive": "CONST_FILL",
+        "instructions": instructions, "data_plan": data_plan,
+        "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg,
+    }
 
 
 def _render_transpose_sxu_program(uops: list[UOp]) -> dict | None:
