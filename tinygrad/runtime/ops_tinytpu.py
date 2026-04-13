@@ -2143,7 +2143,11 @@ def _render_transpose_sxu_program(uops: list[UOp]) -> dict | None:
     store_idx_uops = []
     for s in stores:
         val = s.src[1]
-        store_idx_uops.append(s.src[0].src[1] if s.src[0].op is Ops.INDEX else None)
+        # Unwrap CAST on the address side too (float store addresses get bitcast wrapped).
+        addr = s.src[0]
+        while addr.op is Ops.CAST:
+            addr = addr.src[0]
+        store_idx_uops.append(addr.src[1] if addr.op is Ops.INDEX else None)
         while val.op is Ops.CAST:
             val = val.src[0]
         if val.op is Ops.VECTORIZE:
@@ -2180,14 +2184,10 @@ def _render_transpose_sxu_program(uops: list[UOp]) -> dict | None:
         return None
     store_consts = sorted(set(sum([_consts_in(u) for u in store_idx_uops], [])))
     load_consts = sorted(set(sum([_consts_in(u) for u in load_idx_uops], [])))
-    # Transpose addressing signature: the four LOADs span different rows of
-    # the source (offsets include 4, 8, 12 — the row strides), and each LOAD
-    # accesses a distinct INDEX UOp.
     if not ({4, 8, 12} <= set(load_consts)):
         return None
     if len({id(u) for u in load_idx_uops}) != 4:
         return None
-    # Reject pure reshape/copy (load/store const sets match exactly).
     if set(load_consts) == set(store_consts):
         return None
 
