@@ -1911,6 +1911,14 @@ def _render_min_const_sxu_program(uops: list[UOp]) -> dict | None:
     if len(params) != 2 or op_counts.get("STORE", 0) < 1 or op_counts.get("XOR", 0) == 0 or op_counts.get("MAX", 0) == 0:
         return None
 
+    # Reject chained max/min patterns (e.g. max(0).min(5)) where a MAX consumes
+    # another MAX's result. Those need the multi-step clip lowering, not a
+    # single-op VPU_MIN that drops the outer maximum.
+    if any(u.op is Ops.MAX and _has_load_src(u)
+           and any(_uop_contains(s, Ops.MAX) for s in u.src)
+           for u in uops):
+        return None
+
     min_const = _find_min_scalar_const(uops)
     out_size = params[0].dtype.size
     src_size = params[1].dtype.size
@@ -2364,9 +2372,6 @@ def _render_chained_const_sxu_program(uops: list[UOp]) -> dict | None:
     # Reject patterns that other renderers own.
     op_counts = Counter(u.op.name for u in uops)
     if any(op_counts.get(n, 0) for n in ("WHERE", "MOD", "RECIPROCAL", "TRUNC", "SELECT", "WMMA", "MULACC")):
-        return None
-    # Reject int-minimum decomposition (XOR+MAX) — owned by _render_min_const.
-    if any(u.op is Ops.XOR and _has_load_src(u) for u in uops):
         return None
 
     # Pick one representative STORE and walk its value expression to extract the
