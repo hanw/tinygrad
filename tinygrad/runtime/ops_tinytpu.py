@@ -253,6 +253,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return copy_desc
         if (recip_desc := _render_reciprocal_sxu_program(uops)) is not None:
             return recip_desc
+        if (trunc_desc := _render_trunc_sxu_program(uops)) is not None:
+            return trunc_desc
         if (divmod_desc := _render_scalar_const_divmod_sxu_program(uops)) is not None:
             return divmod_desc
         return _render_elementwise_sxu_program(uops)
@@ -1800,6 +1802,57 @@ def _find_alu_const(data_alu_uops: list[UOp], alu_op) -> int | None:
                 if src.op is Ops.CONST and isinstance(src.arg, bool):
                     return int(src.arg)
     return None
+
+def _render_trunc_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render float32 trunc() as SXU_PROGRAM via F2I+I2F round-trip.
+
+    Replaces the legacy HOST_UNARY TRUNC path. Pattern: single TRUNC UOp on float src.
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    if op_counts.get("TRUNC", 0) < 1:
+        return None
+    _allowed = {"TRUNC", "CONST", "INDEX", "LOAD", "STORE", "PARAM", "SINK",
+                "GROUP", "END", "RANGE", "VECTORIZE", "GEP", "MUL", "ADD", "CAST"}
+    if any(c > 0 and n not in _allowed for n, c in op_counts.items()):
+        return None
+    for u in uops:
+        if u.op in (Ops.MUL, Ops.ADD) and _has_load_src(u):
+            return None
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2 or 0 not in params:
+        return None
+    src_arg = next((k for k in params if k != 0), None)
+    if src_arg is None:
+        return None
+    if not ("float" in str(params[0].dtype) and "float" in str(params[src_arg].dtype)):
+        return None
+    out_size = params[0].dtype.size
+    src_size = params[src_arg].dtype.size
+    if out_size != src_size or out_size <= 0:
+        return None
+
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    all_instrs, data_plan, outputs = [], [], []
+    F2I_OP = _VPU_OPS["F2I"]
+    I2F_OP = _VPU_OPS["I2F"]
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count = min(_TILE_ELEMS, out_size - offset)
+        base = tile_idx * 2
+        data_plan.append({"type": "VMEM", "addr": base, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        out_vmem = base + 1
+        all_instrs += [
+            _load(0, base),
+            _vpu(1, 0, F2I_OP),
+            _vpu(2, 1, I2F_OP),
+            _store(out_vmem, 2),
+        ]
+        outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
+
 
 def _render_reciprocal_sxu_program(uops: list[UOp]) -> dict | None:
     """Render plain float32 reciprocal (1/x) as SXU_PROGRAM using VPU_FRECIP.
