@@ -269,6 +269,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return trunc_desc
         if (divmod_desc := _render_scalar_const_divmod_sxu_program(uops)) is not None:
             return divmod_desc
+        if (chain_desc := _render_chained_const_sxu_program(uops)) is not None:
+            return chain_desc
         return _render_elementwise_sxu_program(uops)
 
     wmma = wmmas[0]
@@ -2026,6 +2028,125 @@ def _render_scalar_const_divmod_sxu_program(uops: list[UOp]) -> dict | None:
                 _vpu(4, 0, SUB_OP, 3),   # v4 = x - v3
                 _store(out_vmem, 4),
             ]
+        outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
+
+
+def _render_chained_const_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render ((x op1 c1) op2 c2) integer/float kernels with one tensor input.
+
+    Handles two chained scalar-const binary ops where the second operates on
+    the result of the first. Exactly one tensor param, exactly two distinct
+    data-path ALU op kinds, each with one LOAD-derived operand and one CONST.
+    """
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2:
+        return None
+    out_params = set()
+    for s in uops:
+        if s.op is Ops.STORE:
+            p = _find_unique_param_arg(s.src[0])
+            if p is not None: out_params.add(p)
+    if len(out_params) != 1:
+        return None
+    out_arg = next(iter(out_params))
+    src_params = [k for k in params if k != out_arg]
+    if len(src_params) != 1:
+        return None
+    src_arg = src_params[0]
+    out_size = params[out_arg].dtype.size
+    src_size = params[src_arg].dtype.size
+    if out_size <= 0 or out_size != src_size:
+        return None
+
+    data_alu = [u for u in uops if u.op in _ALU_OPS and _has_load_src(u)]
+    if not data_alu:
+        return None
+    ops_seen = {u.op for u in data_alu}
+    if len(ops_seen) != 2:
+        return None
+    # Reject patterns that other renderers own (WHERE/CMPLT/DIV/MOD etc).
+    op_counts = Counter(u.op.name for u in uops)
+    if any(op_counts.get(n, 0) for n in ("WHERE", "MOD", "RECIPROCAL", "TRUNC", "SELECT", "WMMA", "MULACC")):
+        return None
+
+    # Find the second (outer) ALU op: one whose src contains another data-path
+    # ALU, plus a CONST. The inner is an ALU whose srcs are LOAD + CONST.
+    outer, inner = None, None
+    for u in data_alu:
+        alu_src = next((s for s in u.src if s in set(data_alu)), None)
+        const_src = next((s for s in u.src if s.op is Ops.CONST and not isinstance(s.arg, bool)), None)
+        if alu_src is not None and const_src is not None:
+            outer = u
+            inner = alu_src
+            break
+    if outer is None or inner is None:
+        return None
+    if inner.op is not any and inner not in data_alu:
+        return None
+    inner_const = next((s for s in inner.src if s.op is Ops.CONST and not isinstance(s.arg, bool)), None)
+    outer_const = next((s for s in outer.src if s.op is Ops.CONST and not isinstance(s.arg, bool)), None)
+    if inner_const is None or outer_const is None:
+        return None
+    # Both the outer and inner op kinds must appear in equal count (one per element).
+    outer_count = sum(1 for u in data_alu if u.op is outer.op)
+    inner_count = sum(1 for u in data_alu if u.op is inner.op)
+    if outer_count != inner_count or outer_count * 2 != len(data_alu):
+        return None
+
+    is_float = "float" in str(params[out_arg].dtype) or "float" in str(params[src_arg].dtype)
+    float_remap = {"ADD": "FADD", "MUL": "FMUL", "SUB": "FSUB", "MAX": "FMAX", "CMPLT": "FCMPLT"}
+    inner_name = _ALU_OPS[inner.op]
+    outer_name = _ALU_OPS[outer.op]
+    if is_float:
+        inner_name = float_remap.get(inner_name, inner_name)
+        outer_name = float_remap.get(outer_name, outer_name)
+    if inner_name not in _VPU_OPS or outer_name not in _VPU_OPS:
+        return None
+    inner_vpu = _VPU_OPS[inner_name]
+    outer_vpu = _VPU_OPS[outer_name]
+
+    def _bits(c):
+        if is_float and isinstance(c, float):
+            return int(np.frombuffer(np.float32(c).tobytes(), dtype=np.int32)[0])
+        return int(c)
+    inner_c_bits = _bits(inner_const.arg)
+    outer_c_bits = _bits(outer_const.arg)
+
+    # Determine operand order for non-commutative ops
+    def _src_is_lhs(u):
+        # src[0] is the data operand (LOAD-derived or inner ALU)
+        if u is outer:
+            return u.src[0] is inner
+        # inner: src[0] has LOAD
+        return _has_load_src(u.src[0]) if len(u.src) > 0 else True
+    inner_src_is_lhs = _src_is_lhs(inner)
+    outer_src_is_lhs = _src_is_lhs(outer)
+
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    addrs_per_tile = 4  # src, inner_const, outer_const, out
+    all_instrs, data_plan, outputs = [], [], []
+    for tile_idx in range(num_tiles):
+        base = tile_idx * addrs_per_tile
+        offset = tile_idx * _TILE_ELEMS
+        count = min(_TILE_ELEMS, out_size - offset)
+        data_plan.append({"type": "VMEM", "addr": base, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        data_plan.append({"type": "VMEM", "addr": base + 1, "layout": "broadcast_const",
+                          "value": inner_c_bits, "count": count, "dtype": "int32"})
+        data_plan.append({"type": "VMEM", "addr": base + 2, "layout": "broadcast_const",
+                          "value": outer_c_bits, "count": count, "dtype": "int32"})
+        out_vmem = base + 3
+        # v0=src, v1=inner_const, v2=outer_const
+        # v3 = v0 op_inner v1 (or v1 op_inner v0 if const is lhs)
+        va, vb = (0, 1) if inner_src_is_lhs else (1, 0)
+        all_instrs += [_load(0, base), _load(1, base + 1), _load(2, base + 2),
+                       _vpu(3, va, inner_vpu, vb)]
+        # v4 = v3 op_outer v2 (or v2 op_outer v3)
+        va, vb = (3, 2) if outer_src_is_lhs else (2, 3)
+        all_instrs += [_vpu(4, va, outer_vpu, vb), _store(out_vmem, 4)]
         outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
     all_instrs.append(_halt())
     return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
