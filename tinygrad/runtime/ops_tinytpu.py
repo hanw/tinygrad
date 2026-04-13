@@ -1435,7 +1435,7 @@ def _render_where_sxu_program(uops: list[UOp]) -> dict | None:
     if op_counts.get("WHERE", 0) == 0:
         return None
     params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
-    if len(params) not in (2, 4):
+    if len(params) not in (2, 3, 4):
         return None
 
     # Find output param
@@ -1461,29 +1461,53 @@ def _render_where_sxu_program(uops: list[UOp]) -> dict | None:
     rhs_arg = _find_unique_param_arg(where_uop.src[2])
     lhs_const = None
     rhs_const = None
-    # Only the 2-param shape (out + cond) supports CONST lhs/rhs. For the
-    # 4-param shape we keep the original strict tensor requirement.
-    if len(params) == 2:
+    # 2-param (out+cond) / 3-param (out+cond+tensor) shapes allow CONST for the
+    # missing lhs/rhs. 4-param keeps original strict tensor requirement.
+    if len(params) in (2, 3):
         # Reject kernels with any data-path ALU (abs = MUL + WHERE, etc.).
         if sum(_data_alu_ops(uops).values()) > 0:
             return None
-        # All WHEREs must have CONST lhs/rhs (not a first-WHERE quirk).
-        where_consts = None
+        # Extract CONST sides that are consistent across every WHERE.
+        where_lhs_const = None
+        where_rhs_const = None
+        lhs_kind = rhs_kind = None  # "const" or "param"
         for w in uops:
-            if w.op is Ops.WHERE:
-                if w.src[1].op is not Ops.CONST or w.src[2].op is not Ops.CONST:
-                    return None
-                if isinstance(w.src[1].arg, bool) or isinstance(w.src[2].arg, bool):
-                    return None
-                pair = (w.src[1].arg, w.src[2].arg)
-                if where_consts is None:
-                    where_consts = pair
-                elif where_consts != pair:
-                    return None
-        if where_consts is None:
-            return None
-        lhs_const, rhs_const = where_consts
+            if w.op is not Ops.WHERE:
+                continue
+            for side, src in (("lhs", w.src[1]), ("rhs", w.src[2])):
+                if src.op is Ops.CONST and not isinstance(src.arg, bool):
+                    if side == "lhs":
+                        if lhs_kind == "param": return None
+                        lhs_kind = "const"
+                        if where_lhs_const is None: where_lhs_const = src.arg
+                        elif where_lhs_const != src.arg: return None
+                    else:
+                        if rhs_kind == "param": return None
+                        rhs_kind = "const"
+                        if where_rhs_const is None: where_rhs_const = src.arg
+                        elif where_rhs_const != src.arg: return None
+                else:
+                    # The side must resolve to a tensor param.
+                    p = _find_unique_param_arg(src)
+                    if p is None:
+                        return None
+                    if side == "lhs":
+                        if lhs_kind == "const": return None
+                        lhs_kind = "param"
+                        if lhs_arg is None: lhs_arg = p
+                        elif lhs_arg != p: return None
+                    else:
+                        if rhs_kind == "const": return None
+                        rhs_kind = "param"
+                        if rhs_arg is None: rhs_arg = p
+                        elif rhs_arg != p: return None
+        lhs_const = where_lhs_const if lhs_kind == "const" else None
+        rhs_const = where_rhs_const if rhs_kind == "const" else None
         if cond_arg is None or cond_arg not in input_args:
+            return None
+        # Tensor inputs used must match input_args exactly.
+        tensor_inputs = sorted({a for a in (cond_arg, lhs_arg, rhs_arg) if a is not None})
+        if tensor_inputs != sorted(input_args):
             return None
     else:
         if cond_arg is None or lhs_arg is None or rhs_arg is None:
