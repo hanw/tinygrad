@@ -400,23 +400,16 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
     out_vmem_base = num_weight_tiles if has_bias else 0
 
     # PSUM accumulation path eliminates the VPU_ADD chain and per-K
-    # LOAD_MXU_RESULT for multi-K-tile GEMM. Requires a zero tile in
-    # VMEM past the outputs to clear the bucket before each chain.
+    # LOAD_MXU_RESULT for multi-K-tile GEMM. SXU_PSUM_CLEAR zeroes the
+    # bucket in one cycle, so no zero-tile preload is needed.
     use_psum = num_k_tiles > 1
-    zero_vmem_addr = out_vmem_base + num_vecs * num_weight_tiles
-    if use_psum:
-        data_plan.append({
-            "type": "VMEM", "addr": zero_vmem_addr,
-            "layout": "broadcast_const", "value": 0,
-            "count": _TILE_ELEMS, "dtype": "int32",
-        })
 
     # Generate SXU instructions
     instructions = _generate_gemm_sxu_instructions(
         num_vecs, num_k_tiles, num_weight_tiles,
         has_bias=has_bias, bias_vmem_base=bias_vmem_base,
         has_relu=has_relu,
-        use_psum=use_psum, zero_vmem_addr=zero_vmem_addr,
+        use_psum=use_psum,
     )
     outputs: list[dict] = []
     for row in range(num_vecs):
@@ -2998,32 +2991,25 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
 def _generate_gemm_sxu_instructions(num_vecs: int, num_k_tiles: int, num_weight_tiles: int,
                                      *, has_bias: bool = False, bias_vmem_base: int = 0,
                                      has_relu: bool = False,
-                                     use_psum: bool = False,
-                                     zero_vmem_addr: int = 0) -> list[str]:
+                                     use_psum: bool = False) -> list[str]:
     """Generate SXU instruction strings for a GEMM kernel.
 
     When use_psum=True and num_k_tiles>1, accumulate K-tiles in the
     PSUM bucket bank instead of reading each partial into a vreg and
     chaining VPU_ADDs. This eliminates num_k_tiles-1 VPU_ADDs and
-    num_k_tiles LOAD_MXU_RESULT instructions per output tile. The
-    caller must preload a zero tile into VMEM[zero_vmem_addr].
+    num_k_tiles LOAD_MXU_RESULT instructions per output tile.
     """
     out_vmem_base = num_weight_tiles if has_bias else 0
     prog_lines: list[str] = []
 
     psum_path = use_psum and num_k_tiles > 1
-    ZERO_VREG = 15
-    if psum_path:
-        prog_lines.append(_load(ZERO_VREG, zero_vmem_addr))
 
     for row in range(num_vecs):
         for tile_idx in range(num_weight_tiles):
             if psum_path:
-                # Clear bucket 0 to zero (whole tile), then accumulate
-                # every K-tile into bucket 0 row 0. Reuse the same
-                # bucket across (row, tile_idx) — the clear+acc chain
-                # is sequential so no aliasing.
-                prog_lines.append(f"2 15 0 0 {ZERO_VREG} 0 0 0 0 0")  # PSUM_WRITE psum[0]:=v15
+                # Zero bucket 0 in one cycle, accumulate every K-tile
+                # into row 0, then extract the accumulated row into v0.
+                prog_lines.append(_psum_clear(0))
                 for k in range(num_k_tiles):
                     wmem_addr = k * num_weight_tiles + tile_idx
                     amem_addr = row * num_k_tiles + k
@@ -3919,6 +3905,12 @@ def _psum_read_row(vd: int, psum_addr: int, psum_row: int) -> str:
     # LOAD_MXU_RESULT, so downstream bias/relu/store don't care that
     # the row came from PSUM.
     return f"2 18 {psum_addr} {vd} {psum_row} 0 0 0 0 0"
+
+def _psum_clear(psum_addr: int) -> str:
+    # SXU_PSUM_CLEAR opcode = 19. Zeros the whole bucket in one cycle
+    # without touching any vreg, so multi-K-tile GEMM can drop the
+    # "preload zero tile + LOAD v15 + PSUM_WRITE" boilerplate.
+    return f"2 19 {psum_addr} 0 0 0 0 0 0 0"
 
 def _wait_mxu() -> str: return "2 5 0 0 0 0 0 0 0 0"
 def _load_mxu_result(vd: int) -> str: return f"2 6 0 {vd} 0 0 0 0 0 0"
