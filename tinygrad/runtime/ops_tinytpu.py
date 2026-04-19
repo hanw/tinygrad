@@ -279,6 +279,11 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return min_const_desc
         if (multi_desc := _render_multistep_sxu_program(uops)) is not None:
             return multi_desc
+        # PAD before row-broadcast: pad kernels have mixed LOAD / CONST(0)
+        # stores, which the row-broadcast renderer would otherwise try to
+        # match and emit a wrong BROADCAST_ROW program for.
+        if (pad_desc := _render_pad_sxu_program(uops)) is not None:
+            return pad_desc
         if (colbc_desc := _render_colbc_sxu_program(uops)) is not None:
             return colbc_desc
         if (rowbc_desc := _render_rowbc_sxu_program(uops)) is not None:
@@ -946,6 +951,94 @@ def _render_cast_sxu_program(uops: list[UOp]) -> dict | None:
     all_instrs.append(_halt())
     return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
             "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
+
+
+def _render_pad_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render PAD kernels as a single-tile LOAD/STORE with a PAD_FILL VMEM
+    preload that scatters source positions into the padded output layout
+    and zero-fills everything else.
+
+    Tinygrad PAD pattern: N STOREs for a larger output than source, where
+    each STORE's value is either LOAD(src[i]) or CONST(0). No ALU ops.
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    if not op_counts.get("STORE") or not op_counts.get("LOAD"):
+        return None
+    # PAD is pure movement: no data-path ALU, no ternary or conversion ops.
+    data_alu = _data_alu_ops(uops)
+    if sum(data_alu.values()) > 0:
+        return None
+    for n in ("WHERE", "MOD", "RECIP", "RECIPROCAL", "TRUNC", "WMMA", "MULACC",
+              "SELECT", "CAST"):
+        if op_counts.get(n, 0):
+            return None
+
+    stores = [u for u in uops if u.op is Ops.STORE]
+    if op_counts.get("LOAD", 0) >= len(stores):
+        return None  # no zero-fills -> this is a plain copy, not pad
+
+    # Extract per-STORE info: (dst_pos, src_pos or None for zero-fill).
+    def _const_tail(idx_uop):
+        # Walk an INDEX chain and return the final integer CONST position.
+        if idx_uop.op is not Ops.INDEX:
+            return None
+        last = idx_uop.src[-1]
+        if last.op is Ops.CONST and isinstance(last.arg, int):
+            return int(last.arg)
+        return None
+
+    def _load_src_pos(load_uop):
+        if load_uop.op is not Ops.LOAD:
+            return None
+        return _const_tail(load_uop.src[0])
+
+    pad_map: list[tuple[int, int | None]] = []  # (dst_pos, src_pos or None)
+    out_params: set = set()
+    src_params: set = set()
+    for s in stores:
+        dst = _const_tail(s.src[0])
+        if dst is None:
+            return None
+        out_param = _find_unique_param_arg(s.src[0])
+        out_params.add(out_param)
+        val = s.src[1]
+        if val.op is Ops.CONST:
+            if val.arg != 0:
+                return None  # only zero-pad for now
+            pad_map.append((dst, None))
+        elif val.op is Ops.LOAD:
+            sp = _load_src_pos(val)
+            if sp is None:
+                return None
+            pad_map.append((dst, sp))
+            src_params.add(_find_unique_param_arg(val.src[0]))
+        else:
+            return None
+
+    if len(out_params) != 1 or len(src_params) != 1:
+        return None
+    out_arg = next(iter(out_params))
+    src_arg = next(iter(src_params))
+
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    out_size = params[out_arg].dtype.size
+    src_size = params[src_arg].dtype.size
+    if out_size > _TILE_ELEMS or src_size > _TILE_ELEMS:
+        return None  # single-tile only for now
+
+    # Pad all CONST stores to 0 slot, LOAD stores to source. Preloaded VMEM
+    # tile is the padded output; the SXU program copies it straight through.
+    data_plan = [{
+        "type": "VMEM", "addr": 0, "param": src_arg,
+        "mode": "PAD_FILL", "pad_map": pad_map,
+        "offset": 0, "count": _TILE_ELEMS, "dtype": "int32",
+    }]
+    all_instrs = [_load(0, 0), _store(1, 0), _halt()]
+    outputs = [{"addr": 1, "param": out_arg, "offset": 0, "count": out_size}]
+    return {
+        "op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+        "outputs": outputs, "num_output_tiles": 1, "out": out_arg,
+    }
 
 
 def _render_copy_sxu_program(uops: list[UOp]) -> dict | None:
@@ -4189,6 +4282,18 @@ class TinyTPUProgram:
                         for i in range(_COLS):
                             tile[i] = int(raw[t*_COLS+i])
                         data_lines.append(_vmem(addr+t, tile))
+                elif mode == "PAD_FILL":
+                    # Scatter source positions into the output tile per the
+                    # renderer-supplied dst->src map; unlisted positions stay
+                    # at zero (pad_value defaults to 0). Single-tile only.
+                    pad_val = int(entry.get("pad_value", 0))
+                    tile = [pad_val] * _TILE_ELEMS
+                    for dst, src in entry["pad_map"]:
+                        if src is None:
+                            continue
+                        if 0 <= src < len(raw):
+                            tile[dst] = int(raw[src])
+                    data_lines.append(_vmem(addr, tile))
                 elif mode == "MATRIX_TILE":
                     # Pack matrix[row_base:row_base+tile_rows, col_base:col_base+tile_cols]
                     # into a 4x4 tile with pad_value fill for out-of-bounds cells.
