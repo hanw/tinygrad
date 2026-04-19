@@ -104,6 +104,25 @@ class TinyTPUCompiler(Compiler):
 # Legacy descriptor renderer — handles patterns not yet migrated to SXU_PROGRAM
 # ---------------------------------------------------------------------------
 
+def _is_float_min_negation(uops: list[UOp]) -> bool:
+    """True if the UOp kernel matches tinygrad's float-MIN decomposition:
+       MUL(MAX(..., MUL(load_i, -1.0), ...), -1.0). Used by scalar/row/col
+       reducers to rewrite to FMIN_REDUCE{,_COL} instead of FMAX.
+    """
+    stores = [u for u in uops if u.op is Ops.STORE]
+    if len(stores) != 1:
+        return False
+    sv = stores[0].src[1]
+    def _is_neg_one(u):
+        return (u.op is Ops.CONST and isinstance(u.arg, float)
+                and float(u.arg) == -1.0)
+    outer_ok = (sv.op is Ops.MUL and len(sv.src) == 2
+                and any(_is_neg_one(s) for s in sv.src))
+    data_muls = [u for u in uops if u.op is Ops.MUL and _has_load_src(u)]
+    inner_ok = all(any(_is_neg_one(s) for s in u.src) for u in data_muls)
+    return outer_ok and inner_ok and len(data_muls) >= 1
+
+
 def _detect_reduce_op(op_counts: Counter, data_alu: Counter | None = None) -> str | None:
     """Detect SUM/MAX/MIN/PROD from UOp op counts.
 
@@ -452,24 +471,17 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
     #   back to "unsupported" if the pattern doesn't match).
     if is_float and has_xor:
         return None
-    is_float_min = False
-    if is_float and has_max and _data_alu_ops(uops).get("MUL", 0) > 0:
-        stores_for_min = [u for u in uops if u.op is Ops.STORE]
-        if len(stores_for_min) == 1:
-            sv = stores_for_min[0].src[1]
-            def _is_neg_one(u):
-                return (u.op is Ops.CONST and isinstance(u.arg, float)
-                        and float(u.arg) == -1.0)
-            # Outer MUL(tree, CONST(-1.0))
-            outer_ok = (sv.op is Ops.MUL and len(sv.src) == 2 and
-                        any(_is_neg_one(s) for s in sv.src))
-            # Every data-path MUL must be MUL(x, CONST(-1.0))
-            data_muls = [u for u in uops if u.op is Ops.MUL and _has_load_src(u)]
-            inner_ok = all(any(_is_neg_one(s) for s in u.src) for u in data_muls)
-            if outer_ok and inner_ok and len(data_muls) >= 1:
-                is_float_min = True
-        if not is_float_min:
-            return None
+    is_float_min = (is_float and has_max
+                    and _data_alu_ops(uops).get("MUL", 0) > 0
+                    and _is_float_min_negation(uops))
+    if (is_float and has_max
+        and _data_alu_ops(uops).get("MUL", 0) > 0
+        and not is_float_min):
+        # Has data-path MULs on a float MAX kernel but not the negation
+        # signature — we can't safely lower this without producing wrong
+        # results (e.g. float-min wrapped around something we don't yet
+        # understand). Bail out.
+        return None
 
     # If the stored value is ADD(tree, CONST) or MUL(tree, CONST) where the tree
     # does the reduction and the CONST is a post-reduction scalar op, detect
@@ -642,15 +654,17 @@ def _render_colreduce_sxu_program(uops: list[UOp]) -> dict | None:
     nrows = src_size // ncols
 
     is_float_col = any("float" in str(p.dtype) for p in params)
-    # Float col-reductions: SUM and MAX lower directly to FSUM/FMAX
-    # COL opcodes. Float MIN uses the negation-around-max decomposition
-    # detected in the scalar renderer; for the col path we'd need to
-    # rewrite the same pattern, which is not done yet.
+    # Float col-reductions: SUM and MAX lower directly. Float MIN uses the
+    # same MUL(-1.0)+MAX+MUL(-1.0) negation decomposition as the scalar
+    # path; detect the signature and rewrite reduce_op to "MIN".
     if is_float_col:
         if reduce_op == "PROD":
             return None
         if reduce_op == "MAX" and data_alu.get("MUL", 0) > 0:
-            return None  # float-min decomp through col-max not yet rewritten
+            if _is_float_min_negation(uops):
+                reduce_op = "MIN"
+            else:
+                return None
 
     _INT32_MIN = -(1 << 31)
     _INT32_MAX = (1 << 31) - 1
@@ -757,16 +771,17 @@ def _render_rowreduce_sxu_program(uops: list[UOp]) -> dict | None:
     nloads = op_counts.get("LOAD", 0)
     if nloads != ncols and nloads != 1: return None
     is_float_row = any("float" in str(p.dtype) for p in params)
-    # Float row reductions: SUM via direct MAX/MIN tree (no negation dance
-    # because both operands come from the same row), and PROD not supported.
-    # tinygrad's float MIN still decomposes via MUL(-1)+MAX which this
-    # renderer does not yet handle for row form; treat as unsupported.
+    # Float row reductions: SUM and MAX lower directly; MIN via the
+    # negation-decomp rewrite shared with the scalar/col paths.
     if is_float_row:
         if reduce_op == "PROD":
             return None
         data_alu = _data_alu_ops(uops)
         if reduce_op == "MAX" and data_alu.get("MUL", 0) > 0:
-            return None  # float-min decomp through row-max not yet rewritten
+            if _is_float_min_negation(uops):
+                reduce_op = "MIN"
+            else:
+                return None
     _INT32_MIN = -(1 << 31)
     _INT32_MAX = (1 << 31) - 1
     _FLOAT_NEG_INF_BITS = -(1 << 23)     # 0xFF800000
