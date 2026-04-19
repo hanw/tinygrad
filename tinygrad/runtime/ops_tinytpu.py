@@ -33,7 +33,8 @@ _VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "SUM_REDUCE": 4, "CMPLT": 5, "CMPNE": 
              "FSUM_REDUCE_TILE": 38, "FMAX_REDUCE_TILE": 39, "FMIN_REDUCE_TILE": 40,
              "FMIN": 41,
              "FSUM_REDUCE": 42, "FMAX_REDUCE": 43, "FMIN_REDUCE": 44,
-             "FSUM_REDUCE_COL": 45, "FMAX_REDUCE_COL": 46, "FMIN_REDUCE_COL": 47}
+             "FSUM_REDUCE_COL": 45, "FMAX_REDUCE_COL": 46, "FMIN_REDUCE_COL": 47,
+             "FPROD_REDUCE_TILE": 48}
 _VPU_BOOL_OPS = {_VPU_OPS["CMPLT"], _VPU_OPS["CMPNE"], _VPU_OPS["CMPEQ"]}
 _SXU_OPS = {"LOAD_VREG": 0, "STORE_VREG": 1, "DISPATCH_VPU": 2, "DISPATCH_XLU_BROADCAST": 3, "DISPATCH_MXU": 4, "WAIT_MXU": 5, "LOAD_MXU_RESULT": 6, "HALT": 7, "DISPATCH_SELECT": 8, "BROADCAST_SCALAR": 9, "BROADCAST_ROW": 10, "BROADCAST_COL": 11, "DISPATCH_XLU_TRANSPOSE": 12}
 
@@ -525,7 +526,15 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
     pad_value = 0
     _FLOAT_NEG_INF_BITS = -(1 << 23)  # 0xFF800000 as signed int32 = -8388608
     _FLOAT_POS_INF_BITS = 0x7F800000  # +inf as unsigned 32-bit
-    if is_float_min:
+    _FLOAT_ONE_BITS     = 0x3F800000  # 1.0 (multiplicative identity)
+    if is_float and has_data_mul and not has_add and not has_max and not is_float_min:
+        # Float prod reduction: MUL on the data path, no MAX or ADD. Same
+        # shape as integer prod but uses the FpReducer via FPROD_REDUCE_TILE
+        # and FMUL for multi-tile combine.
+        vpu_op = _VPU_OPS["FPROD_REDUCE_TILE"]
+        combine_op = _VPU_OPS["FMUL"]
+        pad_value = _FLOAT_ONE_BITS
+    elif is_float_min:
         # Float min via negation-around-max. We read the ORIGINAL data
         # (pre-negation) and reduce with FMIN_REDUCE_TILE; the inner MUL(-1)
         # cancels the outer MUL(-1), so the emitted kernel is just a plain
@@ -568,7 +577,8 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
                       _VPU_OPS["MUL_REDUCE_TILE"]: "prod",
                       _VPU_OPS["FSUM_REDUCE_TILE"]: "sum",
                       _VPU_OPS["FMAX_REDUCE_TILE"]: "max",
-                      _VPU_OPS["FMIN_REDUCE_TILE"]: "min"}
+                      _VPU_OPS["FMIN_REDUCE_TILE"]: "min",
+                      _VPU_OPS["FPROD_REDUCE_TILE"]: "prod"}
 
     # Scalar reduction
     num_tiles = (src_size + _TILE_ELEMS - 1) // _TILE_ELEMS
