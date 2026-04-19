@@ -3912,6 +3912,14 @@ def _psum_clear(psum_addr: int) -> str:
     # "preload zero tile + LOAD v15 + PSUM_WRITE" boilerplate.
     return f"2 19 {psum_addr} 0 0 0 0 0 0 0"
 
+def _set_pred_if_zero(vs: int) -> str:
+    # SXU_SET_PRED_IF_ZERO opcode = 20; pred := (vs[0][0] == 0).
+    return f"2 20 0 0 {vs} 0 0 0 0 0"
+
+def _skip_if_pred() -> str:
+    # SXU_SKIP_IF_PRED opcode = 21; if pred, skip the next instruction.
+    return f"2 21 0 0 0 0 0 0 0 0"
+
 def _wait_mxu() -> str: return "2 5 0 0 0 0 0 0 0 0"
 def _load_mxu_result(vd: int) -> str: return f"2 6 0 {vd} 0 0 0 0 0 0"
 
