@@ -30,7 +30,8 @@ _VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "SUM_REDUCE": 4, "CMPLT": 5, "CMPNE": 
              "SUM_REDUCE_COL": 29, "MAX_REDUCE_COL": 30, "MIN_REDUCE_COL": 31,
              "SUM_REDUCE_TILE": 32, "MAX_REDUCE_TILE": 33, "MIN_REDUCE_TILE": 34,
              "MUL_REDUCE": 35, "MUL_REDUCE_COL": 36, "MUL_REDUCE_TILE": 37,
-             "FSUM_REDUCE_TILE": 38, "FMAX_REDUCE_TILE": 39, "FMIN_REDUCE_TILE": 40}
+             "FSUM_REDUCE_TILE": 38, "FMAX_REDUCE_TILE": 39, "FMIN_REDUCE_TILE": 40,
+             "FMIN": 41}
 _VPU_BOOL_OPS = {_VPU_OPS["CMPLT"], _VPU_OPS["CMPNE"], _VPU_OPS["CMPEQ"]}
 _SXU_OPS = {"LOAD_VREG": 0, "STORE_VREG": 1, "DISPATCH_VPU": 2, "DISPATCH_XLU_BROADCAST": 3, "DISPATCH_MXU": 4, "WAIT_MXU": 5, "LOAD_MXU_RESULT": 6, "HALT": 7, "DISPATCH_SELECT": 8, "BROADCAST_SCALAR": 9, "BROADCAST_ROW": 10, "BROADCAST_COL": 11, "DISPATCH_XLU_TRANSPOSE": 12}
 
@@ -514,13 +515,9 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
         # Float min via negation-around-max. We read the ORIGINAL data
         # (pre-negation) and reduce with FMIN_REDUCE_TILE; the inner MUL(-1)
         # cancels the outer MUL(-1), so the emitted kernel is just a plain
-        # float min with +inf pad. Multi-tile float min needs a VPU_FMIN
-        # ALU opcode (not yet implemented), so we restrict this path to
-        # kernels that fit in a single 16-element tile.
-        if src_size > _TILE_ELEMS:
-            return None
+        # float min with +inf pad. Multi-tile combine uses VPU_FMIN.
         vpu_op = _VPU_OPS["FMIN_REDUCE_TILE"]
-        combine_op = None  # unused: single-tile only
+        combine_op = _VPU_OPS["FMIN"]
         pad_value = _FLOAT_POS_INF_BITS
     elif is_float and has_add and not has_max:
         # Float tile-sum pads with +0.0, which has bit pattern 0x00000000
