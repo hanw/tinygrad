@@ -30,7 +30,7 @@ _VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "SUM_REDUCE": 4, "CMPLT": 5, "CMPNE": 
              "SUM_REDUCE_COL": 29, "MAX_REDUCE_COL": 30, "MIN_REDUCE_COL": 31,
              "SUM_REDUCE_TILE": 32, "MAX_REDUCE_TILE": 33, "MIN_REDUCE_TILE": 34,
              "MUL_REDUCE": 35, "MUL_REDUCE_COL": 36, "MUL_REDUCE_TILE": 37,
-             "FSUM_REDUCE_TILE": 38, "FMAX_REDUCE_TILE": 39}
+             "FSUM_REDUCE_TILE": 38, "FMAX_REDUCE_TILE": 39, "FMIN_REDUCE_TILE": 40}
 _VPU_BOOL_OPS = {_VPU_OPS["CMPLT"], _VPU_OPS["CMPNE"], _VPU_OPS["CMPEQ"]}
 _SXU_OPS = {"LOAD_VREG": 0, "STORE_VREG": 1, "DISPATCH_VPU": 2, "DISPATCH_XLU_BROADCAST": 3, "DISPATCH_MXU": 4, "WAIT_MXU": 5, "LOAD_MXU_RESULT": 6, "HALT": 7, "DISPATCH_SELECT": 8, "BROADCAST_SCALAR": 9, "BROADCAST_ROW": 10, "BROADCAST_COL": 11, "DISPATCH_XLU_TRANSPOSE": 12}
 
@@ -439,18 +439,34 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
     if not has_store:
         return None
 
-    # Float reductions: sum and max supported today. Min/prod need dedicated
-    # float reducer opcodes which do not exist yet.
+    # Float reductions: sum, max, min supported today. Prod still needs its
+    # own reducer opcode.
     # - Integer MIN decomposes to XOR+MAX (has_xor catches it).
-    # - Float MIN decomposes via negation: MUL(-1) on both inputs and outputs
-    #   wrapping a MAX. If the kernel is float and has any data-path MULs,
-    #   it's the float-MIN decomposition (or some other MUL-using reduction
-    #   we don't understand yet); reject so FMAX_REDUCE_TILE doesn't quietly
-    #   produce the wrong answer.
+    # - Float MIN decomposes via negation: tinygrad emits
+    #     MUL(MAX(..., MUL(load_i, -1.0), ...), -1.0)
+    #   i.e. negate each leaf, take max, negate the result. We detect this
+    #   signature so we can rewrite to FMIN_REDUCE_TILE directly (and fall
+    #   back to "unsupported" if the pattern doesn't match).
     if is_float and has_xor:
         return None
+    is_float_min = False
     if is_float and has_max and _data_alu_ops(uops).get("MUL", 0) > 0:
-        return None
+        stores_for_min = [u for u in uops if u.op is Ops.STORE]
+        if len(stores_for_min) == 1:
+            sv = stores_for_min[0].src[1]
+            def _is_neg_one(u):
+                return (u.op is Ops.CONST and isinstance(u.arg, float)
+                        and float(u.arg) == -1.0)
+            # Outer MUL(tree, CONST(-1.0))
+            outer_ok = (sv.op is Ops.MUL and len(sv.src) == 2 and
+                        any(_is_neg_one(s) for s in sv.src))
+            # Every data-path MUL must be MUL(x, CONST(-1.0))
+            data_muls = [u for u in uops if u.op is Ops.MUL and _has_load_src(u)]
+            inner_ok = all(any(_is_neg_one(s) for s in u.src) for u in data_muls)
+            if outer_ok and inner_ok and len(data_muls) >= 1:
+                is_float_min = True
+        if not is_float_min:
+            return None
 
     # If the stored value is ADD(tree, CONST) or MUL(tree, CONST) where the tree
     # does the reduction and the CONST is a post-reduction scalar op, detect
@@ -493,7 +509,20 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
     _INT32_MAX = (1 << 31) - 1
     pad_value = 0
     _FLOAT_NEG_INF_BITS = -(1 << 23)  # 0xFF800000 as signed int32 = -8388608
-    if is_float and has_add and not has_max:
+    _FLOAT_POS_INF_BITS = 0x7F800000  # +inf as unsigned 32-bit
+    if is_float_min:
+        # Float min via negation-around-max. We read the ORIGINAL data
+        # (pre-negation) and reduce with FMIN_REDUCE_TILE; the inner MUL(-1)
+        # cancels the outer MUL(-1), so the emitted kernel is just a plain
+        # float min with +inf pad. Multi-tile float min needs a VPU_FMIN
+        # ALU opcode (not yet implemented), so we restrict this path to
+        # kernels that fit in a single 16-element tile.
+        if src_size > _TILE_ELEMS:
+            return None
+        vpu_op = _VPU_OPS["FMIN_REDUCE_TILE"]
+        combine_op = None  # unused: single-tile only
+        pad_value = _FLOAT_POS_INF_BITS
+    elif is_float and has_add and not has_max:
         # Float tile-sum pads with +0.0, which has bit pattern 0x00000000
         # — same as integer zero — so pad_value stays 0.
         vpu_op = _VPU_OPS["FSUM_REDUCE_TILE"]
@@ -527,7 +556,8 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
                       _VPU_OPS["MIN_REDUCE_TILE"]: "min",
                       _VPU_OPS["MUL_REDUCE_TILE"]: "prod",
                       _VPU_OPS["FSUM_REDUCE_TILE"]: "sum",
-                      _VPU_OPS["FMAX_REDUCE_TILE"]: "max"}
+                      _VPU_OPS["FMAX_REDUCE_TILE"]: "max",
+                      _VPU_OPS["FMIN_REDUCE_TILE"]: "min"}
 
     # Scalar reduction
     num_tiles = (src_size + _TILE_ELEMS - 1) // _TILE_ELEMS
