@@ -450,15 +450,17 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
                               and not isinstance(s.arg, bool)), None)
             tree_src = next((s for s in val.src if s is not const_src), None)
             if const_src is not None and tree_src is not None and _has_load_src(tree_src):
-                # Tree must itself be a reduction expression (contains the src LOAD
-                # plus ADD/MAX/XOR per reduction kind) but *not* another ADD/MUL
-                # that references the same const again. Heuristic: the CONST
-                # should be used by exactly one ALU op in the whole kernel.
-                const_uses = sum(1 for u in uops
-                                 if any(s is const_src for s in u.src))
-                if const_uses == 1 and val.op is Ops.ADD:
+                # The CONST must not be reused anywhere on the data path besides
+                # the outer ADD/MUL. Index-path usage (e.g. CONST(2) as an INDEX
+                # position) is unrelated and should be ignored so the post-op
+                # detection still fires when the post-op constant happens to
+                # collide with an index literal.
+                const_data_uses = sum(1 for u in uops
+                                      if any(s is const_src for s in u.src)
+                                      and u.op is not Ops.INDEX)
+                if const_data_uses == 1 and val.op is Ops.ADD:
                     post_op = ("ADD", const_src.arg)
-                elif const_uses == 1 and val.op is Ops.MUL:
+                elif const_data_uses == 1 and val.op is Ops.MUL:
                     post_op = ("MUL", const_src.arg)
     # When the outer op is ADD(reduce, const) we must NOT count it as part of
     # the reduction (it is the post-op). Adjust op_counts for detection.
