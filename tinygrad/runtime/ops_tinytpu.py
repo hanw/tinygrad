@@ -3920,6 +3920,12 @@ def _skip_if_pred() -> str:
     # SXU_SKIP_IF_PRED opcode = 21; if pred, skip the next instruction.
     return f"2 21 0 0 0 0 0 0 0 0"
 
+def _psum_accumulate_row(vs: int, psum_addr: int, psum_row: int) -> str:
+    # SXU_PSUM_ACCUMULATE_ROW opcode = 22; accumulate row 0 of vs into
+    # psum[psum_addr][psum_row]. VPU-side row-granular deposit,
+    # symmetric with the MXU dispatch's psum_acc path.
+    return f"2 22 {psum_addr} {psum_row} {vs} 0 0 0 0 0"
+
 def _wait_mxu() -> str: return "2 5 0 0 0 0 0 0 0 0"
 def _load_mxu_result(vd: int) -> str: return f"2 6 0 {vd} 0 0 0 0 0 0"
 
