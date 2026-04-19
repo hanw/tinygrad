@@ -954,17 +954,20 @@ def _render_cast_sxu_program(uops: list[UOp]) -> dict | None:
 
 
 def _render_pad_sxu_program(uops: list[UOp]) -> dict | None:
-    """Render PAD kernels as a single-tile LOAD/STORE with a PAD_FILL VMEM
-    preload that scatters source positions into the padded output layout
-    and zero-fills everything else.
+    """Render single-tile unrolled movement kernels (PAD / FLIP / permute)
+    as a LOAD/STORE with a PAD_FILL VMEM preload that scatters source
+    positions into an arbitrary output layout, zero-filling positions
+    whose STORE value is CONST(0).
 
-    Tinygrad PAD pattern: N STOREs for a larger output than source, where
-    each STORE's value is either LOAD(src[i]) or CONST(0). No ALU ops.
+    Pattern: N STOREs whose values are each either LOAD(src[i]) or
+    CONST(0). No ALU ops. Covers PAD (mix of LOAD+CONST), FLIP (all
+    LOADs, reversed indices), and unrolled non-affine permutations
+    that the affine copy renderer rejects.
     """
     op_counts = Counter(u.op.name for u in uops)
     if not op_counts.get("STORE") or not op_counts.get("LOAD"):
         return None
-    # PAD is pure movement: no data-path ALU, no ternary or conversion ops.
+    # Pure movement only: no data-path ALU, ternary, cast, or WMMA.
     data_alu = _data_alu_ops(uops)
     if sum(data_alu.values()) > 0:
         return None
@@ -974,8 +977,6 @@ def _render_pad_sxu_program(uops: list[UOp]) -> dict | None:
             return None
 
     stores = [u for u in uops if u.op is Ops.STORE]
-    if op_counts.get("LOAD", 0) >= len(stores):
-        return None  # no zero-fills -> this is a plain copy, not pad
 
     # Extract per-STORE info: (dst_pos, src_pos or None for zero-fill).
     def _const_tail(idx_uop):
