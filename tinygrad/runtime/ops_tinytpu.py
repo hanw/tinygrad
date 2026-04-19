@@ -3922,6 +3922,17 @@ def _psum_read_row(vd: int, psum_addr: int, psum_row: int) -> str:
 
 def _wait_mxu() -> str: return "2 5 0 0 0 0 0 0 0 0"
 def _load_mxu_result(vd: int) -> str: return f"2 6 0 {vd} 0 0 0 0 0 0"
+
+def _load_vpu_result(vd: int) -> str:
+    # SXU_LOAD_VPU_RESULT opcode = 13; copies vpu.resultReg (linger
+    # register) into vd so subsequent ops can reuse the last VPU
+    # output without re-dispatch.
+    return f"2 13 0 {vd} 0 0 0 0 0 0"
+
+def _load_xlu_result(vd: int) -> str:
+    # SXU_LOAD_XLU_RESULT opcode = 14; same pattern for the XLU output
+    # register.
+    return f"2 14 0 {vd} 0 0 0 0 0 0"
 def _halt()     -> str: return "2 7 0 0 0 0 0 0 0 0"
 def _output_mxu()           -> str: return "3 1"
 def _output_vmem(addr: int) -> str: return f"6 {addr}"
