@@ -34,7 +34,7 @@ _VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "SUM_REDUCE": 4, "CMPLT": 5, "CMPNE": 
              "FMIN": 41,
              "FSUM_REDUCE": 42, "FMAX_REDUCE": 43, "FMIN_REDUCE": 44,
              "FSUM_REDUCE_COL": 45, "FMAX_REDUCE_COL": 46, "FMIN_REDUCE_COL": 47,
-             "FPROD_REDUCE_TILE": 48}
+             "FPROD_REDUCE_TILE": 48, "FPROD_REDUCE": 49, "FPROD_REDUCE_COL": 50}
 _VPU_BOOL_OPS = {_VPU_OPS["CMPLT"], _VPU_OPS["CMPNE"], _VPU_OPS["CMPEQ"]}
 _SXU_OPS = {"LOAD_VREG": 0, "STORE_VREG": 1, "DISPATCH_VPU": 2, "DISPATCH_XLU_BROADCAST": 3, "DISPATCH_MXU": 4, "WAIT_MXU": 5, "LOAD_MXU_RESULT": 6, "HALT": 7, "DISPATCH_SELECT": 8, "BROADCAST_SCALAR": 9, "BROADCAST_ROW": 10, "BROADCAST_COL": 11, "DISPATCH_XLU_TRANSPOSE": 12}
 
@@ -134,9 +134,13 @@ def _detect_reduce_op(op_counts: Counter, data_alu: Counter | None = None) -> st
     nloads = op_counts.get("LOAD", 0)
     if op_counts.get("ADD", 0) > nloads - 1 and op_counts.get("MAX", 0) == 0:
         return "SUM"
-    if op_counts.get("MAX", 0) >= nloads - 1 and op_counts.get("XOR", 0) == 0:
+    if (op_counts.get("MAX", 0) >= nloads - 1
+        and op_counts.get("MAX", 0) > 0
+        and op_counts.get("XOR", 0) == 0):
         return "MAX"
-    if op_counts.get("MAX", 0) >= nloads - 1 and op_counts.get("XOR", 0) > 0:
+    if (op_counts.get("MAX", 0) >= nloads - 1
+        and op_counts.get("MAX", 0) > 0
+        and op_counts.get("XOR", 0) > 0):
         return "MIN"
     if data_alu is not None:
         data_mul = data_alu.get("MUL", 0)
@@ -664,12 +668,9 @@ def _render_colreduce_sxu_program(uops: list[UOp]) -> dict | None:
     nrows = src_size // ncols
 
     is_float_col = any("float" in str(p.dtype) for p in params)
-    # Float col-reductions: SUM and MAX lower directly. Float MIN uses the
-    # same MUL(-1.0)+MAX+MUL(-1.0) negation decomposition as the scalar
-    # path; detect the signature and rewrite reduce_op to "MIN".
+    # Float col-reductions: SUM/MAX/PROD lower directly. Float MIN uses the
+    # MUL(-1.0)+MAX+MUL(-1.0) negation decomposition.
     if is_float_col:
-        if reduce_op == "PROD":
-            return None
         if reduce_op == "MAX" and data_alu.get("MUL", 0) > 0:
             if _is_float_min_negation(uops):
                 reduce_op = "MIN"
@@ -686,10 +687,12 @@ def _render_colreduce_sxu_program(uops: list[UOp]) -> dict | None:
         "MIN":  (_VPU_OPS["MIN_REDUCE_COL"], _VPU_OPS["MIN"], _INT32_MAX),
         "PROD": (_VPU_OPS["MUL_REDUCE_COL"], _VPU_OPS["MUL"], 1),
     }
+    _FLOAT_ONE_BITS = 0x3F800000
     _REDUCE_VPU_FLOAT = {
         "SUM":  (_VPU_OPS["FSUM_REDUCE_COL"], _VPU_OPS["FADD"], 0),
         "MAX":  (_VPU_OPS["FMAX_REDUCE_COL"], _VPU_OPS["FMAX"], _FLOAT_NEG_INF_BITS),
         "MIN":  (_VPU_OPS["FMIN_REDUCE_COL"], _VPU_OPS["FMIN"], _FLOAT_POS_INF_BITS),
+        "PROD": (_VPU_OPS["FPROD_REDUCE_COL"], _VPU_OPS["FMUL"], _FLOAT_ONE_BITS),
     }
     _REDUCE_VPU = _REDUCE_VPU_FLOAT if is_float_col else _REDUCE_VPU_INT
     vpu_op, combine_op, pad_value = _REDUCE_VPU[reduce_op]
@@ -781,11 +784,9 @@ def _render_rowreduce_sxu_program(uops: list[UOp]) -> dict | None:
     nloads = op_counts.get("LOAD", 0)
     if nloads != ncols and nloads != 1: return None
     is_float_row = any("float" in str(p.dtype) for p in params)
-    # Float row reductions: SUM and MAX lower directly; MIN via the
+    # Float row reductions: SUM/MAX/PROD lower directly; MIN via the
     # negation-decomp rewrite shared with the scalar/col paths.
     if is_float_row:
-        if reduce_op == "PROD":
-            return None
         data_alu = _data_alu_ops(uops)
         if reduce_op == "MAX" and data_alu.get("MUL", 0) > 0:
             if _is_float_min_negation(uops):
@@ -802,10 +803,12 @@ def _render_rowreduce_sxu_program(uops: list[UOp]) -> dict | None:
         "MIN":  (_VPU_OPS["MIN_REDUCE"], _VPU_OPS["MIN"], _INT32_MAX),
         "PROD": (_VPU_OPS["MUL_REDUCE"], _VPU_OPS["MUL"], 1),
     }
+    _FLOAT_ONE_BITS = 0x3F800000
     _REDUCE_VPU_FLOAT = {
         "SUM":  (_VPU_OPS["FSUM_REDUCE"], _VPU_OPS["FADD"], 0),
         "MAX":  (_VPU_OPS["FMAX_REDUCE"], _VPU_OPS["FMAX"], _FLOAT_NEG_INF_BITS),
         "MIN":  (_VPU_OPS["FMIN_REDUCE"], _VPU_OPS["FMIN"], _FLOAT_POS_INF_BITS),
+        "PROD": (_VPU_OPS["FPROD_REDUCE"], _VPU_OPS["FMUL"], _FLOAT_ONE_BITS),
     }
     _REDUCE_VPU = _REDUCE_VPU_FLOAT if is_float_row else _REDUCE_VPU_INT
     vpu_op, combine_op, pad_value = _REDUCE_VPU[reduce_op]
