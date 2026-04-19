@@ -31,7 +31,8 @@ _VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "SUM_REDUCE": 4, "CMPLT": 5, "CMPNE": 
              "SUM_REDUCE_TILE": 32, "MAX_REDUCE_TILE": 33, "MIN_REDUCE_TILE": 34,
              "MUL_REDUCE": 35, "MUL_REDUCE_COL": 36, "MUL_REDUCE_TILE": 37,
              "FSUM_REDUCE_TILE": 38, "FMAX_REDUCE_TILE": 39, "FMIN_REDUCE_TILE": 40,
-             "FMIN": 41}
+             "FMIN": 41,
+             "FSUM_REDUCE": 42, "FMAX_REDUCE": 43, "FMIN_REDUCE": 44}
 _VPU_BOOL_OPS = {_VPU_OPS["CMPLT"], _VPU_OPS["CMPNE"], _VPU_OPS["CMPEQ"]}
 _SXU_OPS = {"LOAD_VREG": 0, "STORE_VREG": 1, "DISPATCH_VPU": 2, "DISPATCH_XLU_BROADCAST": 3, "DISPATCH_MXU": 4, "WAIT_MXU": 5, "LOAD_MXU_RESULT": 6, "HALT": 7, "DISPATCH_SELECT": 8, "BROADCAST_SCALAR": 9, "BROADCAST_ROW": 10, "BROADCAST_COL": 11, "DISPATCH_XLU_TRANSPOSE": 12}
 
@@ -735,14 +736,33 @@ def _render_rowreduce_sxu_program(uops: list[UOp]) -> dict | None:
     # Tinygrad may fully unroll or keep a RANGE loop; match both.
     nloads = op_counts.get("LOAD", 0)
     if nloads != ncols and nloads != 1: return None
+    is_float_row = any("float" in str(p.dtype) for p in params)
+    # Float row reductions: SUM via direct MAX/MIN tree (no negation dance
+    # because both operands come from the same row), and PROD not supported.
+    # tinygrad's float MIN still decomposes via MUL(-1)+MAX which this
+    # renderer does not yet handle for row form; treat as unsupported.
+    if is_float_row:
+        if reduce_op == "PROD":
+            return None
+        data_alu = _data_alu_ops(uops)
+        if reduce_op == "MAX" and data_alu.get("MUL", 0) > 0:
+            return None  # float-min decomp through row-max not yet rewritten
     _INT32_MIN = -(1 << 31)
     _INT32_MAX = (1 << 31) - 1
-    _REDUCE_VPU = {
+    _FLOAT_NEG_INF_BITS = -(1 << 23)     # 0xFF800000
+    _FLOAT_POS_INF_BITS = 0x7F800000
+    _REDUCE_VPU_INT = {
         "SUM":  (_VPU_OPS["SUM_REDUCE"], _VPU_OPS["ADD"], 0),
         "MAX":  (_VPU_OPS["MAX_REDUCE"], _VPU_OPS["MAX"], _INT32_MIN),
         "MIN":  (_VPU_OPS["MIN_REDUCE"], _VPU_OPS["MIN"], _INT32_MAX),
         "PROD": (_VPU_OPS["MUL_REDUCE"], _VPU_OPS["MUL"], 1),
     }
+    _REDUCE_VPU_FLOAT = {
+        "SUM":  (_VPU_OPS["FSUM_REDUCE"], _VPU_OPS["FADD"], 0),
+        "MAX":  (_VPU_OPS["FMAX_REDUCE"], _VPU_OPS["FMAX"], _FLOAT_NEG_INF_BITS),
+        "MIN":  (_VPU_OPS["FMIN_REDUCE"], _VPU_OPS["FMIN"], _FLOAT_POS_INF_BITS),
+    }
+    _REDUCE_VPU = _REDUCE_VPU_FLOAT if is_float_row else _REDUCE_VPU_INT
     vpu_op, combine_op, pad_value = _REDUCE_VPU[reduce_op]
 
     out_arg, src_arg = 0, 1
