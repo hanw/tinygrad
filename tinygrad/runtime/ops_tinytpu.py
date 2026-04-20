@@ -2856,6 +2856,12 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
     stores = [u for u in uops if u.op is Ops.STORE]
     if not stores or not params:
         return None
+    # Transcendental UOps are handled by the dedicated transcendental
+    # renderers above. If one appears in the kernel, don't silently render
+    # just the adjacent ALU ops (which would drop the transcendental and
+    # produce wrong numeric results).
+    if any(op_counts.get(n, 0) for n in ("EXP2", "LOG2", "SIN", "SQRT")):
+        return None
 
     # Find output param
     out_params = set()
