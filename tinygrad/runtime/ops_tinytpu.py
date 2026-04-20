@@ -327,6 +327,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return scaled_sin_desc
         if (sin_desc := _render_sin_sxu_program(uops)) is not None:
             return sin_desc
+        if (self_sq_desc := _render_self_square_sxu_program(uops)) is not None:
+            return self_sq_desc
         if (rsqrt_desc := _render_rsqrt_sxu_program(uops)) is not None:
             return rsqrt_desc
         if (sqrt_desc := _render_sqrt_sxu_program(uops)) is not None:
@@ -2868,6 +2870,73 @@ def _render_sigmoid_sxu_program(uops: list[UOp]) -> dict | None:
             _vpu(5, 4, FADD_OP, 1),
             _vpu(6, 5, FRECIP_OP),
             _store(out_vmem, 6),
+        ]
+        outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
+
+
+def _render_self_square_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render x · x (= x**2, Tensor.square).
+
+    tinygrad's elementwise renderer expects two PARAMs for a binary op;
+    the self-multiply pattern has a single PARAM fed into both MUL
+    operands, so elementwise rejects it. This renderer detects the
+    STORE(..., MUL(INDEX(p), INDEX(p))) shape and emits
+    LOAD x → FMUL(v, v) → STORE per tile.
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    allowed = {"MUL", "CONST", "INDEX", "LOAD", "STORE", "PARAM", "SINK",
+               "END", "RANGE", "VECTORIZE", "GEP", "CAST"}
+    if any(c > 0 and n not in allowed for n, c in op_counts.items()):
+        return None
+    if op_counts.get("MUL", 0) < 1:
+        return None
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2 or 0 not in params:
+        return None
+    src_arg = next((k for k in params if k != 0), None)
+    if src_arg is None:
+        return None
+    if not ("float" in str(params[0].dtype) and "float" in str(params[src_arg].dtype)):
+        return None
+    out_size = params[0].dtype.size
+    if out_size != params[src_arg].dtype.size or out_size <= 0:
+        return None
+
+    stores = [u for u in uops if u.op is Ops.STORE]
+    if not stores:
+        return None
+    val = stores[0].src[1]
+    while val.op in (Ops.VECTORIZE, Ops.CAST, Ops.GEP):
+        val = val.src[0] if len(val.src) > 0 else val
+    if val.op is not Ops.MUL:
+        return None
+    s_left, s_right = val.src[0], val.src[1]
+    if s_left is not s_right:
+        return None
+    # Must chase through CAST/GEP and terminate at a LOAD/INDEX on src_arg.
+    cur = s_left
+    while cur.op in (Ops.CAST, Ops.GEP):
+        cur = cur.src[0]
+    if not _has_load_src(cur):
+        return None
+
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    FMUL_OP = _VPU_OPS["FMUL"]
+    all_instrs, data_plan, outputs = [], [], []
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count  = min(_TILE_ELEMS, out_size - offset)
+        in_vmem  = tile_idx * 2
+        out_vmem = in_vmem + 1
+        data_plan.append({"type": "VMEM", "addr": in_vmem, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        all_instrs += [
+            _load(0, in_vmem),
+            _vpu(1, 0, FMUL_OP, 0),
+            _store(out_vmem, 1),
         ]
         outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
     all_instrs.append(_halt())
