@@ -313,6 +313,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return recip_desc
         if (tanh_desc := _render_tanh_sxu_program(uops)) is not None:
             return tanh_desc
+        if (softsign_desc := _render_softsign_sxu_program(uops)) is not None:
+            return softsign_desc
         if (swish_desc := _render_swish_sxu_program(uops)) is not None:
             return swish_desc
         if (sigmoid_desc := _render_sigmoid_sxu_program(uops)) is not None:
@@ -2772,6 +2774,110 @@ def _render_tanh_sxu_program(uops: list[UOp]) -> dict | None:
             _vpu(9, 8, FMUL_OP, 2),
             _vpu(10, 9, FADD_OP, 3),
             _store(out_vmem, 10),
+        ]
+        outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
+
+
+def _render_softsign_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render softsign(x) = x / (1 + |x|).
+
+    Pattern signature:
+      * single src PARAM
+      * no transcendentals (EXP2/LOG2/SIN/SQRT)
+      * WHERE+CMPLT+CMPNE+MUL from |x| decomposition
+      * RECIPROCAL, data-path ADD present
+      * one outer MUL combining LOAD(x) and RECIPROCAL(...)
+
+    Per tile emits:
+      LOAD v0 = x
+      LOAD v1 = zeros
+      LOAD v2 = broadcast 1.0
+      FSUB v3 = v1 - v0   (= -x)
+      FMAX v4 = v0 max v3 (= |x|)
+      FADD v5 = v4 + v2   (= 1 + |x|)
+      FRECIP v6 = 1 / v5
+      FMUL v7 = v0 * v6   (= softsign)
+      STORE v7
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    if any(op_counts.get(n, 0) for n in ("EXP2", "LOG2", "SIN", "SQRT")):
+        return None
+    if op_counts.get("RECIPROCAL", 0) < 1:
+        return None
+    if op_counts.get("WHERE", 0) < 1:
+        return None
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2 or 0 not in params:
+        return None
+    src_arg = next((k for k in params if k != 0), None)
+    if src_arg is None:
+        return None
+    if not ("float" in str(params[0].dtype) and "float" in str(params[src_arg].dtype)):
+        return None
+    out_size = params[0].dtype.size
+    if out_size != params[src_arg].dtype.size or out_size <= 0:
+        return None
+    # Verify the STORE is MUL(LOAD(x), RECIPROCAL(ADD(1, abs-shape))) on the
+    # shared PARAM.
+    stores = [u for u in uops if u.op is Ops.STORE]
+    if not stores:
+        return None
+    val = stores[0].src[1]
+    while val.op in (Ops.VECTORIZE, Ops.CAST, Ops.GEP):
+        val = val.src[0] if len(val.src) > 0 else val
+    if val.op is not Ops.MUL:
+        return None
+    a, b = val.src[0], val.src[1]
+    recip = next((s for s in (a, b) if _chase(s).op is Ops.RECIPROCAL), None)
+    direct_x = next((s for s in (a, b) if s is not recip), None)
+    if recip is None or direct_x is None or not _has_load_src(direct_x):
+        return None
+    recip = _chase(recip)
+    add_node = recip.src[0]
+    while add_node.op in (Ops.CAST, Ops.GEP):
+        add_node = add_node.src[0]
+    if add_node.op is not Ops.ADD:
+        return None
+    one_src = next((s for s in add_node.src
+                    if s.op is Ops.CONST or
+                    (s.op in (Ops.CAST, Ops.VECTORIZE, Ops.GEP) and
+                     s.src and s.src[0].op is Ops.CONST)), None)
+    if one_src is None:
+        return None
+    cst = one_src
+    while cst.op in (Ops.CAST, Ops.VECTORIZE, Ops.GEP):
+        cst = cst.src[0]
+    if cst.op is not Ops.CONST or float(cst.arg) != 1.0:
+        return None
+
+    one_bits = int(np.frombuffer(np.float32(1.0).tobytes(), dtype=np.int32)[0])
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    data_plan = [{"type": "VMEM", "addr": 0, "layout": "broadcast_const",
+                  "value": 0, "count": _TILE_ELEMS, "dtype": "int32"},
+                 {"type": "VMEM", "addr": 1, "layout": "broadcast_const",
+                  "value": one_bits, "count": _TILE_ELEMS, "dtype": "int32"}]
+    all_instrs = [_load(0, 0), _load(1, 1)]
+    FSUB, FMAX, FADD = _VPU_OPS["FSUB"], _VPU_OPS["FMAX"], _VPU_OPS["FADD"]
+    FRECIP, FMUL = _VPU_OPS["FRECIP"], _VPU_OPS["FMUL"]
+    outputs = []
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count  = min(_TILE_ELEMS, out_size - offset)
+        in_vmem  = 2 + tile_idx * 2
+        out_vmem = 3 + tile_idx * 2
+        data_plan.append({"type": "VMEM", "addr": in_vmem, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        all_instrs += [
+            _load(2, in_vmem),               # v2 = x
+            _vpu(3, 0, FSUB, 2),             # v3 = 0 - x = -x
+            _vpu(4, 2, FMAX, 3),             # v4 = max(x, -x) = |x|
+            _vpu(5, 4, FADD, 1),             # v5 = |x| + 1
+            _vpu(6, 5, FRECIP),              # v6 = 1/(1+|x|)
+            _vpu(7, 2, FMUL, 6),             # v7 = x * v6
+            _store(out_vmem, 7),
         ]
         outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
     all_instrs.append(_halt())
