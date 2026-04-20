@@ -2588,11 +2588,20 @@ def _render_scaled_sin_sxu_program(uops: list[UOp]) -> dict | None:
     if inner.op is Ops.MUL:
         scale_const = next((s for s in inner.src if s.op is Ops.CONST and not isinstance(s.arg, bool)), None)
         load_src = next((s for s in inner.src if s is not scale_const), None)
-        if scale_const is None or load_src is None or not _has_load_src(load_src):
+        if scale_const is None or load_src is None:
+            return None
+        # Require the non-const factor to terminate at a plain LOAD.
+        tail = load_src
+        while tail.op in (Ops.CAST, Ops.GEP, Ops.VECTORIZE):
+            tail = tail.src[0]
+        if tail.op is not Ops.LOAD:
             return None
     else:
         # no MUL — inner should be load-directly (pure-shift case)
-        if not _has_load_src(inner):
+        tail = inner
+        while tail.op in (Ops.CAST, Ops.GEP, Ops.VECTORIZE):
+            tail = tail.src[0]
+        if tail.op is not Ops.LOAD:
             return None
 
     scale_bits = (int(np.frombuffer(np.float32(float(scale_const.arg)).tobytes(), dtype=np.int32)[0])
@@ -2689,7 +2698,15 @@ def _render_scaled_exp2_sxu_program(uops: list[UOp]) -> dict | None:
         return None
     const_src = next((s for s in inner.src if s.op is Ops.CONST and not isinstance(s.arg, bool)), None)
     load_src = next((s for s in inner.src if s is not const_src), None)
-    if const_src is None or load_src is None or not _has_load_src(load_src):
+    if const_src is None or load_src is None:
+        return None
+    # Tighten: the non-const operand must terminate at a plain LOAD.
+    # Otherwise expressions like EXP2(MUL(x+k, c)) would silently drop
+    # the inner ADD and render as EXP2(x*c).
+    load_tail = load_src
+    while load_tail.op in (Ops.CAST, Ops.GEP, Ops.VECTORIZE):
+        load_tail = load_tail.src[0]
+    if load_tail.op is not Ops.LOAD:
         return None
     const_bits = int(np.frombuffer(np.float32(float(const_src.arg)).tobytes(), dtype=np.int32)[0])
     mul_opcode = _VPU_OPS["FMUL" if inner.op is Ops.MUL else "FADD"]
