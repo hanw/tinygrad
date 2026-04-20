@@ -1394,8 +1394,13 @@ def _render_multistep_sxu_program(uops: list[UOp]) -> dict | None:
 
     # --- ABS: 2 params, WHERE+CMPLT+CMPNE+MUL pattern → SUB(0,x), MAX(x, neg) ---
     # For float tensors use FSUB/FMAX; bits for 0.0 and 0 are identical so broadcast const reuses 0.
+    # Reject kernels that also carry RECIPROCAL or data-path ADD — those
+    # are larger expressions (e.g. softsign = x / (1 + |x|)) whose abs
+    # subtree is only part of the computation.
     if (len(src_params) == 1 and has_where and has_cmplt and has_cmpne and has_mul
-            and not has_idiv and not has_mod):
+            and not has_idiv and not has_mod
+            and op_counts.get("RECIPROCAL", 0) == 0
+            and data_alu.get("ADD", 0) == 0):
         src_arg = src_params[0]
         src_is_float = "float" in str(params[src_arg].dtype)
         sub_op = _VPU_OPS["FSUB"] if src_is_float else SUB_OP
@@ -3767,8 +3772,13 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
     vec_count = op_counts.get("VECTORIZE", 0)
     where_ok = (op_counts.get("WHERE", 0) == store_count
                 or (vec_count > 0 and op_counts.get("WHERE", 0) == op_counts.get("CMPLT", 0)))
+    # RELU uses one compare per output element. Kernels with more than one
+    # compare per element (e.g. clip / hardtanh = max(lo, min(hi, x)) has
+    # two) share the WHERE+CMPLT shape but are not RELU.
+    cmplt_total = op_counts.get("CMPLT", 0) + op_counts.get("FCMPLT", 0)
     is_relu_candidate = (has_where and len(params) == 2 and len(src_params) == 1
                          and where_ok
+                         and cmplt_total <= max(1, out_size)
                          and not any(data_alu_counts.get(n, 0) > 0 for n in ["ADD", "MUL", "MAX"]))
     if has_where and not is_relu_candidate:
         return None
