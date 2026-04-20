@@ -319,6 +319,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return scaled_exp2_desc
         if (exp2_desc := _render_exp2_sxu_program(uops)) is not None:
             return exp2_desc
+        if (scaled_log2_desc := _render_scaled_log2_sxu_program(uops)) is not None:
+            return scaled_log2_desc
         if (log2_desc := _render_log2_sxu_program(uops)) is not None:
             return log2_desc
         if (scaled_sin_desc := _render_scaled_sin_sxu_program(uops)) is not None:
@@ -2340,6 +2342,81 @@ def _render_exp2_sxu_program(uops: list[UOp]) -> dict | None:
 
 def _render_log2_sxu_program(uops: list[UOp]) -> dict | None:
     return _render_unary_transcendental_sxu_program(uops, "LOG2", _vpu_log2)
+
+
+def _render_scaled_log2_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render k · log2(x) — Tensor.log() lowers as LOG2(x) · ln(2).
+
+    Pattern: MUL(LOG2(x), const). Emits per tile:
+      LOAD v0 = broadcast const
+      LOAD v1 = x
+      VPU  v2 = LOG2(v1)
+      VPU  v3 = FMUL(v2, v0)
+      STORE   = v3
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    if op_counts.get("LOG2", 0) < 1:
+        return None
+    if op_counts.get("EXP2", 0) > 0 or op_counts.get("SIN", 0) > 0 or op_counts.get("SQRT", 0) > 0:
+        return None
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2 or 0 not in params:
+        return None
+    src_arg = next((k for k in params if k != 0), None)
+    if src_arg is None:
+        return None
+    if not ("float" in str(params[0].dtype) and "float" in str(params[src_arg].dtype)):
+        return None
+    out_size = params[0].dtype.size
+    if out_size != params[src_arg].dtype.size or out_size <= 0:
+        return None
+
+    stores = [u for u in uops if u.op is Ops.STORE]
+    if not stores:
+        return None
+    val = stores[0].src[1]
+    while val.op in (Ops.VECTORIZE, Ops.CAST, Ops.GEP):
+        val = val.src[0] if len(val.src) > 0 else val
+    if val.op is not Ops.MUL:
+        return None
+    scale_const = next((s for s in val.src if s.op is Ops.CONST and not isinstance(s.arg, bool)), None)
+    log2_node  = next((s for s in val.src if s is not scale_const), None)
+    if scale_const is None or log2_node is None:
+        return None
+    while log2_node.op in (Ops.CAST, Ops.GEP):
+        log2_node = log2_node.src[0]
+    if log2_node.op is not Ops.LOG2:
+        return None
+    input_src = log2_node.src[0]
+    while input_src.op in (Ops.CAST, Ops.GEP):
+        input_src = input_src.src[0]
+    if not _has_load_src(input_src):
+        return None
+
+    scale_bits = int(np.frombuffer(np.float32(float(scale_const.arg)).tobytes(), dtype=np.int32)[0])
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    data_plan = [{"type": "VMEM", "addr": 0, "layout": "broadcast_const",
+                  "value": scale_bits, "count": _TILE_ELEMS, "dtype": "int32"}]
+    all_instrs = [_load(0, 0)]
+    outputs = []
+    FMUL_OP = _VPU_OPS["FMUL"]
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count  = min(_TILE_ELEMS, out_size - offset)
+        in_vmem  = 1 + tile_idx * 2
+        out_vmem = 2 + tile_idx * 2
+        data_plan.append({"type": "VMEM", "addr": in_vmem, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        all_instrs += [
+            _load(1, in_vmem),
+            _vpu_log2(2, 1),
+            _vpu(3, 2, FMUL_OP, 0),
+            _store(out_vmem, 3),
+        ]
+        outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
 
 
 def _render_sin_sxu_program(uops: list[UOp]) -> dict | None:
