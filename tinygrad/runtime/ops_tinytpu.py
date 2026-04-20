@@ -34,7 +34,8 @@ _VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "SUM_REDUCE": 4, "CMPLT": 5, "CMPNE": 
              "FMIN": 41,
              "FSUM_REDUCE": 42, "FMAX_REDUCE": 43, "FMIN_REDUCE": 44,
              "FSUM_REDUCE_COL": 45, "FMAX_REDUCE_COL": 46, "FMIN_REDUCE_COL": 47,
-             "FPROD_REDUCE_TILE": 48, "FPROD_REDUCE": 49, "FPROD_REDUCE_COL": 50}
+             "FPROD_REDUCE_TILE": 48, "FPROD_REDUCE": 49, "FPROD_REDUCE_COL": 50,
+             "EXP2": 51}
 _VPU_BOOL_OPS = {_VPU_OPS["CMPLT"], _VPU_OPS["CMPNE"], _VPU_OPS["CMPEQ"]}
 _SXU_OPS = {"LOAD_VREG": 0, "STORE_VREG": 1, "DISPATCH_VPU": 2, "DISPATCH_XLU_BROADCAST": 3, "DISPATCH_MXU": 4, "WAIT_MXU": 5, "LOAD_MXU_RESULT": 6, "HALT": 7, "DISPATCH_SELECT": 8, "BROADCAST_SCALAR": 9, "BROADCAST_ROW": 10, "BROADCAST_COL": 11, "DISPATCH_XLU_TRANSPOSE": 12, "LOAD_VPU_RESULT": 13, "LOAD_XLU_RESULT": 14, "PSUM_WRITE": 15, "PSUM_ACCUMULATE": 16, "PSUM_READ": 17}
 
@@ -230,6 +231,11 @@ class TinyTPURenderer(Renderer):
     has_threads = False
     global_max  = (1,) * 3
     local_max   = (1,) * 3
+    # Declaring transcendental ops here tells tinygrad's codegen that this
+    # backend has hardware support, so the default xexp2/xlog2/xsin poly
+    # decompositions are skipped and EXP2/LOG2/SIN pass through to the
+    # SXU renderer as single UOps.
+    code_for_op = {Ops.EXP2: (lambda *_a, **_k: None)}
     tensor_cores = [TensorCore(
         dims=(4, 4, 4),
         threads=1,
@@ -302,6 +308,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return copy_desc
         if (recip_desc := _render_reciprocal_sxu_program(uops)) is not None:
             return recip_desc
+        if (exp2_desc := _render_exp2_sxu_program(uops)) is not None:
+            return exp2_desc
         if (trunc_desc := _render_trunc_sxu_program(uops)) is not None:
             return trunc_desc
         if (divmod_desc := _render_scalar_const_divmod_sxu_program(uops)) is not None:
@@ -2253,6 +2261,57 @@ def _render_trunc_sxu_program(uops: list[UOp]) -> dict | None:
             "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
 
 
+def _render_exp2_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render plain float32 2^x as SXU_PROGRAM using VPU_EXP2.
+
+    Pattern: single EXP2 UOp on a float source, no other compute ops in the
+    data path. Multi-tile kernels emit one VPU_EXP2 per tile; the TranscUnit
+    handles per-lane Horner sequentially inside each dispatch, so SXU stalls
+    on vpu.isDone between VMEM load and STORE.
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    if op_counts.get("EXP2", 0) < 1:
+        return None
+    _allowed = {"EXP2", "CONST", "INDEX", "LOAD", "STORE", "PARAM", "SINK",
+                "GROUP", "END", "RANGE", "VECTORIZE", "GEP", "MUL", "ADD", "CAST"}
+    if any(c > 0 and n not in _allowed for n, c in op_counts.items()):
+        return None
+    for u in uops:
+        if u.op in (Ops.MUL, Ops.ADD) and _has_load_src(u):
+            return None
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2 or 0 not in params:
+        return None
+    src_arg = next((k for k in params if k != 0), None)
+    if src_arg is None:
+        return None
+    if not ("float" in str(params[0].dtype) and "float" in str(params[src_arg].dtype)):
+        return None
+    out_size = params[0].dtype.size
+    src_size = params[src_arg].dtype.size
+    if out_size != src_size or out_size <= 0:
+        return None
+
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    all_instrs, data_plan, outputs = [], [], []
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count = min(_TILE_ELEMS, out_size - offset)
+        base = tile_idx * 2
+        data_plan.append({"type": "VMEM", "addr": base, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        out_vmem = base + 1
+        all_instrs += [
+            _load(0, base),
+            _vpu_exp2(1, 0),
+            _store(out_vmem, 1),
+        ]
+        outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
+
+
 def _render_reciprocal_sxu_program(uops: list[UOp]) -> dict | None:
     """Render plain float32 reciprocal (1/x) as SXU_PROGRAM using VPU_FRECIP.
 
@@ -3862,6 +3921,11 @@ def _store(vmem_dst: int, vs: int) -> str:
 
 def _vpu(vd: int, va: int, op: int, vb: int = 0) -> str:
     return f"2 2 0 {vd} {va} {op} {vb} 0 0 0"
+
+def _vpu_exp2(vd: int, va: int) -> str:
+    # VPU_EXP2 (opcode 51). Multi-cycle walker — SXU stalls on vpu.isDone
+    # until TranscUnit finishes its lane-by-lane Horner. ~80 cycles per tile.
+    return _vpu(vd, va, _VPU_OPS["EXP2"])
 
 def _select(vd: int, cond: int, lhs: int, rhs: int) -> str:
     return f"2 8 0 {vd} {cond} 0 {lhs} {rhs} 0 0"
