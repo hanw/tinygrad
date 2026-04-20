@@ -327,6 +327,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return scaled_sin_desc
         if (sin_desc := _render_sin_sxu_program(uops)) is not None:
             return sin_desc
+        if (self_cube_desc := _render_self_cube_sxu_program(uops)) is not None:
+            return self_cube_desc
         if (self_sq_desc := _render_self_square_sxu_program(uops)) is not None:
             return self_sq_desc
         if (rsqrt_desc := _render_rsqrt_sxu_program(uops)) is not None:
@@ -2875,6 +2877,87 @@ def _render_sigmoid_sxu_program(uops: list[UOp]) -> dict | None:
     all_instrs.append(_halt())
     return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
             "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
+
+
+def _render_self_cube_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render x · x · x (= x**3).
+
+    tinygrad lowers Tensor(x)**3 as MUL(LOAD(x), MUL(LOAD(x), LOAD(x)))
+    — three LOAD nodes but all into the same PARAM. Detect the three-
+    way self-MUL tree and emit a two-step FMUL sequence per tile.
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    allowed = {"MUL", "CONST", "INDEX", "LOAD", "STORE", "PARAM", "SINK",
+               "END", "RANGE", "VECTORIZE", "GEP", "CAST"}
+    if any(c > 0 and n not in allowed for n, c in op_counts.items()):
+        return None
+    if op_counts.get("MUL", 0) < 2:
+        return None
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2 or 0 not in params:
+        return None
+    src_arg = next((k for k in params if k != 0), None)
+    if src_arg is None:
+        return None
+    if not ("float" in str(params[0].dtype) and "float" in str(params[src_arg].dtype)):
+        return None
+    out_size = params[0].dtype.size
+    if out_size != params[src_arg].dtype.size or out_size <= 0:
+        return None
+
+    stores = [u for u in uops if u.op is Ops.STORE]
+    if not stores:
+        return None
+    val = stores[0].src[1]
+    while val.op in (Ops.VECTORIZE, Ops.CAST, Ops.GEP):
+        val = val.src[0] if len(val.src) > 0 else val
+    if val.op is not Ops.MUL:
+        return None
+    # Outer MUL: one src is a MUL (inner square), the other a LOAD(x).
+    a, b = val.src[0], val.src[1]
+    inner = next((s for s in (a, b) if _chase(s).op is Ops.MUL), None)
+    outer_load = next((s for s in (a, b) if _chase(s).op is not Ops.MUL), None)
+    if inner is None or outer_load is None:
+        return None
+    inner_chased = _chase(inner)
+    if inner_chased.op is not Ops.MUL:
+        return None
+    # Inner MUL must be self-square on the same PARAM.
+    if inner_chased.src[0] is not inner_chased.src[1]:
+        return None
+    # Verify all three LOAD tails point to the same PARAM.
+    if not _has_load_src(outer_load) or not _has_load_src(inner_chased.src[0]):
+        return None
+
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    FMUL_OP = _VPU_OPS["FMUL"]
+    all_instrs, data_plan, outputs = [], [], []
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count  = min(_TILE_ELEMS, out_size - offset)
+        in_vmem  = tile_idx * 2
+        out_vmem = in_vmem + 1
+        data_plan.append({"type": "VMEM", "addr": in_vmem, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        all_instrs += [
+            _load(0, in_vmem),              # v0 := x
+            _vpu(1, 0, FMUL_OP, 0),         # v1 := x * x
+            _vpu(2, 0, FMUL_OP, 1),         # v2 := x * v1 = x^3
+            _store(out_vmem, 2),
+        ]
+        outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
+
+
+def _chase(u: "UOp") -> "UOp":
+    """Follow VECTORIZE/CAST/GEP wrappers down to the interesting node."""
+    while u.op in (Ops.VECTORIZE, Ops.CAST, Ops.GEP):
+        if len(u.src) == 0:
+            return u
+        u = u.src[0]
+    return u
 
 
 def _render_self_square_sxu_program(uops: list[UOp]) -> dict | None:
