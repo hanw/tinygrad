@@ -672,7 +672,16 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
         const_vreg = num_tiles * 2 + 10
         result_vreg = const_vreg + 1
         all_instrs.append(_load(const_vreg, const_addr))
-        post_vpu = _VPU_OPS["ADD"] if op_name == "ADD" else _VPU_OPS["MUL"]
+        # Float reductions (FSUM/FMAX/FMIN/FPROD) must use the float VPU
+        # variants for the post-op; integer reductions stay on the int ops.
+        is_float_reduce = vpu_op in (_VPU_OPS["FSUM_REDUCE_TILE"],
+                                     _VPU_OPS["FMAX_REDUCE_TILE"],
+                                     _VPU_OPS["FMIN_REDUCE_TILE"],
+                                     _VPU_OPS["FPROD_REDUCE_TILE"])
+        if is_float_reduce:
+            post_vpu = _VPU_OPS["FADD"] if op_name == "ADD" else _VPU_OPS["FMUL"]
+        else:
+            post_vpu = _VPU_OPS["ADD"] if op_name == "ADD" else _VPU_OPS["MUL"]
         all_instrs.append(_vpu(result_vreg, acc_vreg, post_vpu, const_vreg))
         acc_vreg = result_vreg
         out_vmem = num_tiles + 1
