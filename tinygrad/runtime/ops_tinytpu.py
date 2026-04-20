@@ -313,6 +313,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return recip_desc
         if (tanh_desc := _render_tanh_sxu_program(uops)) is not None:
             return tanh_desc
+        if (swish_desc := _render_swish_sxu_program(uops)) is not None:
+            return swish_desc
         if (sigmoid_desc := _render_sigmoid_sxu_program(uops)) is not None:
             return sigmoid_desc
         if (scaled_exp2_desc := _render_scaled_exp2_sxu_program(uops)) is not None:
@@ -2765,6 +2767,128 @@ def _render_tanh_sxu_program(uops: list[UOp]) -> dict | None:
             _vpu(9, 8, FMUL_OP, 2),
             _vpu(10, 9, FADD_OP, 3),
             _store(out_vmem, 10),
+        ]
+        outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
+
+
+def _render_swish_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render swish(x) / silu(x) = x * sigmoid(x).
+
+    Pattern: MUL(LOAD(x), RECIPROCAL(ADD(CONST(1.0), EXP2(MUL(LOAD(x), CONST(-1/ln2))))))
+    where both LOAD(x) references share the same PARAM.
+
+    Per tile emits:
+      LOAD v0 = broadcast -1/ln2
+      LOAD v1 = broadcast 1.0
+      LOAD v2 = x
+      FMUL v3 = v2 * v0  (x * -1/ln2)
+      EXP2 v4 = exp2(v3)
+      FADD v5 = v4 + v1  (1 + exp2)
+      FRECIP v6 = 1/v5    (sigmoid)
+      FMUL v7 = v2 * v6   (x * sigmoid)
+      STORE v7
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    if op_counts.get("RECIPROCAL", 0) < 1 or op_counts.get("EXP2", 0) < 1:
+        return None
+    if op_counts.get("LOG2", 0) > 0 or op_counts.get("SIN", 0) > 0 or op_counts.get("SQRT", 0) > 0:
+        return None
+    if op_counts.get("MUL", 0) < 2:
+        return None
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2 or 0 not in params:
+        return None
+    src_arg = next((k for k in params if k != 0), None)
+    if src_arg is None:
+        return None
+    if not ("float" in str(params[0].dtype) and "float" in str(params[src_arg].dtype)):
+        return None
+    out_size = params[0].dtype.size
+    if out_size != params[src_arg].dtype.size or out_size <= 0:
+        return None
+
+    stores = [u for u in uops if u.op is Ops.STORE]
+    if not stores:
+        return None
+    val = stores[0].src[1]
+    while val.op in (Ops.VECTORIZE, Ops.CAST, Ops.GEP):
+        val = val.src[0] if len(val.src) > 0 else val
+    # Outer MUL: one src is the input x (as a LOAD-tail), other is RECIPROCAL.
+    if val.op is not Ops.MUL:
+        return None
+    a, b = val.src[0], val.src[1]
+    recip = next((s for s in (a, b) if _chase(s).op is Ops.RECIPROCAL), None)
+    direct_x = next((s for s in (a, b) if s is not recip), None)
+    if recip is None or direct_x is None:
+        return None
+    recip = _chase(recip)
+    if not _has_load_src(direct_x):
+        return None
+    # Dig into RECIPROCAL -> ADD(1, EXP2(MUL(x, c)))
+    add_node = recip.src[0]
+    while add_node.op in (Ops.CAST, Ops.GEP):
+        add_node = add_node.src[0]
+    if add_node.op is not Ops.ADD:
+        return None
+    one_src = next((s for s in add_node.src
+                    if s.op is Ops.CONST or
+                    (s.op in (Ops.CAST, Ops.VECTORIZE, Ops.GEP) and
+                     s.src and s.src[0].op is Ops.CONST)), None)
+    exp_src = next((s for s in add_node.src if s is not one_src), None)
+    if one_src is None or exp_src is None:
+        return None
+    cst = one_src
+    while cst.op in (Ops.CAST, Ops.VECTORIZE, Ops.GEP):
+        cst = cst.src[0]
+    if cst.op is not Ops.CONST or float(cst.arg) != 1.0:
+        return None
+    while exp_src.op in (Ops.CAST, Ops.GEP):
+        exp_src = exp_src.src[0]
+    if exp_src.op is not Ops.EXP2:
+        return None
+    mul_node = exp_src.src[0]
+    while mul_node.op in (Ops.CAST, Ops.GEP):
+        mul_node = mul_node.src[0]
+    if mul_node.op is not Ops.MUL:
+        return None
+    scale_const = next((s for s in mul_node.src if s.op is Ops.CONST), None)
+    input_src   = next((s for s in mul_node.src if s is not scale_const), None)
+    if scale_const is None or input_src is None or not _has_load_src(input_src):
+        return None
+
+    scale_bits = int(np.frombuffer(np.float32(float(scale_const.arg)).tobytes(), dtype=np.int32)[0])
+    one_bits   = int(np.frombuffer(np.float32(1.0).tobytes(), dtype=np.int32)[0])
+
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    data_plan = [
+        {"type": "VMEM", "addr": 0, "layout": "broadcast_const",
+         "value": scale_bits, "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 1, "layout": "broadcast_const",
+         "value": one_bits,   "count": _TILE_ELEMS, "dtype": "int32"},
+    ]
+    all_instrs = [_load(0, 0), _load(1, 1)]
+    FMUL_OP  = _VPU_OPS["FMUL"]
+    FADD_OP  = _VPU_OPS["FADD"]
+    FRECIP_OP = _VPU_OPS["FRECIP"]
+    outputs = []
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count  = min(_TILE_ELEMS, out_size - offset)
+        in_vmem  = 2 + tile_idx * 2
+        out_vmem = 3 + tile_idx * 2
+        data_plan.append({"type": "VMEM", "addr": in_vmem, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        all_instrs += [
+            _load(2, in_vmem),              # v2 = x
+            _vpu(3, 2, FMUL_OP, 0),         # v3 = x * -1/ln2
+            _vpu_exp2(4, 3),                # v4 = exp2(x * -1/ln2)
+            _vpu(5, 4, FADD_OP, 1),         # v5 = 1 + exp2
+            _vpu(6, 5, FRECIP_OP),          # v6 = sigmoid(x)
+            _vpu(7, 2, FMUL_OP, 6),         # v7 = x * sigmoid(x)
+            _store(out_vmem, 7),
         ]
         outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
     all_instrs.append(_halt())
