@@ -4739,6 +4739,12 @@ def _mxu_os(wbase: int, abase: int, tiles: int) -> str:
     # for the duration. PSUM plumbing is not available in OS mode yet.
     return f"2 23 0 0 0 0 0 {wbase} {abase} {tiles}"
 
+def _mxu_clear() -> str:
+    # SXU_MXU_CLEAR opcode = 24. Zeroes the systolic-array PE
+    # accumulators. Needed between OS-mode accumulation epochs
+    # because startOS intentionally preserves accumulator state.
+    return "2 24 0 0 0 0 0 0 0 0"
+
 def _psum_read(vd: int, psum_addr: int) -> str:
     # SXU_PSUM_READ opcode = 17; vmemAddr doubles as PSUM bucket index.
     return f"2 17 {psum_addr} {vd} 0 0 0 0 0 0"
