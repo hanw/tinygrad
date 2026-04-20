@@ -237,7 +237,8 @@ class TinyTPURenderer(Renderer):
     # SXU renderer as single UOps.
     code_for_op = {Ops.EXP2: (lambda *_a, **_k: None),
                    Ops.LOG2: (lambda *_a, **_k: None),
-                   Ops.SIN:  (lambda *_a, **_k: None)}
+                   Ops.SIN:  (lambda *_a, **_k: None),
+                   Ops.SQRT: (lambda *_a, **_k: None)}
     tensor_cores = [TensorCore(
         dims=(4, 4, 4),
         threads=1,
@@ -316,6 +317,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return log2_desc
         if (sin_desc := _render_sin_sxu_program(uops)) is not None:
             return sin_desc
+        if (sqrt_desc := _render_sqrt_sxu_program(uops)) is not None:
+            return sqrt_desc
         if (trunc_desc := _render_trunc_sxu_program(uops)) is not None:
             return trunc_desc
         if (divmod_desc := _render_scalar_const_divmod_sxu_program(uops)) is not None:
@@ -2328,6 +2331,67 @@ def _render_log2_sxu_program(uops: list[UOp]) -> dict | None:
 
 def _render_sin_sxu_program(uops: list[UOp]) -> dict | None:
     return _render_unary_transcendental_sxu_program(uops, "SIN", _vpu_sin)
+
+
+def _render_sqrt_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render Ops.SQRT as Exp2(0.5 * Log2(x)) using LOG2+FMUL+EXP2.
+
+    SQRT isn't a direct VPU opcode; this microprogram decomposes it into
+    the existing transcendentals. Accuracy compounds the degree-2/5
+    Taylor errors in LOG2 and EXP2 — exact at powers of two.
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    if op_counts.get("SQRT", 0) < 1:
+        return None
+    _allowed = {"SQRT", "CONST", "INDEX", "LOAD", "STORE", "PARAM", "SINK",
+                "GROUP", "END", "RANGE", "VECTORIZE", "GEP", "MUL", "ADD", "CAST"}
+    if any(c > 0 and n not in _allowed for n, c in op_counts.items()):
+        return None
+    for u in uops:
+        if u.op in (Ops.MUL, Ops.ADD) and _has_load_src(u):
+            return None
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2 or 0 not in params:
+        return None
+    src_arg = next((k for k in params if k != 0), None)
+    if src_arg is None:
+        return None
+    if not ("float" in str(params[0].dtype) and "float" in str(params[src_arg].dtype)):
+        return None
+    out_size = params[0].dtype.size
+    src_size = params[src_arg].dtype.size
+    if out_size != src_size or out_size <= 0:
+        return None
+
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    half_bits = int(np.frombuffer(np.float32(0.5).tobytes(), dtype=np.int32)[0])
+    # VMEM layout: addr 0 = broadcast-0.5 const tile, then per-tile slots
+    # (2 per tile: input, output) starting at addr 1.
+    data_plan = [{
+        "type": "VMEM", "addr": 0, "layout": "broadcast_const",
+        "value": half_bits, "count": _TILE_ELEMS, "dtype": "int32",
+    }]
+    all_instrs = [_load(0, 0)]   # v0 := [0.5, 0.5, …]
+    outputs = []
+    FMUL_OP = _VPU_OPS["FMUL"]
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count  = min(_TILE_ELEMS, out_size - offset)
+        in_vmem  = 1 + tile_idx * 2
+        out_vmem = 2 + tile_idx * 2
+        data_plan.append({"type": "VMEM", "addr": in_vmem, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        all_instrs += [
+            _load(1, in_vmem),                  # v1 := x
+            _vpu_log2(2, 1),                    # v2 := log2(x)
+            _vpu(3, 2, FMUL_OP, 0),             # v3 := 0.5 * log2(x)
+            _vpu_exp2(4, 3),                    # v4 := exp2(v3) = sqrt(x)
+            _store(out_vmem, 4),
+        ]
+        outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
 
 
 def _render_reciprocal_sxu_program(uops: list[UOp]) -> dict | None:
