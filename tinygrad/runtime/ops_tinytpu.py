@@ -311,6 +311,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return copy_desc
         if (recip_desc := _render_reciprocal_sxu_program(uops)) is not None:
             return recip_desc
+        if (sigmoid_desc := _render_sigmoid_sxu_program(uops)) is not None:
+            return sigmoid_desc
         if (scaled_exp2_desc := _render_scaled_exp2_sxu_program(uops)) is not None:
             return scaled_exp2_desc
         if (exp2_desc := _render_exp2_sxu_program(uops)) is not None:
@@ -2402,6 +2404,113 @@ def _render_scaled_exp2_sxu_program(uops: list[UOp]) -> dict | None:
             _vpu(2, 1, mul_opcode, 0),
             _vpu_exp2(3, 2),
             _store(out_vmem, 3),
+        ]
+        outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
+
+
+def _render_sigmoid_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render sigmoid(x) = reciprocal(1 + exp2(x * -1/ln2)).
+
+    Pattern: one RECIPROCAL whose input is an ADD of CONST(1.0) and an
+    EXP2 of a scalar-const-scaled input. Emits per tile:
+      LOAD v0 = broadcast -1/ln2
+      LOAD v1 = broadcast 1.0
+      LOAD v2 = x
+      VPU  v3 = FMUL(v2, v0)
+      VPU  v4 = EXP2(v3)
+      VPU  v5 = FADD(v4, v1)
+      VPU  v6 = FRECIP(v5)
+      STORE   = v6
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    if op_counts.get("RECIPROCAL", 0) < 1 or op_counts.get("EXP2", 0) < 1:
+        return None
+    if op_counts.get("LOG2", 0) > 0 or op_counts.get("SIN", 0) > 0 or op_counts.get("SQRT", 0) > 0:
+        return None
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2 or 0 not in params:
+        return None
+    src_arg = next((k for k in params if k != 0), None)
+    if src_arg is None:
+        return None
+    if not ("float" in str(params[0].dtype) and "float" in str(params[src_arg].dtype)):
+        return None
+    out_size = params[0].dtype.size
+    if out_size != params[src_arg].dtype.size or out_size <= 0:
+        return None
+
+    stores = [u for u in uops if u.op is Ops.STORE]
+    if not stores:
+        return None
+    val = stores[0].src[1]
+    while val.op in (Ops.VECTORIZE, Ops.CAST, Ops.GEP):
+        val = val.src[0] if len(val.src) > 0 else val
+    if val.op is not Ops.RECIPROCAL:
+        return None
+    add_node = val.src[0]
+    while add_node.op in (Ops.CAST, Ops.GEP):
+        add_node = add_node.src[0]
+    if add_node.op is not Ops.ADD:
+        return None
+    const_src = next((s for s in add_node.src
+                      if s.op is Ops.CONST or
+                      (s.op in (Ops.CAST, Ops.VECTORIZE, Ops.GEP) and
+                       s.src and s.src[0].op is Ops.CONST)), None)
+    exp_src = next((s for s in add_node.src if s is not const_src), None)
+    if const_src is None or exp_src is None:
+        return None
+    # Unwrap to find CONST
+    cst = const_src
+    while cst.op in (Ops.CAST, Ops.VECTORIZE, Ops.GEP):
+        cst = cst.src[0]
+    if cst.op is not Ops.CONST or float(cst.arg) != 1.0:
+        return None
+    while exp_src.op in (Ops.CAST, Ops.GEP):
+        exp_src = exp_src.src[0]
+    if exp_src.op is not Ops.EXP2:
+        return None
+    mul_node = exp_src.src[0]
+    while mul_node.op in (Ops.CAST, Ops.GEP):
+        mul_node = mul_node.src[0]
+    if mul_node.op is not Ops.MUL:
+        return None
+    scale_const = next((s for s in mul_node.src if s.op is Ops.CONST), None)
+    input_src   = next((s for s in mul_node.src if s is not scale_const), None)
+    if scale_const is None or input_src is None or not _has_load_src(input_src):
+        return None
+
+    scale_bits = int(np.frombuffer(np.float32(float(scale_const.arg)).tobytes(), dtype=np.int32)[0])
+    one_bits   = int(np.frombuffer(np.float32(1.0).tobytes(), dtype=np.int32)[0])
+
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    data_plan = [
+        {"type": "VMEM", "addr": 0, "layout": "broadcast_const",
+         "value": scale_bits, "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 1, "layout": "broadcast_const",
+         "value": one_bits,   "count": _TILE_ELEMS, "dtype": "int32"},
+    ]
+    all_instrs = [_load(0, 0), _load(1, 1)]
+    FMUL_OP  = _VPU_OPS["FMUL"]
+    FADD_OP  = _VPU_OPS["FADD"]
+    FRECIP_OP = _VPU_OPS["FRECIP"]
+    outputs = []
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count  = min(_TILE_ELEMS, out_size - offset)
+        in_vmem  = 2 + tile_idx * 2
+        out_vmem = 3 + tile_idx * 2
+        data_plan.append({"type": "VMEM", "addr": in_vmem, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        all_instrs += [
+            _load(2, in_vmem),
+            _vpu(3, 2, FMUL_OP, 0),
+            _vpu_exp2(4, 3),
+            _vpu(5, 4, FADD_OP, 1),
+            _vpu(6, 5, FRECIP_OP),
+            _store(out_vmem, 6),
         ]
         outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
     all_instrs.append(_halt())
