@@ -754,15 +754,48 @@ def _render_colreduce_sxu_program(uops: list[UOp]) -> dict | None:
     _REDUCE_VPU = _REDUCE_VPU_FLOAT if is_float_col else _REDUCE_VPU_INT
     vpu_op, combine_op, pad_value = _REDUCE_VPU[reduce_op]
 
+    # Post-reduction scalar mul (e.g. mean = sum * (1/N)).
+    # Only detect the pattern for FLOAT SUM reductions: one extra
+    # data-path MUL with a float CONST combines the reduction output
+    # with a scalar. Skipping other cases keeps int PROD / MIN / MAX
+    # reductions routing through the existing code paths.
+    post_op_name = None
+    post_const = None
+    if is_float_col and reduce_op == "SUM":
+        post_mul_uops = [u for u in uops if u.op is Ops.MUL and _has_load_src(u)]
+        for u in post_mul_uops:
+            cst = next((s for s in u.src if s.op is Ops.CONST and isinstance(s.arg, float)), None)
+            if cst is not None:
+                post_op_name = "MUL"
+                post_const = float(cst.arg)
+                break
+
     out_arg, src_arg = 0, 1
     num_row_tiles = (nrows + _ROWS - 1) // _ROWS
     num_col_tiles = (ncols + _COLS - 1) // _COLS
+    # VMEM slot layout: slots 0..M-1 hold src col-tiles + output tiles, and
+    # the post-reduction constant (if any) sits one past the end so we
+    # don't collide with either.
+    reserved_slots = num_col_tiles * (num_row_tiles + 1)
     data_plan: list[dict] = []
     all_instrs: list[str] = []
     outputs: list[dict] = []
 
     src_addr = 0
     vreg = 0
+
+    # Pre-load scaling constant (broadcast tile) if post-op is in play.
+    post_const_vreg = None
+    post_const_addr = None
+    if post_op_name is not None:
+        post_const_addr = reserved_slots
+        c_bits = int(np.frombuffer(np.float32(post_const).tobytes(), dtype=np.int32)[0])
+        data_plan.append({"type": "VMEM", "addr": post_const_addr,
+                          "layout": "broadcast_const", "value": c_bits,
+                          "count": _TILE_ELEMS, "dtype": "int32"})
+        post_const_vreg = vreg; vreg += 1
+        all_instrs.append(_load(post_const_vreg, post_const_addr))
+
     # Each col-tile gets its own output; within a col-tile we reduce all row-tiles.
     for ct in range(num_col_tiles):
         col_base = ct * _COLS
@@ -797,6 +830,12 @@ def _render_colreduce_sxu_program(uops: list[UOp]) -> dict | None:
                 all_instrs.append(_vpu(out_vreg, acc, combine_op, nxt))
                 acc = out_vreg
             final_vreg = acc
+        # Apply post-reduction scalar op (currently only FMUL).
+        if post_op_name is not None:
+            scaled_vreg = vreg; vreg += 1
+            post_vpu = _VPU_OPS["FMUL"] if post_op_name == "MUL" else _VPU_OPS["FADD"]
+            all_instrs.append(_vpu(scaled_vreg, final_vreg, post_vpu, post_const_vreg))
+            final_vreg = scaled_vreg
         out_addr = src_addr; src_addr += 1
         all_instrs.append(_store(out_addr, final_vreg))
         outputs.append({
