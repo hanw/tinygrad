@@ -2999,11 +2999,13 @@ def _render_self_square_sxu_program(uops: list[UOp]) -> dict | None:
     s_left, s_right = val.src[0], val.src[1]
     if s_left is not s_right:
         return None
-    # Must chase through CAST/GEP and terminate at a LOAD/INDEX on src_arg.
+    # Must chase through CAST/GEP and terminate at a LOAD on src_arg — if
+    # the left factor is itself a MUL we are looking at x**4 or higher,
+    # which needs a different renderer.
     cur = s_left
-    while cur.op in (Ops.CAST, Ops.GEP):
+    while cur.op in (Ops.CAST, Ops.GEP, Ops.VECTORIZE):
         cur = cur.src[0]
-    if not _has_load_src(cur):
+    if cur.op is not Ops.LOAD:
         return None
 
     num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
