@@ -311,6 +311,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return copy_desc
         if (recip_desc := _render_reciprocal_sxu_program(uops)) is not None:
             return recip_desc
+        if (tanh_desc := _render_tanh_sxu_program(uops)) is not None:
+            return tanh_desc
         if (sigmoid_desc := _render_sigmoid_sxu_program(uops)) is not None:
             return sigmoid_desc
         if (scaled_exp2_desc := _render_scaled_exp2_sxu_program(uops)) is not None:
@@ -2411,6 +2413,155 @@ def _render_scaled_exp2_sxu_program(uops: list[UOp]) -> dict | None:
             "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
 
 
+def _render_tanh_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render tanh(x) = 2*sigmoid(2x) - 1.
+
+    The tinygrad decomposition chains an outer +(-1) and *2 around the
+    sigmoid. The simplest way to match the chain is to run sigmoid's
+    FMUL+EXP2+FADD+FRECIP microprogram, then rescale: t = 2*s - 1.
+    Full kernel per tile:
+      LOAD v0 = broadcast (2 * -1/ln2) = -2.885390 (fold 2* inside exp arg)
+      LOAD v1 = broadcast 1.0
+      LOAD v2 = broadcast 2.0
+      LOAD v3 = broadcast -1.0
+      LOAD v4 = x
+      VPU  v5 = FMUL(v4, v0)       # 2x*-1/ln2
+      VPU  v6 = EXP2(v5)
+      VPU  v7 = FADD(v6, v1)        # 1 + exp(-2x)
+      VPU  v8 = FRECIP(v7)           # sigmoid(2x)
+      VPU  v9 = FMUL(v8, v2)         # 2*sigmoid(2x)
+      VPU  v10 = FADD(v9, v3)         # 2*sigmoid(2x) - 1 = tanh(x)
+      STORE   = v10
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    if op_counts.get("RECIPROCAL", 0) < 1 or op_counts.get("EXP2", 0) < 1:
+        return None
+    if op_counts.get("LOG2", 0) > 0 or op_counts.get("SIN", 0) > 0 or op_counts.get("SQRT", 0) > 0:
+        return None
+    # tanh chain wraps the sigmoid shape with 2 extra muls + 1 extra add.
+    # Distinguish from sigmoid: tanh has >1 ADD and >1 MUL in data path.
+    adds = op_counts.get("ADD", 0)
+    muls = op_counts.get("MUL", 0)
+    if adds < 2 or muls < 2:
+        return None
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2 or 0 not in params:
+        return None
+    src_arg = next((k for k in params if k != 0), None)
+    if src_arg is None:
+        return None
+    if not ("float" in str(params[0].dtype) and "float" in str(params[src_arg].dtype)):
+        return None
+    out_size = params[0].dtype.size
+    if out_size != params[src_arg].dtype.size or out_size <= 0:
+        return None
+
+    # Walk the store value to confirm: ADD(MUL(CONST(2), RECIPROCAL(...)), CONST(-1))
+    stores = [u for u in uops if u.op is Ops.STORE]
+    if not stores:
+        return None
+    val = stores[0].src[1]
+    while val.op in (Ops.VECTORIZE, Ops.CAST, Ops.GEP):
+        val = val.src[0] if len(val.src) > 0 else val
+    if val.op is not Ops.ADD:
+        return None
+    outer_const = next((s for s in val.src
+                        if (s.op is Ops.CONST) or
+                        (s.op in (Ops.CAST, Ops.GEP) and s.src and s.src[0].op is Ops.CONST)), None)
+    inner = next((s for s in val.src if s is not outer_const), None)
+    if outer_const is None or inner is None:
+        return None
+    while outer_const.op in (Ops.CAST, Ops.GEP):
+        outer_const = outer_const.src[0]
+    if float(outer_const.arg) != -1.0:
+        return None
+    while inner.op in (Ops.CAST, Ops.GEP):
+        inner = inner.src[0]
+    if inner.op is not Ops.MUL:
+        return None
+    scale_const = next((s for s in inner.src if s.op is Ops.CONST), None)
+    sigmoid_node = next((s for s in inner.src if s is not scale_const), None)
+    if scale_const is None or sigmoid_node is None or float(scale_const.arg) != 2.0:
+        return None
+    while sigmoid_node.op in (Ops.CAST, Ops.GEP):
+        sigmoid_node = sigmoid_node.src[0]
+    if sigmoid_node.op is not Ops.RECIPROCAL:
+        return None
+    add_in = sigmoid_node.src[0]
+    while add_in.op in (Ops.CAST, Ops.GEP):
+        add_in = add_in.src[0]
+    if add_in.op is not Ops.ADD:
+        return None
+    one_c = next((s for s in add_in.src
+                  if (s.op is Ops.CONST) or
+                  (s.op in (Ops.CAST, Ops.GEP) and s.src and s.src[0].op is Ops.CONST)), None)
+    exp_src = next((s for s in add_in.src if s is not one_c), None)
+    if one_c is None or exp_src is None:
+        return None
+    while one_c.op in (Ops.CAST, Ops.GEP):
+        one_c = one_c.src[0]
+    if float(one_c.arg) != 1.0:
+        return None
+    while exp_src.op in (Ops.CAST, Ops.GEP):
+        exp_src = exp_src.src[0]
+    if exp_src.op is not Ops.EXP2:
+        return None
+    exp_in = exp_src.src[0]
+    while exp_in.op in (Ops.CAST, Ops.GEP):
+        exp_in = exp_in.src[0]
+    if exp_in.op is not Ops.MUL:
+        return None
+    inner_scale = next((s for s in exp_in.src if s.op is Ops.CONST), None)
+    input_src   = next((s for s in exp_in.src if s is not inner_scale), None)
+    if inner_scale is None or input_src is None or not _has_load_src(input_src):
+        return None
+
+    # Fold (2 * -1/ln2) into one constant so the kernel saves one FMUL.
+    combined_scale = 2.0 * float(inner_scale.arg)
+    scale_bits   = int(np.frombuffer(np.float32(combined_scale).tobytes(), dtype=np.int32)[0])
+    one_bits     = int(np.frombuffer(np.float32(1.0).tobytes(),  dtype=np.int32)[0])
+    two_bits     = int(np.frombuffer(np.float32(2.0).tobytes(),  dtype=np.int32)[0])
+    negone_bits  = int(np.frombuffer(np.float32(-1.0).tobytes(), dtype=np.int32)[0])
+
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    data_plan = [
+        {"type": "VMEM", "addr": 0, "layout": "broadcast_const", "value": scale_bits,
+         "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 1, "layout": "broadcast_const", "value": one_bits,
+         "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 2, "layout": "broadcast_const", "value": two_bits,
+         "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 3, "layout": "broadcast_const", "value": negone_bits,
+         "count": _TILE_ELEMS, "dtype": "int32"},
+    ]
+    all_instrs = [_load(0, 0), _load(1, 1), _load(2, 2), _load(3, 3)]
+    FMUL_OP   = _VPU_OPS["FMUL"]
+    FADD_OP   = _VPU_OPS["FADD"]
+    FRECIP_OP = _VPU_OPS["FRECIP"]
+    outputs = []
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count  = min(_TILE_ELEMS, out_size - offset)
+        in_vmem  = 4 + tile_idx * 2
+        out_vmem = 5 + tile_idx * 2
+        data_plan.append({"type": "VMEM", "addr": in_vmem, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        all_instrs += [
+            _load(4, in_vmem),
+            _vpu(5, 4, FMUL_OP, 0),
+            _vpu_exp2(6, 5),
+            _vpu(7, 6, FADD_OP, 1),
+            _vpu(8, 7, FRECIP_OP),
+            _vpu(9, 8, FMUL_OP, 2),
+            _vpu(10, 9, FADD_OP, 3),
+            _store(out_vmem, 10),
+        ]
+        outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
+
+
 def _render_sigmoid_sxu_program(uops: list[UOp]) -> dict | None:
     """Render sigmoid(x) = reciprocal(1 + exp2(x * -1/ln2)).
 
@@ -2587,6 +2738,11 @@ def _render_reciprocal_sxu_program(uops: list[UOp]) -> dict | None:
     """
     op_counts = Counter(u.op.name for u in uops)
     if op_counts.get("RECIPROCAL", 0) < 1:
+        return None
+    # Reject kernels that mix RECIPROCAL with transcendentals (tanh,
+    # sigmoid, scaled-exp2) — those belong to their dedicated composite
+    # renderers, not the plain 1/x path.
+    if any(op_counts.get(n, 0) for n in ("EXP2", "LOG2", "SIN", "SQRT")):
         return None
     _allowed = {"RECIPROCAL", "CONST", "INDEX", "LOAD", "STORE", "PARAM", "SINK",
                 "GROUP", "END", "RANGE", "VECTORIZE", "GEP", "MUL", "ADD", "CAST"}
