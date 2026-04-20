@@ -4527,6 +4527,12 @@ def _mxu_psum_acc(wbase: int, abase: int, tiles: int,
                   psum_addr: int, psum_row: int) -> str:
     return _mxu(wbase, abase, tiles, psum_addr, psum_row, 2)
 
+def _mxu_os(wbase: int, abase: int, tiles: int) -> str:
+    # SXU_DISPATCH_MXU_OS opcode = 23. Routes the dispatch through
+    # Controller.startOS so dfModeReg latches DF_OUTPUT_STATIONARY
+    # for the duration. PSUM plumbing is not available in OS mode yet.
+    return f"2 23 0 0 0 0 0 {wbase} {abase} {tiles}"
+
 def _psum_read(vd: int, psum_addr: int) -> str:
     # SXU_PSUM_READ opcode = 17; vmemAddr doubles as PSUM bucket index.
     return f"2 17 {psum_addr} {vd} 0 0 0 0 0 0"
