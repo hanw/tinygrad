@@ -1333,8 +1333,13 @@ def _render_multistep_sxu_program(uops: list[UOp]) -> dict | None:
 
     # --- Float scalar-numerator divide: 2 params (x, out), MUL + RECIPROCAL, float const numerator ---
     # Pattern: c / x = c * (1/x) = FMUL(broadcast(c_bits), FRECIP(x))
+    # Guard against transcendental-wrapping kernels (tanh, sigmoid, etc.)
+    # whose RECIPROCAL sits inside a larger expression. Those must route
+    # to their dedicated renderers further down the chain rather than
+    # silently miscompiling as c/x.
     if (len(src_params) == 1 and has_recip and has_mul and all_float
-            and not has_where and not has_cmplt):
+            and not has_where and not has_cmplt
+            and not any(op_counts.get(n, 0) for n in ("EXP2", "LOG2", "SIN", "SQRT"))):
         recip_uops = [u for u in uops if u.op is Ops.RECIPROCAL and _has_load_src(u)]
         # Find float const used as MUL operand alongside the RECIPROCAL
         num_const = None
@@ -2516,8 +2521,10 @@ def _render_tanh_sxu_program(uops: list[UOp]) -> dict | None:
     if inner_scale is None or input_src is None or not _has_load_src(input_src):
         return None
 
-    # Fold (2 * -1/ln2) into one constant so the kernel saves one FMUL.
-    combined_scale = 2.0 * float(inner_scale.arg)
+    # tinygrad's tanh decomposition pre-scales by (2·-1/ln2) before EXP2,
+    # so inner_scale.arg already holds the full -2.885 multiplier. Use
+    # it directly — the earlier "* 2" fold was double-scaling.
+    combined_scale = float(inner_scale.arg)
     scale_bits   = int(np.frombuffer(np.float32(combined_scale).tobytes(), dtype=np.int32)[0])
     one_bits     = int(np.frombuffer(np.float32(1.0).tobytes(),  dtype=np.int32)[0])
     two_bits     = int(np.frombuffer(np.float32(2.0).tobytes(),  dtype=np.int32)[0])
