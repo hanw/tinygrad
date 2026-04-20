@@ -513,12 +513,15 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
     has_store = op_counts.get("STORE", 0) > 0
     if not has_store:
         return None
-    # Reject kernels where a unary transcendental or reciprocal feeds into
-    # the reduction chain. The reduce renderer only knows how to stream
-    # raw loaded tiles through VPU_*_REDUCE_TILE; an unhandled pre-
-    # reduction unary would be silently dropped and the sum/max/etc.
-    # would be computed over the unprocessed input (giving wrong results).
+    # Reject kernels where pre-reduction data-path processing sits
+    # between the LOAD(s) and the reduction. The reduce renderer only
+    # streams raw loaded tiles through VPU_*_REDUCE_TILE; any unhandled
+    # pre-reduction op (transcendental, reciprocal, WHERE-based abs,
+    # conditional selection) would be silently dropped and the reduction
+    # would run over the unprocessed input (giving wrong results).
     if any(op_counts.get(n, 0) for n in ("EXP2", "LOG2", "SIN", "SQRT", "RECIPROCAL")):
+        return None
+    if op_counts.get("WHERE", 0) > 0 or op_counts.get("CMPLT", 0) > 0 or op_counts.get("CMPEQ", 0) > 0 or op_counts.get("CMPNE", 0) > 0:
         return None
 
     # Float reductions: sum, max, min supported today. Prod still needs its
