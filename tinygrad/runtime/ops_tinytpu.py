@@ -35,7 +35,7 @@ _VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "SUM_REDUCE": 4, "CMPLT": 5, "CMPNE": 
              "FSUM_REDUCE": 42, "FMAX_REDUCE": 43, "FMIN_REDUCE": 44,
              "FSUM_REDUCE_COL": 45, "FMAX_REDUCE_COL": 46, "FMIN_REDUCE_COL": 47,
              "FPROD_REDUCE_TILE": 48, "FPROD_REDUCE": 49, "FPROD_REDUCE_COL": 50,
-             "EXP2": 51, "LOG2": 52}
+             "EXP2": 51, "LOG2": 52, "SIN": 53}
 _VPU_BOOL_OPS = {_VPU_OPS["CMPLT"], _VPU_OPS["CMPNE"], _VPU_OPS["CMPEQ"]}
 _SXU_OPS = {"LOAD_VREG": 0, "STORE_VREG": 1, "DISPATCH_VPU": 2, "DISPATCH_XLU_BROADCAST": 3, "DISPATCH_MXU": 4, "WAIT_MXU": 5, "LOAD_MXU_RESULT": 6, "HALT": 7, "DISPATCH_SELECT": 8, "BROADCAST_SCALAR": 9, "BROADCAST_ROW": 10, "BROADCAST_COL": 11, "DISPATCH_XLU_TRANSPOSE": 12, "LOAD_VPU_RESULT": 13, "LOAD_XLU_RESULT": 14, "PSUM_WRITE": 15, "PSUM_ACCUMULATE": 16, "PSUM_READ": 17}
 
@@ -236,7 +236,8 @@ class TinyTPURenderer(Renderer):
     # decompositions are skipped and EXP2/LOG2/SIN pass through to the
     # SXU renderer as single UOps.
     code_for_op = {Ops.EXP2: (lambda *_a, **_k: None),
-                   Ops.LOG2: (lambda *_a, **_k: None)}
+                   Ops.LOG2: (lambda *_a, **_k: None),
+                   Ops.SIN:  (lambda *_a, **_k: None)}
     tensor_cores = [TensorCore(
         dims=(4, 4, 4),
         threads=1,
@@ -313,6 +314,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return exp2_desc
         if (log2_desc := _render_log2_sxu_program(uops)) is not None:
             return log2_desc
+        if (sin_desc := _render_sin_sxu_program(uops)) is not None:
+            return sin_desc
         if (trunc_desc := _render_trunc_sxu_program(uops)) is not None:
             return trunc_desc
         if (divmod_desc := _render_scalar_const_divmod_sxu_program(uops)) is not None:
@@ -2323,6 +2326,10 @@ def _render_log2_sxu_program(uops: list[UOp]) -> dict | None:
     return _render_unary_transcendental_sxu_program(uops, "LOG2", _vpu_log2)
 
 
+def _render_sin_sxu_program(uops: list[UOp]) -> dict | None:
+    return _render_unary_transcendental_sxu_program(uops, "SIN", _vpu_sin)
+
+
 def _render_reciprocal_sxu_program(uops: list[UOp]) -> dict | None:
     """Render plain float32 reciprocal (1/x) as SXU_PROGRAM using VPU_FRECIP.
 
@@ -3943,6 +3950,12 @@ def _vpu_log2(vd: int, va: int) -> str:
     # in the TranscUnit walker. Exact at powers of two, ~28% error at
     # worst-case fractional inputs. ~96 cycles per tile (6 steps/lane).
     return _vpu(vd, va, _VPU_OPS["LOG2"])
+
+def _vpu_sin(vd: int, va: int) -> str:
+    # VPU_SIN (opcode 53). Degree-5 Taylor through the TranscUnit walker.
+    # Accurate for |x| <= π/2; diverges for |x| > π. Upstream range
+    # reduction (mod 2π + quadrant fold) must be emitted by the renderer.
+    return _vpu(vd, va, _VPU_OPS["SIN"])
 
 def _select(vd: int, cond: int, lhs: int, rhs: int) -> str:
     return f"2 8 0 {vd} {cond} 0 {lhs} {rhs} 0 0"
