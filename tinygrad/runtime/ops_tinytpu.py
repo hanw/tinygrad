@@ -2490,9 +2490,12 @@ def _render_scaled_log2_sxu_program(uops: list[UOp]) -> dict | None:
     if log2_node.op is not Ops.LOG2:
         return None
     input_src = log2_node.src[0]
-    while input_src.op in (Ops.CAST, Ops.GEP):
+    while input_src.op in (Ops.CAST, Ops.GEP, Ops.VECTORIZE):
         input_src = input_src.src[0]
-    if not _has_load_src(input_src):
+    # Require the LOG2 input to terminate at a LOAD. Compound expressions
+    # (e.g. LOG2(ADD(x, 5)) for Tensor(x+5).log()) would otherwise be
+    # silently rendered as log(x).
+    if input_src.op is not Ops.LOAD:
         return None
 
     scale_bits = int(np.frombuffer(np.float32(float(scale_const.arg)).tobytes(), dtype=np.int32)[0])
