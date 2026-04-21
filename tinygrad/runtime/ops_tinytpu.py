@@ -5496,23 +5496,26 @@ def _mxu_psum_acc(wbase: int, abase: int, tiles: int,
                   psum_addr: int, psum_row: int) -> str:
     return _mxu(wbase, abase, tiles, psum_addr, psum_row, 2)
 
-def _mxu_os(wbase: int, abase: int, tiles: int) -> str:
-    # SXU_DISPATCH_MXU_OS opcode = 23. Routes the dispatch through
-    # Controller.startOS so dfModeReg latches DF_OUTPUT_STATIONARY
-    # for the duration. PSUM plumbing is not available in OS mode yet.
+def _mxu_accumulate(wbase: int, abase: int, tiles: int) -> str:
+    # SXU_DISPATCH_MXU_ACCUMULATE opcode = 23. Routes through
+    # Controller.startAccumulate: WS feed path with drain-time PE
+    # clear skipped, so consecutive dispatches sum into the same PE
+    # accumulator (multi-K-tile GEMM). Not a distinct dataflow — the
+    # PE still holds a preloaded weight. PSUM plumbing not available.
     return f"2 23 0 0 0 0 0 {wbase} {abase} {tiles}"
 
 def _mxu_clear() -> str:
     # SXU_MXU_CLEAR opcode = 24. Zeroes the systolic-array PE
-    # accumulators. Needed between OS-mode accumulation epochs
-    # because startOS intentionally preserves accumulator state.
+    # accumulators. Needed between accumulate epochs and when
+    # re-entering WS from a previous accumulate/OS dispatch.
     return "2 24 0 0 0 0 0 0 0 0"
 
-def _mxu_os_real(wbase: int, abase: int, klen: int) -> str:
-    # SXU_DISPATCH_MXU_OS_REAL opcode = 25. Routes through
-    # Controller.startOsReal: weights + activations both stream as
-    # a staircase, full (rows x cols) psum drained via resultsMatrix().
-    # klen reuses the MXU tileLen field (<= rows).
+def _mxu_os(wbase: int, abase: int, klen: int) -> str:
+    # SXU_DISPATCH_MXU_OS opcode = 25. Routes through Controller.startOS:
+    # real output-stationary — weights + activations both stream as a
+    # staircase, each PE holds its own psum, full (rows x cols) psum
+    # drained via resultsMatrix(). klen reuses the MXU tileLen field
+    # (<= rows for the current single-tile weight SRAM read).
     return f"2 25 0 0 0 0 0 {wbase} {abase} {klen}"
 
 def _psum_read(vd: int, psum_addr: int) -> str:
