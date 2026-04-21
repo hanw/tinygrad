@@ -663,12 +663,17 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
     all_instrs: list[str] = []
     data_plan: list[dict] = []
 
+    src_is_bool = (isinstance(params[src_arg].dtype, PtrDType)
+                   and params[src_arg].dtype.base.itemsize == 1
+                   and "bool" in str(params[src_arg].dtype))
     for tile_idx in range(num_tiles):
         offset = tile_idx * _TILE_ELEMS
         count = min(_TILE_ELEMS, src_size - offset)
         vmem_addr = tile_idx
         entry = {"type": "VMEM", "addr": vmem_addr, "param": src_arg,
                  "offset": offset, "count": count, "dtype": "int32"}
+        if src_is_bool:
+            entry["bool"] = True
         if pad_value != 0:
             entry["pad_value"] = pad_value
         data_plan.append(entry)
