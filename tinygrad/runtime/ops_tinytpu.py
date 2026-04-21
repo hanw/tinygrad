@@ -790,6 +790,14 @@ def _render_colreduce_sxu_program(uops: list[UOp]) -> dict | None:
                 post_const = float(cst.arg)
                 break
 
+    # Reject col-reduce kernels with pre-reduction data-path MUL that we
+    # can't fold into a post-op (sum(x*x, axis=0), sum(-x, axis=0), etc.).
+    # Float MIN uses a MUL(-1) negation decomp and stays on this path;
+    # guard fires only for SUM / MAX.
+    has_data_mul = data_alu.get("MUL", 0) > 0
+    if has_data_mul and post_op_name is None and reduce_op in ("SUM", "MAX"):
+        return None
+
     out_arg, src_arg = 0, 1
     num_row_tiles = (nrows + _ROWS - 1) // _ROWS
     num_col_tiles = (ncols + _COLS - 1) // _COLS
@@ -929,6 +937,10 @@ def _render_rowreduce_sxu_program(uops: list[UOp]) -> dict | None:
     _REDUCE_VPU = _REDUCE_VPU_FLOAT if is_float_row else _REDUCE_VPU_INT
     vpu_op, combine_op, pad_value = _REDUCE_VPU[reduce_op]
 
+    # Pre-reduction data-path MUL count (reused by both post-op detection
+    # and the guard just below).
+    data_alu = _data_alu_ops(uops)
+
     # Post-reduction scalar mul for float SUM (mean = sum * (1/ncols)).
     post_op_name = None
     post_const = None
@@ -940,6 +952,14 @@ def _render_rowreduce_sxu_program(uops: list[UOp]) -> dict | None:
                     post_op_name = "MUL"
                     post_const = float(cst.arg)
                     break
+
+    # Reject row-reduce kernels with pre-reduction data-path MUL that we
+    # can't fold into a post-op (sum(x*x, axis=1), max(-x, axis=1), etc.).
+    # Float MIN uses a MUL(-1) negation decomposition and stays on this
+    # path; guard only fires for SUM / MAX combos.
+    has_data_mul = data_alu.get("MUL", 0) > 0
+    if has_data_mul and post_op_name is None and reduce_op in ("SUM", "MAX"):
+        return None
 
     out_arg, src_arg = 0, 1
     num_row_tiles = (nrows + _ROWS - 1) // _ROWS
