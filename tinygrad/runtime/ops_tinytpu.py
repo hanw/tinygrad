@@ -315,6 +315,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return tanh_desc
         if (clip_desc := _render_clip_sxu_program(uops)) is not None:
             return clip_desc
+        if (clamp_sb_desc := _render_clamp_single_bound_sxu_program(uops)) is not None:
+            return clamp_sb_desc
         if (leaky_relu_desc := _render_leaky_relu_sxu_program(uops)) is not None:
             return leaky_relu_desc
         if (softsign_desc := _render_softsign_sxu_program(uops)) is not None:
@@ -3115,6 +3117,112 @@ def _render_leaky_relu_sxu_program(uops: list[UOp]) -> dict | None:
             "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
 
 
+def _render_clamp_single_bound_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render Tensor.clamp(min_=c) = max(x, c) / clamp(max_=c) = min(x, c).
+
+    Single-bound clamp decomposes to WHERE(CMPLT(x, c), c, x) or
+    WHERE(CMPLT(c, x), c, x). One WHERE, one CMPLT, one float CONST,
+    one PARAM, all float. Emits per tile:
+      LOAD v0 = x
+      LOAD v1 = broadcast c
+      FMAX/FMIN v2 = max-or-min(v0, v1)
+      STORE v2
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    if any(op_counts.get(n, 0) for n in ("EXP2", "LOG2", "SIN", "SQRT", "RECIPROCAL")):
+        return None
+    if op_counts.get("WHERE", 0) < 1 or op_counts.get("CMPLT", 0) < 1:
+        return None
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2 or 0 not in params:
+        return None
+    src_arg = next((k for k in params if k != 0), None)
+    if src_arg is None:
+        return None
+    if not ("float" in str(params[0].dtype) and "float" in str(params[src_arg].dtype)):
+        return None
+    out_size = params[0].dtype.size
+    if out_size != params[src_arg].dtype.size or out_size <= 0:
+        return None
+    # Require exactly one data-path float CONST (the bound). No data-path MULs.
+    data_alu = _data_alu_ops(uops)
+    if data_alu.get("MUL", 0) > 0:
+        return None
+    # Extract bound + detect which side of WHERE it's on.
+    where_uop = next((u for u in uops if u.op is Ops.WHERE), None)
+    if where_uop is None:
+        return None
+    cond = where_uop.src[0]
+    while cond.op in (Ops.CAST, Ops.GEP, Ops.VECTORIZE):
+        cond = cond.src[0]
+    if cond.op is not Ops.CMPLT:
+        return None
+    lhs_body = where_uop.src[1]
+    rhs_body = where_uop.src[2]
+    def _is_float_const(u):
+        while u.op in (Ops.CAST, Ops.GEP, Ops.VECTORIZE):
+            u = u.src[0]
+        return u.op is Ops.CONST and not isinstance(u.arg, bool) and isinstance(u.arg, float)
+    # Exactly one of the WHERE bodies must be a float CONST, the other
+    # must be the raw LOAD. 0.0 is handled by the RELU path.
+    if _is_float_const(lhs_body) == _is_float_const(rhs_body):
+        return None
+    bound_side = lhs_body if _is_float_const(lhs_body) else rhs_body
+    raw_side   = rhs_body if _is_float_const(lhs_body) else lhs_body
+    while bound_side.op in (Ops.CAST, Ops.GEP, Ops.VECTORIZE):
+        bound_side = bound_side.src[0]
+    if bound_side.op is not Ops.CONST:
+        return None
+    bound = float(bound_side.arg)
+    if bound == 0.0:
+        # RELU handles this in the elementwise renderer.
+        return None
+    # Raw side must terminate at a LOAD.
+    tail = raw_side
+    while tail.op in (Ops.CAST, Ops.GEP, Ops.VECTORIZE):
+        tail = tail.src[0]
+    if tail.op is not Ops.LOAD:
+        return None
+    # Decide FMAX vs FMIN: CMPLT(x, bound) with WHERE selecting bound on
+    # true means clamp-min (x < bound → replace with bound → max(x, bound)).
+    # CMPLT(bound, x) with WHERE selecting bound on true means clamp-max
+    # (bound < x → replace with bound → min(x, bound)).
+    cmplt_a = cond.src[0]
+    while cmplt_a.op in (Ops.CAST, Ops.GEP, Ops.VECTORIZE):
+        cmplt_a = cmplt_a.src[0]
+    # When CMPLT's first operand is the LOAD (x), it's clamp-min → FMAX.
+    use_fmax = cmplt_a.op is Ops.LOAD
+    # If WHERE's lhs_body is the CONST, the "true" branch picks the bound;
+    # the Python decomposition `(x < c).where(c, x)` has lhs_body=bound.
+    if not _is_float_const(lhs_body):
+        # WHERE selects bound on FALSE — opposite of the decomposition above.
+        use_fmax = not use_fmax
+
+    bound_bits = int(np.frombuffer(np.float32(bound).tobytes(), dtype=np.int32)[0])
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    data_plan = [{"type": "VMEM", "addr": 0, "layout": "broadcast_const",
+                  "value": bound_bits, "count": _TILE_ELEMS, "dtype": "int32"}]
+    all_instrs = [_load(0, 0)]
+    op = _VPU_OPS["FMAX" if use_fmax else "FMIN"]
+    outputs = []
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count  = min(_TILE_ELEMS, out_size - offset)
+        in_vmem  = 1 + tile_idx * 2
+        out_vmem = 2 + tile_idx * 2
+        data_plan.append({"type": "VMEM", "addr": in_vmem, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        all_instrs += [
+            _load(1, in_vmem),
+            _vpu(2, 1, op, 0),
+            _store(out_vmem, 2),
+        ]
+        outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
+
+
 def _render_clip_sxu_program(uops: list[UOp]) -> dict | None:
     """Render Tensor.clip(a, b) = max(lo, min(hi, x)) for float tensors.
 
@@ -4232,7 +4340,13 @@ def _render_elementwise_sxu_program(uops: list[UOp]) -> dict | None:
     if not is_neg_add and any(s in data_alu_set for u in data_alu_set for s in u.src):
         return None
 
-    is_relu = is_relu_candidate and op_counts.get("CMPLT", 0) > 0
+    # RELU = WHERE(CMPLT(x, 0), 0, x). Tighten: require the CMPLT's CONST
+    # operand to be 0 so clamp(max=c) for c != 0 doesn't false-match as
+    # RELU (it also has WHERE+CMPLT+CONST but the CONST is the bound, not 0).
+    cmplt_zero_ok = any(u.op is Ops.CMPLT and any(
+        s.op is Ops.CONST and not isinstance(s.arg, bool) and float(s.arg) == 0.0
+        for s in u.src) for u in uops)
+    is_relu = is_relu_candidate and op_counts.get("CMPLT", 0) > 0 and cmplt_zero_ok
 
     # --- Determine VPU op, operand sources, and inputs_per_tile ---
     const_val = None  # set if one operand is a scalar constant
