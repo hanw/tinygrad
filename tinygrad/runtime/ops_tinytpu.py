@@ -5508,6 +5508,13 @@ def _mxu_clear() -> str:
     # because startOS intentionally preserves accumulator state.
     return "2 24 0 0 0 0 0 0 0 0"
 
+def _mxu_os_real(wbase: int, abase: int, klen: int) -> str:
+    # SXU_DISPATCH_MXU_OS_REAL opcode = 25. Routes through
+    # Controller.startOsReal: weights + activations both stream as
+    # a staircase, full (rows x cols) psum drained via resultsMatrix().
+    # klen reuses the MXU tileLen field (<= rows).
+    return f"2 25 0 0 0 0 0 {wbase} {abase} {klen}"
+
 def _psum_read(vd: int, psum_addr: int) -> str:
     # SXU_PSUM_READ opcode = 17; vmemAddr doubles as PSUM bucket index.
     return f"2 17 {psum_addr} {vd} 0 0 0 0 0 0"
