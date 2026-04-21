@@ -1599,9 +1599,14 @@ def _render_multistep_sxu_program(uops: list[UOp]) -> dict | None:
     _has_chained_max = any(u.op is Ops.MAX and _has_load_src(u)
                            and any(_uop_contains(s, Ops.MAX) for s in u.src)
                            for u in uops)
+    # Reject kernels that also carry transcendentals / reciprocal. Softplus
+    # (log(1+exp(x))) decomposes to MAX+MUL+EXP2+LOG2 with no WHERE/CMPLT;
+    # without this guard it silently false-matches as minimum(x, c).
+    _has_trans_or_recip = any(op_counts.get(n, 0) for n in
+                              ("EXP2", "LOG2", "SIN", "SQRT", "RECIPROCAL"))
     if (len(src_params) == 1 and has_max and has_mul and all_float
             and not has_where and data_alu.get("XOR", 0) == 0 and not has_cmplt and not has_idiv
-            and not _has_chained_max):
+            and not _has_chained_max and not _has_trans_or_recip):
         # Find MAX UOp and extract the constant (it's stored as -c)
         max_uops = [u for u in uops if u.op is Ops.MAX and _has_load_src(u)]
         if max_uops:
@@ -1906,6 +1911,12 @@ def _render_where_sxu_program(uops: list[UOp]) -> dict | None:
     if len(params) in (2, 3):
         # Reject kernels with any data-path ALU (abs = MUL + WHERE, etc.).
         if sum(_data_alu_ops(uops).values()) > 0:
+            return None
+        # Reject kernels that also carry transcendentals / reciprocals —
+        # these are not simple WHERE kernels (e.g. softplus decomposes to
+        # WHERE+EXP+LOG). Without this, the outer WHERE would silently
+        # render as `cond ? lhs : rhs` dropping the math branch.
+        if any(op_counts.get(n, 0) for n in ("EXP2", "LOG2", "SIN", "SQRT", "RECIPROCAL")):
             return None
         # Extract CONST sides that are consistent across every WHERE.
         where_lhs_const = None
