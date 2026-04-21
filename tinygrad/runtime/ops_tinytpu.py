@@ -2083,6 +2083,13 @@ def _render_rowbc_sxu_program(uops: list[UOp]) -> dict | None:
     }]
     instructions: list[str] = []
     outputs: list[dict] = []
+    # Remap integer VPU ops to float variants when operating on float tensors.
+    is_float = any("float" in str(params[p].dtype) for p in (out_arg, lhs_arg, rhs_arg))
+    if is_float:
+        _FLOAT_REMAP = {"ADD": "FADD", "SUB": "FSUB", "MUL": "FMUL",
+                        "MAX": "FMAX", "MIN": "FMIN", "CMPLT": "FCMPLT"}
+        if op_name in _FLOAT_REMAP:
+            op_name = _FLOAT_REMAP[op_name]
     vpu_op = _VPU_OPS[op_name]
     rows_per_tile = _ROWS
     num_chunks = (nrows + rows_per_tile - 1) // rows_per_tile
