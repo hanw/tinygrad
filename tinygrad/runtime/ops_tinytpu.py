@@ -2200,6 +2200,14 @@ def _render_colbc_sxu_program(uops: list[UOp]) -> dict | None:
             else:
                 return None
 
+    # Remap integer VPU ops to float variants when operating on float tensors.
+    is_float = any("float" in str(params[p].dtype)
+                   for p in (out_arg, lhs_arg, rhs_arg))
+    if is_float:
+        _FLOAT_REMAP = {"ADD": "FADD", "SUB": "FSUB", "MUL": "FMUL",
+                        "MAX": "FMAX", "MIN": "FMIN", "CMPLT": "FCMPLT"}
+        if vpu_name in _FLOAT_REMAP:
+            vpu_name = _FLOAT_REMAP[vpu_name]
     vpu_op = _VPU_OPS[vpu_name]
     data_plan: list[dict] = [
         {"type": "VMEM", "addr": 0, "param": rhs_arg, "offset": 0, "count": nrows, "dtype": "int32",
