@@ -315,6 +315,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return tanh_desc
         if (clip_desc := _render_clip_sxu_program(uops)) is not None:
             return clip_desc
+        if (leaky_relu_desc := _render_leaky_relu_sxu_program(uops)) is not None:
+            return leaky_relu_desc
         if (softsign_desc := _render_softsign_sxu_program(uops)) is not None:
             return softsign_desc
         if (swish_desc := _render_swish_sxu_program(uops)) is not None:
@@ -3028,6 +3030,84 @@ def _render_softsign_sxu_program(uops: list[UOp]) -> dict | None:
             _vpu(6, 5, FRECIP),              # v6 = 1/(1+|x|)
             _vpu(7, 2, FMUL, 6),             # v7 = x * v6
             _store(out_vmem, 7),
+        ]
+        outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
+
+
+def _render_leaky_relu_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render leaky_relu(x, alpha) = max(alpha*x, x) for alpha in (0, 1).
+
+    tinygrad lowers `(x < 0).where(x*alpha, x)`. For 0 < alpha < 1 this
+    equals `max(alpha*x, x)`. Per tile:
+      LOAD v0 = x
+      LOAD v1 = broadcast alpha
+      FMUL v2 = alpha*x
+      FMAX v3 = max(v2, v0)
+      STORE v3
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    if any(op_counts.get(n, 0) for n in ("EXP2", "LOG2", "SIN", "SQRT", "RECIPROCAL")):
+        return None
+    if op_counts.get("WHERE", 0) < 1 or op_counts.get("CMPLT", 0) < 1:
+        return None
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2 or 0 not in params:
+        return None
+    src_arg = next((k for k in params if k != 0), None)
+    if src_arg is None:
+        return None
+    if not ("float" in str(params[0].dtype) and "float" in str(params[src_arg].dtype)):
+        return None
+    out_size = params[0].dtype.size
+    if out_size != params[src_arg].dtype.size or out_size <= 0:
+        return None
+    # Find the scalar slope: a data-path MUL with a float CONST.
+    alpha = None
+    for u in uops:
+        if u.op is Ops.MUL and _has_load_src(u):
+            cst = next((s for s in u.src if s.op is Ops.CONST and isinstance(s.arg, float)), None)
+            if cst is not None:
+                if alpha is None:
+                    alpha = float(cst.arg)
+                elif alpha != float(cst.arg):
+                    return None
+    if alpha is None or not (0.0 < alpha < 1.0):
+        return None
+    # Reject kernels with more than one CONST used as WHERE lhs/rhs (that
+    # would indicate clip-shape, not leaky_relu).
+    where_consts = []
+    for w in uops:
+        if w.op is not Ops.WHERE: continue
+        for s in (w.src[1], w.src[2]):
+            if s.op is Ops.CONST and isinstance(s.arg, float):
+                where_consts.append(s.arg)
+    # leaky_relu's WHERE has no CONST bodies (alpha*x and x are both
+    # expressions). If we see CONSTs in WHERE bodies, bail.
+    if where_consts:
+        return None
+
+    alpha_bits = int(np.frombuffer(np.float32(alpha).tobytes(), dtype=np.int32)[0])
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    data_plan = [{"type": "VMEM", "addr": 0, "layout": "broadcast_const",
+                  "value": alpha_bits, "count": _TILE_ELEMS, "dtype": "int32"}]
+    all_instrs = [_load(0, 0)]
+    FMUL_OP, FMAX_OP = _VPU_OPS["FMUL"], _VPU_OPS["FMAX"]
+    outputs = []
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count  = min(_TILE_ELEMS, out_size - offset)
+        in_vmem  = 1 + tile_idx * 2
+        out_vmem = 2 + tile_idx * 2
+        data_plan.append({"type": "VMEM", "addr": in_vmem, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        all_instrs += [
+            _load(1, in_vmem),
+            _vpu(2, 1, FMUL_OP, 0),       # v2 = alpha * x
+            _vpu(3, 2, FMAX_OP, 1),       # v3 = max(v2, x)
+            _store(out_vmem, 3),
         ]
         outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
     all_instrs.append(_halt())
