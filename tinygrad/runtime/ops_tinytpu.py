@@ -580,6 +580,16 @@ def _render_reduction_sxu_program(uops: list[UOp]) -> dict | None:
     # Data-path MUL is the MUL-reduction signature (no index-arithmetic MULs).
     data_alu = _data_alu_ops(uops)
     has_data_mul = data_alu.get("MUL", 0) > 0
+    # Reject SUM/MAX reductions with pre-reduction MULs we can't fold into
+    # a post-op. Without this, sum(x*x) and sum(-x) silently return sum(x)
+    # because the reducer ignores the inner MULs. PROD reductions (no ADD
+    # in data path) still route through MUL_REDUCE_TILE below.
+    if has_data_mul and has_add and post_op is None:
+        return None
+    # Float-min negation uses a MUL(-1) decomposition that's part of the
+    # reduction, not a pre-op — allow it through the existing path.
+    if has_data_mul and has_max and not is_float_min and post_op is None:
+        return None
 
     # INT32 identity bounds used as padding so tile-reduce produces correct
     # results on partial last tiles.
