@@ -5530,6 +5530,17 @@ def _read_cycle(vd: int) -> str:
     # the span of a program region from inside the bundle itself.
     return f"2 27 0 {vd} 0 0 0 0 0 0"
 
+def _loop_begin(count: int) -> str:
+    # SXU_LOOP_BEGIN opcode = 28. Sets loopCounter := count and marks
+    # the next instruction as the loop-return pc. Count must be 1..255.
+    assert 1 <= count <= 255, "loop count out of range"
+    return f"2 28 0 0 0 0 0 0 0 {count}"
+
+def _loop_end() -> str:
+    # SXU_LOOP_END opcode = 29. Decrements loopCounter; jumps back to
+    # the instruction after LOOP_BEGIN if more iterations remain.
+    return "2 29 0 0 0 0 0 0 0 0"
+
 def _psum_read(vd: int, psum_addr: int) -> str:
     # SXU_PSUM_READ opcode = 17; vmemAddr doubles as PSUM bucket index.
     return f"2 17 {psum_addr} {vd} 0 0 0 0 0 0"
