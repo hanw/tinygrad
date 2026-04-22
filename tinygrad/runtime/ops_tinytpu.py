@@ -5541,6 +5541,11 @@ def _loop_end() -> str:
     # the instruction after LOOP_BEGIN if more iterations remain.
     return "2 29 0 0 0 0 0 0 0 0"
 
+def _vzero(vd: int) -> str:
+    # SXU_VZERO opcode = 30. One-cycle tile-of-zeros into vd. Skips
+    # the "preload zero in VMEM + LOAD" two-instruction dance.
+    return f"2 30 0 {vd} 0 0 0 0 0 0"
+
 def _psum_read(vd: int, psum_addr: int) -> str:
     # SXU_PSUM_READ opcode = 17; vmemAddr doubles as PSUM bucket index.
     return f"2 17 {psum_addr} {vd} 0 0 0 0 0 0"
