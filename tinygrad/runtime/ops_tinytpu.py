@@ -5557,6 +5557,10 @@ def _vmov(vd: int, vs: int) -> str:
     # SXU_VMOV opcode = 32. vd := vs in one cycle.
     return f"2 32 0 {vd} {vs} 0 0 0 0 0"
 
+def _vneg(vd: int, vs: int) -> str:
+    # SXU_VNEG opcode = 34. vd := -vs lane-wise in one cycle.
+    return f"2 34 0 {vd} {vs} 0 0 0 0 0"
+
 def _mxu_os_accumulate(wbase: int, abase: int, klen: int) -> str:
     # SXU_DISPATCH_MXU_OS_ACCUMULATE opcode = 33. Routes through
     # Controller.startOsAccumulate: real-OS dispatch that skips the
