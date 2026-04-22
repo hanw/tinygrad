@@ -5518,6 +5518,11 @@ def _mxu_os(wbase: int, abase: int, klen: int) -> str:
     # (<= rows for the current single-tile weight SRAM read).
     return f"2 25 0 0 0 0 0 {wbase} {abase} {klen}"
 
+def _load_mxu_matrix_row(vd: int, row: int) -> str:
+    # SXU_LOAD_MXU_MATRIX_ROW opcode = 26. Copies ctrl.resultsMatrix[row]
+    # into row 0 of vd. Intended for draining an OS dispatch row-by-row.
+    return f"2 26 0 {vd} {row} 0 0 0 0 0"
+
 def _psum_read(vd: int, psum_addr: int) -> str:
     # SXU_PSUM_READ opcode = 17; vmemAddr doubles as PSUM bucket index.
     return f"2 17 {psum_addr} {vd} 0 0 0 0 0 0"
