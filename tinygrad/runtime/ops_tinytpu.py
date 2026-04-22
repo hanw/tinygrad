@@ -5523,6 +5523,13 @@ def _load_mxu_matrix_row(vd: int, row: int) -> str:
     # into row 0 of vd. Intended for draining an OS dispatch row-by-row.
     return f"2 26 0 {vd} {row} 0 0 0 0 0"
 
+def _read_cycle(vd: int) -> str:
+    # SXU_READ_CYCLE opcode = 27. Writes the SXU's free-running cycle
+    # counter as Int#(32) into row 0, lane 0 of vd (other lanes zeroed).
+    # Pair two READ_CYCLE calls with a STORE + host parse to measure
+    # the span of a program region from inside the bundle itself.
+    return f"2 27 0 {vd} 0 0 0 0 0 0"
+
 def _psum_read(vd: int, psum_addr: int) -> str:
     # SXU_PSUM_READ opcode = 17; vmemAddr doubles as PSUM bucket index.
     return f"2 17 {psum_addr} {vd} 0 0 0 0 0 0"
