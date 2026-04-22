@@ -5546,6 +5546,17 @@ def _vzero(vd: int) -> str:
     # the "preload zero in VMEM + LOAD" two-instruction dance.
     return f"2 30 0 {vd} 0 0 0 0 0 0"
 
+def _vfill(vd: int, imm_i8: int) -> str:
+    # SXU_VFILL opcode = 31. Broadcast a signed 8-bit constant to all
+    # 16 lanes of vd. Encoded with imm in mxuWBase (unsigned byte).
+    assert -128 <= imm_i8 <= 127, "VFILL immediate out of int8 range"
+    enc = imm_i8 & 0xFF
+    return f"2 31 0 {vd} 0 0 0 {enc} 0 0"
+
+def _vmov(vd: int, vs: int) -> str:
+    # SXU_VMOV opcode = 32. vd := vs in one cycle.
+    return f"2 32 0 {vd} {vs} 0 0 0 0 0"
+
 def _psum_read(vd: int, psum_addr: int) -> str:
     # SXU_PSUM_READ opcode = 17; vmemAddr doubles as PSUM bucket index.
     return f"2 17 {psum_addr} {vd} 0 0 0 0 0 0"
