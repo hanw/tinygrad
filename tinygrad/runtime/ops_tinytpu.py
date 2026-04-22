@@ -5561,6 +5561,10 @@ def _vneg(vd: int, vs: int) -> str:
     # SXU_VNEG opcode = 34. vd := -vs lane-wise in one cycle.
     return f"2 34 0 {vd} {vs} 0 0 0 0 0"
 
+def _vabs(vd: int, vs: int) -> str:
+    # SXU_VABS opcode = 35. vd := |vs| lane-wise in one cycle.
+    return f"2 35 0 {vd} {vs} 0 0 0 0 0"
+
 def _mxu_os_accumulate(wbase: int, abase: int, klen: int) -> str:
     # SXU_DISPATCH_MXU_OS_ACCUMULATE opcode = 33. Routes through
     # Controller.startOsAccumulate: real-OS dispatch that skips the
