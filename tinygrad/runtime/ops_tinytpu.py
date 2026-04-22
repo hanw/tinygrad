@@ -5557,6 +5557,14 @@ def _vmov(vd: int, vs: int) -> str:
     # SXU_VMOV opcode = 32. vd := vs in one cycle.
     return f"2 32 0 {vd} {vs} 0 0 0 0 0"
 
+def _mxu_os_accumulate(wbase: int, abase: int, klen: int) -> str:
+    # SXU_DISPATCH_MXU_OS_ACCUMULATE opcode = 33. Routes through
+    # Controller.startOsAccumulate: real-OS dispatch that skips the
+    # drain-time clearAll, so consecutive dispatches add another
+    # kLen worth of psums into the same matrix. Lets multi-K-tile OS
+    # scale past K == rows.
+    return f"2 33 0 0 0 0 0 {wbase} {abase} {klen}"
+
 def _psum_read(vd: int, psum_addr: int) -> str:
     # SXU_PSUM_READ opcode = 17; vmemAddr doubles as PSUM bucket index.
     return f"2 17 {psum_addr} {vd} 0 0 0 0 0 0"
