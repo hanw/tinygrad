@@ -3051,11 +3051,11 @@ def _render_softsign_sxu_program(uops: list[UOp]) -> dict | None:
 
     one_bits = int(np.frombuffer(np.float32(1.0).tobytes(), dtype=np.int32)[0])
     num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
-    data_plan = [{"type": "VMEM", "addr": 0, "layout": "broadcast_const",
-                  "value": 0, "count": _TILE_ELEMS, "dtype": "int32"},
-                 {"type": "VMEM", "addr": 1, "layout": "broadcast_const",
+    # VZERO sets v0 to a zero tile with no VMEM round-trip; only the
+    # one-bits broadcast still needs a VMEM preload.
+    data_plan = [{"type": "VMEM", "addr": 1, "layout": "broadcast_const",
                   "value": one_bits, "count": _TILE_ELEMS, "dtype": "int32"}]
-    all_instrs = [_load(0, 0), _load(1, 1)]
+    all_instrs = [f"2 30 0 0 0 0 0 0 0 0", _load(1, 1)]  # VZERO v0; LOAD v1 = 1.0 tile
     FSUB, FMAX, FADD = _VPU_OPS["FSUB"], _VPU_OPS["FMAX"], _VPU_OPS["FADD"]
     FRECIP, FMUL = _VPU_OPS["FRECIP"], _VPU_OPS["FMUL"]
     outputs = []
