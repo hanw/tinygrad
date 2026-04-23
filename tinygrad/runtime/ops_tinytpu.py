@@ -1566,26 +1566,21 @@ def _render_multistep_sxu_program(uops: list[UOp]) -> dict | None:
             all_instrs.append(_halt())
             return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
                     "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg}
-        # Float: keep FSUB+FMAX (SXU_VABS is int-only; running it on float
-        # bit patterns would treat them as signed ints and produce garbage).
-        sub_op = _VPU_OPS["FSUB"]
-        max_op = _VPU_OPS["FMAX"]
-        addrs_per_tile = 3  # src, zeros, out
+        # Float: VPU_FABS is a single-cycle bit-clear of the sign bit,
+        # replacing the old (LOAD zeros, FSUB, FMAX) 3-instr sequence.
+        fabs_op = _VPU_OPS["FABS"]
+        addrs_per_tile = 2  # src, out  (no more zero-tile preload)
         for tile_idx in range(num_tiles):
             base = tile_idx * addrs_per_tile
             offset = tile_idx * _TILE_ELEMS
             count = min(_TILE_ELEMS, out_size - offset)
             data_plan.append({"type": "VMEM", "addr": base, "param": src_arg,
                               "offset": offset, "count": count, "dtype": "int32"})
-            data_plan.append({"type": "VMEM", "addr": base + 1,
-                              "layout": "broadcast_const", "value": 0, "count": count, "dtype": "int32"})
-            out_vmem = base + 2
+            out_vmem = base + 1
             all_instrs += [
                 _load(0, base),
-                _load(1, base + 1),
-                _vpu(2, 1, sub_op, 0),
-                _vpu(3, 0, max_op, 2),
-                _store(out_vmem, 3),
+                _vpu(1, 0, fabs_op, 0),
+                _store(out_vmem, 1),
             ]
             outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
         all_instrs.append(_halt())
