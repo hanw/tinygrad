@@ -46,7 +46,8 @@ _VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "SUM_REDUCE": 4, "CMPLT": 5, "CMPNE": 
              "CLZ": 71, "POPCOUNT": 72, "CTZ": 73, "BYTE_REVERSE": 74,
              "SAT_ADD_I32": 75, "SAT_SUB_I32": 76,
              "ABS_DIFF_I32": 77, "PACKED_I8_ABS_DIFF": 78,
-             "FABS": 79}
+             "FABS": 79, "ROTL": 80, "ROTR": 81,
+             "MIN_U32": 82, "MAX_U32": 83}
 _VPU_BOOL_OPS = {_VPU_OPS["CMPLT"], _VPU_OPS["CMPNE"], _VPU_OPS["CMPEQ"]}
 _SXU_OPS = {"LOAD_VREG": 0, "STORE_VREG": 1, "DISPATCH_VPU": 2, "DISPATCH_XLU_BROADCAST": 3, "DISPATCH_MXU": 4, "WAIT_MXU": 5, "LOAD_MXU_RESULT": 6, "HALT": 7, "DISPATCH_SELECT": 8, "BROADCAST_SCALAR": 9, "BROADCAST_ROW": 10, "BROADCAST_COL": 11, "DISPATCH_XLU_TRANSPOSE": 12, "LOAD_VPU_RESULT": 13, "LOAD_XLU_RESULT": 14, "PSUM_WRITE": 15, "PSUM_ACCUMULATE": 16, "PSUM_READ": 17}
 
@@ -5473,6 +5474,12 @@ def _store(vmem_dst: int, vs: int) -> str:
 
 def _vpu(vd: int, va: int, op: int, vb: int = 0) -> str:
     return f"2 2 0 {vd} {va} {op} {vb} 0 0 0"
+
+def _vpu_bg(vd: int, va: int, op: int, vb: int = 0) -> str:
+    # DISPATCH_VPU_BG (opcode 41). Background-collect dual-issue path
+    # for single-cycle VPU ops. Main FSM advances pc the same cycle;
+    # a background rule retires the vreg write when vpu.isDone.
+    return f"2 41 0 {vd} {va} {op} {vb} 0 0 0"
 
 def _vpu_exp2(vd: int, va: int) -> str:
     # VPU_EXP2 (opcode 51). Multi-cycle walker — SXU stalls on vpu.isDone
