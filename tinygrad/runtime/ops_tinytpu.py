@@ -35,7 +35,18 @@ _VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "SUM_REDUCE": 4, "CMPLT": 5, "CMPNE": 
              "FSUM_REDUCE": 42, "FMAX_REDUCE": 43, "FMIN_REDUCE": 44,
              "FSUM_REDUCE_COL": 45, "FMAX_REDUCE_COL": 46, "FMIN_REDUCE_COL": 47,
              "FPROD_REDUCE_TILE": 48, "FPROD_REDUCE": 49, "FPROD_REDUCE_COL": 50,
-             "EXP2": 51, "LOG2": 52, "SIN": 53, "COS": 54}
+             "EXP2": 51, "LOG2": 52, "SIN": 53, "COS": 54,
+             "PACKED_I8_ADD": 55, "PACKED_I8_SUB": 56,
+             "PACKED_I8_MAX": 57, "PACKED_I8_MIN": 58,
+             "PACKED_I8_NEG": 59, "PACKED_I8_RELU": 60,
+             "PACKED_I8_CMPLT": 61, "PACKED_I8_CMPEQ": 62,
+             "PACKED_I8_MUL_LOW": 63, "PACKED_I8_MUL_HIGH": 64,
+             "PACKED_I8_ABS": 65, "SIGN": 66, "PACKED_I8_SIGN": 67,
+             "FSIGN": 68, "ARGMIN": 69, "ARGMAX": 70,
+             "CLZ": 71, "POPCOUNT": 72, "CTZ": 73, "BYTE_REVERSE": 74,
+             "SAT_ADD_I32": 75, "SAT_SUB_I32": 76,
+             "ABS_DIFF_I32": 77, "PACKED_I8_ABS_DIFF": 78,
+             "FABS": 79}
 _VPU_BOOL_OPS = {_VPU_OPS["CMPLT"], _VPU_OPS["CMPNE"], _VPU_OPS["CMPEQ"]}
 _SXU_OPS = {"LOAD_VREG": 0, "STORE_VREG": 1, "DISPATCH_VPU": 2, "DISPATCH_XLU_BROADCAST": 3, "DISPATCH_MXU": 4, "WAIT_MXU": 5, "LOAD_MXU_RESULT": 6, "HALT": 7, "DISPATCH_SELECT": 8, "BROADCAST_SCALAR": 9, "BROADCAST_ROW": 10, "BROADCAST_COL": 11, "DISPATCH_XLU_TRANSPOSE": 12, "LOAD_VPU_RESULT": 13, "LOAD_XLU_RESULT": 14, "PSUM_WRITE": 15, "PSUM_ACCUMULATE": 16, "PSUM_READ": 17}
 
@@ -3051,12 +3062,12 @@ def _render_softsign_sxu_program(uops: list[UOp]) -> dict | None:
 
     one_bits = int(np.frombuffer(np.float32(1.0).tobytes(), dtype=np.int32)[0])
     num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
-    # VZERO sets v0 to a zero tile with no VMEM round-trip; only the
-    # one-bits broadcast still needs a VMEM preload.
+    # One broadcast tile (1.0) is all we need — FABS replaces the old
+    # VZERO + FSUB + FMAX sequence for |x|.
     data_plan = [{"type": "VMEM", "addr": 1, "layout": "broadcast_const",
                   "value": one_bits, "count": _TILE_ELEMS, "dtype": "int32"}]
-    all_instrs = [f"2 30 0 0 0 0 0 0 0 0", _load(1, 1)]  # VZERO v0; LOAD v1 = 1.0 tile
-    FSUB, FMAX, FADD = _VPU_OPS["FSUB"], _VPU_OPS["FMAX"], _VPU_OPS["FADD"]
+    all_instrs = [_load(1, 1)]  # v1 = 1.0 tile
+    FADD, FABS = _VPU_OPS["FADD"], _VPU_OPS["FABS"]
     FRECIP, FMUL = _VPU_OPS["FRECIP"], _VPU_OPS["FMUL"]
     outputs = []
     for tile_idx in range(num_tiles):
@@ -3068,8 +3079,7 @@ def _render_softsign_sxu_program(uops: list[UOp]) -> dict | None:
                           "offset": offset, "count": count, "dtype": "int32"})
         all_instrs += [
             _load(2, in_vmem),               # v2 = x
-            _vpu(3, 0, FSUB, 2),             # v3 = 0 - x = -x
-            _vpu(4, 2, FMAX, 3),             # v4 = max(x, -x) = |x|
+            _vpu(4, 2, FABS, 0),             # v4 = |x|        (was FSUB+FMAX)
             _vpu(5, 4, FADD, 1),             # v5 = |x| + 1
             _vpu(6, 5, FRECIP),              # v6 = 1/(1+|x|)
             _vpu(7, 2, FMUL, 6),             # v7 = x * v6
@@ -5552,6 +5562,18 @@ def _read_cycle(vd: int) -> str:
     # the span of a program region from inside the bundle itself.
     return f"2 27 0 {vd} 0 0 0 0 0 0"
 
+def _load_loop_depth(vd: int) -> str:
+    # SXU_LOAD_LOOP_DEPTH opcode = 36. Writes the current LOOP stack
+    # depth (0..4) into row 0, lane 0 of vd (other lanes zeroed).
+    # Intended for debug/test of nested SXU_LOOP frames.
+    return f"2 36 0 {vd} 0 0 0 0 0 0"
+
+def _xlu_rotate(vd: int, vs: int, amount: int) -> str:
+    # SXU_DISPATCH_XLU_ROTATE opcode = 37. Cyclic lane rotation via the
+    # XLU: vd[s][i] = vs[s][(i + amount) mod lanes]. Dual-issue like
+    # other XLU dispatches. `amount` stored in vregSrc2 low bits.
+    return f"2 37 0 {vd} {vs} 0 {amount} 0 0 0"
+
 def _loop_begin(count: int) -> str:
     # SXU_LOOP_BEGIN opcode = 28. Sets loopCounter := count and marks
     # the next instruction as the loop-return pc. Count must be 1..255.
@@ -5612,6 +5634,13 @@ def _psum_clear(psum_addr: int) -> str:
     # "preload zero tile + LOAD v15 + PSUM_WRITE" boilerplate.
     return f"2 19 {psum_addr} 0 0 0 0 0 0 0"
 
+def _psum_clear_all() -> str:
+    # SXU_PSUM_CLEAR_ALL opcode = 38. Multi-cycle walker inside SXU
+    # zeroes every bucket (psumDepth cycles total, one instruction).
+    # Replaces the 8-instruction PSUM_CLEAR sweep a multi-K-tile GEMM
+    # does before re-using buckets for a new K chain.
+    return f"2 38 0 0 0 0 0 0 0 0"
+
 def _set_pred_if_zero(vs: int) -> str:
     # SXU_SET_PRED_IF_ZERO opcode = 20; pred := (vs[0][0] == 0).
     return f"2 20 0 0 {vs} 0 0 0 0 0"
@@ -5619,6 +5648,14 @@ def _set_pred_if_zero(vs: int) -> str:
 def _skip_if_pred() -> str:
     # SXU_SKIP_IF_PRED opcode = 21; if pred, skip the next instruction.
     return f"2 21 0 0 0 0 0 0 0 0"
+
+def _set_pred_ne_zero(vs: int) -> str:
+    # SXU_SET_PRED_NE_ZERO opcode = 39; pred := (vs[0][0] != 0).
+    return f"2 39 0 0 {vs} 0 0 0 0 0"
+
+def _skip_if_not_pred() -> str:
+    # SXU_SKIP_IF_NOT_PRED opcode = 40; if !pred, skip the next instruction.
+    return f"2 40 0 0 0 0 0 0 0 0"
 
 def _psum_accumulate_row(vs: int, psum_addr: int, psum_row: int) -> str:
     # SXU_PSUM_ACCUMULATE_ROW opcode = 22; accumulate row 0 of vs into
