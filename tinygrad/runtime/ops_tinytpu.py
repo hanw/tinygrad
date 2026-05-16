@@ -339,6 +339,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return leaky_relu_desc
         if (softsign_desc := _render_softsign_sxu_program(uops)) is not None:
             return softsign_desc
+        if (mish_desc := _render_mish_sxu_program(uops)) is not None:
+            return mish_desc
         if (swish_desc := _render_swish_sxu_program(uops)) is not None:
             return swish_desc
         if (softplus_desc := _render_softplus_sxu_program(uops)) is not None:
@@ -4163,6 +4165,92 @@ def _render_softplus_sxu_program(uops: list[UOp]) -> dict | None:
 
 def _render_logsigmoid_sxu_program(uops: list[UOp]) -> dict | None:
     return _render_logaddexp0_sxu_program(uops, -1.0)
+
+
+def _render_mish_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render mish(x) = x * tanh(softplus(x))."""
+    op_counts = Counter(u.op.name for u in uops)
+    if op_counts.get("LOG2", 0) < 1 or op_counts.get("EXP2", 0) < 2 or \
+       op_counts.get("RECIPROCAL", 0) < 1 or op_counts.get("MAX", 0) < 1:
+        return None
+    if op_counts.get("WHERE", 0) > 0 or op_counts.get("SIN", 0) > 0 or op_counts.get("SQRT", 0) > 0:
+        return None
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2 or 0 not in params:
+        return None
+    src_arg = next((k for k in params if k != 0), None)
+    if src_arg is None:
+        return None
+    if not ("float" in str(params[0].dtype) and "float" in str(params[src_arg].dtype)):
+        return None
+    out_size = params[0].dtype.size
+    if out_size != params[src_arg].dtype.size or out_size <= 0:
+        return None
+    consts = [float(u.arg) for u in uops if u.op is Ops.CONST and isinstance(u.arg, float)]
+    for required in (1.4426950408889634, -1.4426950408889634,
+                     0.6931471805599453, -2.8853900817779268, 2.0, 1.0, 0.0, -1.0):
+        if not any(abs(c - required) < 1e-6 for c in consts):
+            return None
+
+    def _bits(v: float) -> int:
+        return int(np.frombuffer(np.float32(v).tobytes(), dtype=np.int32)[0])
+
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    data_plan = [
+        {"type": "VMEM", "addr": 0, "layout": "broadcast_const",
+         "value": _bits(1.4426950408889634), "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 1, "layout": "broadcast_const",
+         "value": _bits(-1.4426950408889634), "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 2, "layout": "broadcast_const",
+         "value": _bits(0.6931471805599453), "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 3, "layout": "broadcast_const",
+         "value": _bits(0.0), "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 4, "layout": "broadcast_const",
+         "value": _bits(-1.0), "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 5, "layout": "broadcast_const",
+         "value": _bits(-2.8853900817779268), "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 6, "layout": "broadcast_const",
+         "value": _bits(1.0), "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 7, "layout": "broadcast_const",
+         "value": _bits(2.0), "count": _TILE_ELEMS, "dtype": "int32"},
+    ]
+    all_instrs = [_load(i, i) for i in range(8)]
+    FMUL_OP, FADD_OP, FMAX_OP, FRECIP_OP = (_VPU_OPS["FMUL"], _VPU_OPS["FADD"],
+                                            _VPU_OPS["FMAX"], _VPU_OPS["FRECIP"])
+    outputs = []
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count = min(_TILE_ELEMS, out_size - offset)
+        in_vmem = 8 + tile_idx * 2
+        out_vmem = 9 + tile_idx * 2
+        data_plan.append({"type": "VMEM", "addr": in_vmem, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        all_instrs += [
+            _load(8, in_vmem),             # x
+            _vpu(9, 8, FMAX_OP, 3),        # m = max(x, 0)
+            _vpu(10, 9, FMUL_OP, 4),       # -m
+            _vpu(11, 8, FADD_OP, 10),      # x - m
+            _vpu(11, 11, FMUL_OP, 0),      # (x-m)/ln2
+            _vpu_exp2(11, 11),
+            _vpu(10, 9, FMUL_OP, 1),       # -m/ln2
+            _vpu_exp2(10, 10),
+            _vpu(11, 11, FADD_OP, 10),
+            _vpu_log2(11, 11),
+            _vpu(11, 11, FMUL_OP, 2),
+            _vpu(11, 11, FADD_OP, 9),      # softplus(x)
+            _vpu(12, 11, FMUL_OP, 5),      # -2*softplus/ln2
+            _vpu_exp2(12, 12),
+            _vpu(12, 12, FADD_OP, 6),
+            _vpu(12, 12, FRECIP_OP),
+            _vpu(12, 12, FMUL_OP, 7),
+            _vpu(12, 12, FADD_OP, 4),      # tanh(softplus)
+            _vpu(13, 8, FMUL_OP, 12),
+            _store(out_vmem, 13),
+        ]
+        outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
 
 
 def _render_tan_sxu_program(uops: list[UOp]) -> dict | None:
