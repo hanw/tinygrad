@@ -335,6 +335,10 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return softsign_desc
         if (swish_desc := _render_swish_sxu_program(uops)) is not None:
             return swish_desc
+        if (softplus_desc := _render_softplus_sxu_program(uops)) is not None:
+            return softplus_desc
+        if (logsigmoid_desc := _render_logsigmoid_sxu_program(uops)) is not None:
+            return logsigmoid_desc
         if (tan_desc := _render_tan_sxu_program(uops)) is not None:
             return tan_desc
         if (cosh_desc := _render_cosh_sxu_program(uops)) is not None:
@@ -3722,6 +3726,196 @@ def _render_hyperbolic_sxu_program(uops: list[UOp], kind: str) -> dict | None:
     all_instrs.append(_halt())
     return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
             "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
+
+
+def _render_logaddexp0_sxu_program(uops: list[UOp], outer_sign: float) -> dict | None:
+    """Shared renderer for softplus(x) and -softplus(-x) = logsigmoid(x).
+
+    Stable logaddexp form expanded by tinygrad:
+        m = max(z, 0),  inner = exp2((z-m)*c) + exp2(-m*c),
+        softplus(z) = log2(inner)*ln2 + m
+    where c = 1/ln2. For softplus z = x; for logsigmoid z = -x and the
+    final result is `outer_sign * softplus(z)` with outer_sign = -1.
+
+    The UOp tree of the STORE value root is
+        outer_sign == 1  : ADD(MUL(LOG2(inner_add), ln2), m)
+        outer_sign == -1 : MUL(ADD(MUL(LOG2(inner_add), ln2), m), -1)
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    if op_counts.get("LOG2", 0) < 1 or op_counts.get("EXP2", 0) < 2 or op_counts.get("MAX", 0) < 1:
+        return None
+    if op_counts.get("WHERE", 0) > 0 or op_counts.get("SIN", 0) > 0 or \
+       op_counts.get("SQRT", 0) > 0 or op_counts.get("RECIPROCAL", 0) > 0:
+        return None
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2 or 0 not in params:
+        return None
+    src_arg = next((k for k in params if k != 0), None)
+    if src_arg is None:
+        return None
+    if not ("float" in str(params[0].dtype) and "float" in str(params[src_arg].dtype)):
+        return None
+    out_size = params[0].dtype.size
+    if out_size != params[src_arg].dtype.size or out_size <= 0:
+        return None
+
+    stores = [u for u in uops if u.op is Ops.STORE]
+    if not stores:
+        return None
+    val = _chase(stores[0].src[1])
+
+    # tinygrad may either keep the outer MUL(..., -1) explicit or
+    # distribute it across the ADD children, sometimes folding the
+    # negation into a sibling CONST (e.g. ln2 -> -ln2). Be lenient:
+    # peel one optional outer MUL(..., -1), then look at the ADD
+    # children and accept either {+log, +m} (softplus) or {-log, -m}
+    # (logsigmoid) by reading the sign of the m-branch CONST and the
+    # sign of the log-branch CONST.
+    if val.op is Ops.MUL:
+        nc = next((s for s in val.src if _chase(s).op is Ops.CONST and
+                   float(_chase(s).arg) == -1.0), None)
+        inner = next((s for s in val.src if s is not nc), None)
+        if nc is not None and inner is not None:
+            val = _chase(inner)
+    if val.op is not Ops.ADD:
+        return None
+    a, b = _chase(val.src[0]), _chase(val.src[1])
+    # Identify log-branch: MUL(LOG2(inner), k_ln). m-branch: MUL(MAX(z, 0), k_m) or MAX(z, 0).
+    def _is_log_branch(n):
+        return n.op is Ops.MUL and any(_chase(t).op is Ops.LOG2 for t in n.src)
+    def _m_branch_max(n):
+        n = _chase(n)
+        if n.op is Ops.MAX:
+            return n, 1.0
+        if n.op is Ops.MUL:
+            cst = next((s for s in n.src if _chase(s).op is Ops.CONST), None)
+            other = next((s for s in n.src if s is not cst), None)
+            if cst is not None and other is not None and _chase(other).op is Ops.MAX:
+                return _chase(other), float(_chase(cst).arg)
+        return None, None
+    log_branch = next((cand for cand in (a, b) if _is_log_branch(cand)), None)
+    other = next((cand for cand in (a, b) if cand is not log_branch), None)
+    if log_branch is None or other is None:
+        return None
+    m_chased, k_m = _m_branch_max(other)
+    if m_chased is None:
+        return None
+    if abs(abs(k_m) - 1.0) > 1e-4:
+        return None
+    log_node = next((s for s in log_branch.src if _chase(s).op is Ops.LOG2), None)
+    k_ln_const = next((s for s in log_branch.src if s is not log_node), None)
+    if log_node is None or k_ln_const is None:
+        return None
+    log_node = _chase(log_node)
+    k_ln = float(_chase(k_ln_const).arg)
+    if abs(abs(k_ln) - 0.6931471805599453) > 1e-4:
+        return None
+    # Both branch signs must agree and match the outer_sign target.
+    sign_m  = 1.0 if k_m > 0  else -1.0
+    sign_ln = 1.0 if k_ln > 0 else -1.0
+    if sign_m != sign_ln:
+        return None
+    if abs(sign_m - outer_sign) > 1e-6:
+        return None
+    # m_node = MAX(z, 0). z = LOAD(x) for softplus or MUL(LOAD(x), -1) for logsigmoid.
+    if m_chased.op is not Ops.MAX:
+        return None
+    zero_c = next((s for s in m_chased.src if _chase(s).op is Ops.CONST and float(_chase(s).arg) == 0.0), None)
+    z_node = next((s for s in m_chased.src if s is not zero_c), None)
+    if zero_c is None or z_node is None:
+        return None
+    # inner_add = ADD(EXP2(MUL(ADD(z, MUL(m, -1)), c)), EXP2(MUL(m, -c)))
+    inner_add = log_node.src[0]
+    inner_add = _chase(inner_add)
+    if inner_add.op is not Ops.ADD:
+        return None
+
+    if abs(outer_sign - 1.0) < 1e-6:
+        # softplus: z must be a direct LOAD of x.
+        if not _has_load_src(z_node):
+            return None
+    else:
+        # logsigmoid: z = MUL(LOAD(x), -1).
+        zc = _chase(z_node)
+        if zc.op is not Ops.MUL:
+            return None
+        nc = next((s for s in zc.src if _chase(s).op is Ops.CONST and float(_chase(s).arg) == -1.0), None)
+        xl = next((s for s in zc.src if s is not nc), None)
+        if nc is None or xl is None or not _has_load_src(xl):
+            return None
+
+    c_val   = 1.4426950408889634  # 1/ln2
+    cbits   = int(np.frombuffer(np.float32( c_val).tobytes(), dtype=np.int32)[0])
+    ncbits  = int(np.frombuffer(np.float32(-c_val).tobytes(), dtype=np.int32)[0])
+    lnbits  = int(np.frombuffer(np.float32(0.6931471805599453).tobytes(), dtype=np.int32)[0])
+    zbits   = int(np.frombuffer(np.float32(0.0).tobytes(), dtype=np.int32)[0])
+    nobits  = int(np.frombuffer(np.float32(-1.0).tobytes(), dtype=np.int32)[0])
+    sgnbits = int(np.frombuffer(np.float32(outer_sign).tobytes(), dtype=np.int32)[0])
+
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    data_plan = [
+        {"type": "VMEM", "addr": 0, "layout": "broadcast_const",
+         "value": cbits,   "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 1, "layout": "broadcast_const",
+         "value": ncbits,  "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 2, "layout": "broadcast_const",
+         "value": lnbits,  "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 3, "layout": "broadcast_const",
+         "value": zbits,   "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 4, "layout": "broadcast_const",
+         "value": nobits,  "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 5, "layout": "broadcast_const",
+         "value": sgnbits, "count": _TILE_ELEMS, "dtype": "int32"},
+    ]
+    # VRegFile is 16 wide (TensorCore: mkVRegFile with numRegs=16). The
+    # compute below recycles v6 and v9 across the data-flow chain so the
+    # whole softplus kernel fits in vregs 0..9.
+    all_instrs = [_load(0, 0), _load(1, 1), _load(2, 2),
+                  _load(3, 3), _load(4, 4), _load(5, 5)]
+    FMUL_OP = _VPU_OPS["FMUL"]
+    FADD_OP = _VPU_OPS["FADD"]
+    FMAX_OP = _VPU_OPS["FMAX"]
+    outputs = []
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count  = min(_TILE_ELEMS, out_size - offset)
+        in_vmem  = 6 + tile_idx * 2
+        out_vmem = 7 + tile_idx * 2
+        data_plan.append({"type": "VMEM", "addr": in_vmem, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        # v6 = x_load, v7 = z (= x for softplus; -x for logsigmoid)
+        all_instrs.append(_load(6, in_vmem))
+        if abs(outer_sign - 1.0) < 1e-6:
+            all_instrs.append(_vpu(7, 6, FADD_OP, 3))  # z = x + 0
+        else:
+            all_instrs.append(_vpu(7, 6, FMUL_OP, 4))  # z = -x
+        all_instrs += [
+            _vpu(8, 7, FMAX_OP, 3),       # v8 = m = max(z, 0)
+            _vpu(9, 8, FMUL_OP, 4),       # v9 = -m
+            _vpu(6, 7, FADD_OP, 9),       # v6 = z - m  (overwrite x_load)
+            _vpu(6, 6, FMUL_OP, 0),       # v6 = (z-m)*c
+            _vpu_exp2(6, 6),              # v6 = exp2((z-m)*c)
+            _vpu(9, 8, FMUL_OP, 1),       # v9 = m * -c
+            _vpu_exp2(9, 9),              # v9 = exp2(-m*c)
+            _vpu(6, 6, FADD_OP, 9),       # v6 = exp2 sum
+            _vpu_log2(6, 6),              # v6 = log2(sum)
+            _vpu(6, 6, FMUL_OP, 2),       # v6 *= ln2
+            _vpu(6, 6, FADD_OP, 8),       # v6 += m   -> softplus(z)
+            _vpu(6, 6, FMUL_OP, 5),       # v6 *= outer_sign
+            _store(out_vmem, 6),
+        ]
+        outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
+
+
+def _render_softplus_sxu_program(uops: list[UOp]) -> dict | None:
+    return _render_logaddexp0_sxu_program(uops, +1.0)
+
+
+def _render_logsigmoid_sxu_program(uops: list[UOp]) -> dict | None:
+    return _render_logaddexp0_sxu_program(uops, -1.0)
 
 
 def _render_tan_sxu_program(uops: list[UOp]) -> dict | None:
