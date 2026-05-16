@@ -325,6 +325,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return recip_desc
         if (tanh_desc := _render_tanh_sxu_program(uops)) is not None:
             return tanh_desc
+        if (relu6_desc := _render_relu6_sxu_program(uops)) is not None:
+            return relu6_desc
         if (clip_desc := _render_clip_sxu_program(uops)) is not None:
             return clip_desc
         if (clamp_sb_desc := _render_clamp_single_bound_sxu_program(uops)) is not None:
@@ -3274,6 +3276,120 @@ def _render_clamp_single_bound_sxu_program(uops: list[UOp]) -> dict | None:
             _load(1, in_vmem),
             _vpu(2, 1, op, 0),
             _store(out_vmem, 2),
+        ]
+        outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
+
+
+def _render_relu6_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render Tensor.relu6(x) = clamp(x, 0, 6) (float).
+
+    tinygrad decomposes relu6 as `relu(x) - relu(x - 6)`:
+        ADD(WHERE(CMPLT(0, x), x, 0),
+            MUL(WHERE(CMPLT(0, ADD(x, -6)), ADD(x, -6), 0), -1))
+    The clip renderer can't match this because the WHERE bodies are
+    `x` / `x - 6`, not the bound CONSTs. Emit a simple FMIN/FMAX chain.
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    if any(op_counts.get(n, 0) for n in ("EXP2", "LOG2", "SIN", "SQRT", "RECIPROCAL")):
+        return None
+    if op_counts.get("WHERE", 0) < 2 or op_counts.get("CMPLT", 0) < 2:
+        return None
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2 or 0 not in params:
+        return None
+    src_arg = next((k for k in params if k != 0), None)
+    if src_arg is None:
+        return None
+    if not ("float" in str(params[0].dtype) and "float" in str(params[src_arg].dtype)):
+        return None
+    out_size = params[0].dtype.size
+    if out_size != params[src_arg].dtype.size or out_size <= 0:
+        return None
+
+    stores = [u for u in uops if u.op is Ops.STORE]
+    if not stores:
+        return None
+    val = _chase(stores[0].src[1])
+    if val.op is not Ops.ADD:
+        return None
+    a, b = _chase(val.src[0]), _chase(val.src[1])
+    # One child: relu(x). Other: MUL(relu(x + k), -1) with k < 0.
+    def _is_relu_of(node):
+        n = _chase(node)
+        if n.op is not Ops.WHERE:
+            return None, None
+        cond, t_body, f_body = _chase(n.src[0]), _chase(n.src[1]), _chase(n.src[2])
+        if cond.op is not Ops.CMPLT:
+            return None, None
+        zc = _chase(cond.src[0])
+        if zc.op is not Ops.CONST or float(zc.arg) != 0.0:
+            return None, None
+        zf = _chase(f_body)
+        if zf.op is not Ops.CONST or float(zf.arg) != 0.0:
+            return None, None
+        # cond.src[1] should equal t_body and chase to either LOAD(x) or ADD(LOAD(x), const)
+        body = _chase(cond.src[1])
+        if body.op is Ops.ADD:
+            cst = next((s for s in body.src if _chase(s).op is Ops.CONST), None)
+            xl  = next((s for s in body.src if s is not cst), None)
+            if cst is None or xl is None or not _has_load_src(xl):
+                return None, None
+            return body, float(_chase(cst).arg)
+        if _has_load_src(body):
+            return body, 0.0
+        return None, None
+
+    def _strip_neg1(node):
+        n = _chase(node)
+        if n.op is not Ops.MUL:
+            return None
+        nc = next((s for s in n.src if _chase(s).op is Ops.CONST and float(_chase(s).arg) == -1.0), None)
+        inner = next((s for s in n.src if s is not nc), None)
+        if nc is None or inner is None:
+            return None
+        return _chase(inner)
+
+    relu_a, k_a = _is_relu_of(a)
+    if relu_a is not None:
+        neg_part = _strip_neg1(b)
+    else:
+        relu_a, k_a = _is_relu_of(b)
+        neg_part = _strip_neg1(a)
+    if relu_a is None or neg_part is None or k_a != 0.0:
+        return None
+    relu_b, k_b = _is_relu_of(neg_part)
+    if relu_b is None or k_b == 0.0 or k_b >= 0.0:
+        return None
+    hi = -k_b  # k_b < 0 means body = x + k_b => relu(x - hi) with hi = -k_b
+    lo = 0.0
+
+    lo_bits = int(np.frombuffer(np.float32(lo).tobytes(), dtype=np.int32)[0])
+    hi_bits = int(np.frombuffer(np.float32(hi).tobytes(), dtype=np.int32)[0])
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    data_plan = [
+        {"type": "VMEM", "addr": 0, "layout": "broadcast_const",
+         "value": lo_bits, "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 1, "layout": "broadcast_const",
+         "value": hi_bits, "count": _TILE_ELEMS, "dtype": "int32"},
+    ]
+    all_instrs = [_load(0, 0), _load(1, 1)]
+    FMIN_OP, FMAX_OP = _VPU_OPS["FMIN"], _VPU_OPS["FMAX"]
+    outputs = []
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count  = min(_TILE_ELEMS, out_size - offset)
+        in_vmem  = 2 + tile_idx * 2
+        out_vmem = 3 + tile_idx * 2
+        data_plan.append({"type": "VMEM", "addr": in_vmem, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        all_instrs += [
+            _load(2, in_vmem),
+            _vpu(3, 2, FMIN_OP, 1),
+            _vpu(4, 3, FMAX_OP, 0),
+            _store(out_vmem, 4),
         ]
         outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
     all_instrs.append(_halt())
