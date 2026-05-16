@@ -335,6 +335,8 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return softsign_desc
         if (swish_desc := _render_swish_sxu_program(uops)) is not None:
             return swish_desc
+        if (tan_desc := _render_tan_sxu_program(uops)) is not None:
+            return tan_desc
         if (cosh_desc := _render_cosh_sxu_program(uops)) is not None:
             return cosh_desc
         if (sinh_desc := _render_sinh_sxu_program(uops)) is not None:
@@ -3715,6 +3717,118 @@ def _render_hyperbolic_sxu_program(uops: list[UOp], kind: str) -> dict | None:
             _vpu(8, 5, COMBINE_OP, 7),
             _vpu(9, 8, FMUL_OP, 2),
             _store(out_vmem, 9),
+        ]
+        outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
+
+
+def _render_tan_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render tan(x) = sin(x)/cos(x).
+
+    tinygrad expresses cos(x) as sin(π/2 - x), so the kernel is
+        MUL(SIN(x), RECIPROCAL(SIN(ADD(MUL(x, -1), π/2))))
+    Emits per tile:
+        LOAD v0 = broadcast π/2
+        LOAD v1 = broadcast -1.0
+        LOAD v2 = x
+        v3 = SIN(v2)
+        v4 = FMUL(v2, v1)
+        v5 = FADD(v4, v0)
+        v6 = SIN(v5)
+        v7 = FRECIP(v6)
+        v8 = FMUL(v3, v7)
+        STORE v8
+    """
+    op_counts = Counter(u.op.name for u in uops)
+    if op_counts.get("SIN", 0) < 2 or op_counts.get("RECIPROCAL", 0) < 1:
+        return None
+    if op_counts.get("EXP2", 0) > 0 or op_counts.get("LOG2", 0) > 0 or \
+       op_counts.get("SQRT", 0) > 0 or op_counts.get("WHERE", 0) > 0:
+        return None
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2 or 0 not in params:
+        return None
+    src_arg = next((k for k in params if k != 0), None)
+    if src_arg is None:
+        return None
+    if not ("float" in str(params[0].dtype) and "float" in str(params[src_arg].dtype)):
+        return None
+    out_size = params[0].dtype.size
+    if out_size != params[src_arg].dtype.size or out_size <= 0:
+        return None
+
+    stores = [u for u in uops if u.op is Ops.STORE]
+    if not stores:
+        return None
+    val = _chase(stores[0].src[1])
+    # Outer MUL: SIN(x) * RECIPROCAL(SIN(π/2 - x))
+    if val.op is not Ops.MUL:
+        return None
+    a, b = _chase(val.src[0]), _chase(val.src[1])
+    sin_x_node = next((s for s in (a, b) if s.op is Ops.SIN), None)
+    recip_node = next((s for s in (a, b) if s.op is Ops.RECIPROCAL), None)
+    if sin_x_node is None or recip_node is None:
+        return None
+    # sin_x_node.src[0] should chase to a LOAD of x.
+    if not _has_load_src(sin_x_node.src[0]):
+        return None
+    inner = _chase(recip_node.src[0])
+    if inner.op is not Ops.SIN:
+        return None
+    add_node = _chase(inner.src[0])
+    if add_node.op is not Ops.ADD:
+        return None
+    # add_node has CONST(π/2) and MUL(x, -1) (or MUL(-1, x)).
+    pi2_cand = next((s for s in add_node.src if _chase(s).op is Ops.CONST), None)
+    neg_mul  = next((s for s in add_node.src if s is not pi2_cand), None)
+    if pi2_cand is None or neg_mul is None:
+        return None
+    pi2 = float(_chase(pi2_cand).arg)
+    if abs(pi2 - (np.pi / 2.0)) > 1e-4:
+        return None
+    neg_mul = _chase(neg_mul)
+    if neg_mul.op is not Ops.MUL:
+        return None
+    nm_const = next((s for s in neg_mul.src if _chase(s).op is Ops.CONST), None)
+    nm_x     = next((s for s in neg_mul.src if s is not nm_const), None)
+    if nm_const is None or nm_x is None or not _has_load_src(nm_x):
+        return None
+    if float(_chase(nm_const).arg) != -1.0:
+        return None
+
+    pi2_bits     = int(np.frombuffer(np.float32(np.pi / 2.0).tobytes(), dtype=np.int32)[0])
+    neg_one_bits = int(np.frombuffer(np.float32(-1.0).tobytes(),        dtype=np.int32)[0])
+
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    data_plan = [
+        {"type": "VMEM", "addr": 0, "layout": "broadcast_const",
+         "value": pi2_bits,     "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 1, "layout": "broadcast_const",
+         "value": neg_one_bits, "count": _TILE_ELEMS, "dtype": "int32"},
+    ]
+    all_instrs = [_load(0, 0), _load(1, 1)]
+    FMUL_OP   = _VPU_OPS["FMUL"]
+    FADD_OP   = _VPU_OPS["FADD"]
+    FRECIP_OP = _VPU_OPS["FRECIP"]
+    outputs = []
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count  = min(_TILE_ELEMS, out_size - offset)
+        in_vmem  = 2 + tile_idx * 2
+        out_vmem = 3 + tile_idx * 2
+        data_plan.append({"type": "VMEM", "addr": in_vmem, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        all_instrs += [
+            _load(2, in_vmem),
+            _vpu_sin(3, 2),
+            _vpu(4, 2, FMUL_OP, 1),
+            _vpu(5, 4, FADD_OP, 0),
+            _vpu_sin(6, 5),
+            _vpu(7, 6, FRECIP_OP),
+            _vpu(8, 3, FMUL_OP, 7),
+            _store(out_vmem, 8),
         ]
         outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
     all_instrs.append(_halt())
