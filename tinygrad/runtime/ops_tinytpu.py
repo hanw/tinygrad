@@ -335,6 +335,10 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
             return softsign_desc
         if (swish_desc := _render_swish_sxu_program(uops)) is not None:
             return swish_desc
+        if (cosh_desc := _render_cosh_sxu_program(uops)) is not None:
+            return cosh_desc
+        if (sinh_desc := _render_sinh_sxu_program(uops)) is not None:
+            return sinh_desc
         if (sigmoid_desc := _render_sigmoid_sxu_program(uops)) is not None:
             return sigmoid_desc
         if (scaled_exp2_desc := _render_scaled_exp2_sxu_program(uops)) is not None:
@@ -3572,6 +3576,158 @@ def _render_sigmoid_sxu_program(uops: list[UOp]) -> dict | None:
     all_instrs.append(_halt())
     return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
             "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
+
+
+def _render_hyperbolic_sxu_program(uops: list[UOp], kind: str) -> dict | None:
+    """Render sinh(x) = (exp(x)-exp(-x))/2 or cosh(x) = (exp(x)+exp(-x))/2.
+
+    tinygrad shape (per lane, kind="cosh"):
+        MUL(ADD(EXP2(MUL(x, +1/ln2)), EXP2(MUL(x, -1/ln2))), 0.5)
+    For sinh the second EXP2 input is the negated x, which tinygrad
+    expresses as `MUL(x, -1/ln2)` too, but the outer combine is a
+    SUB. After tinygrad's neg/sub canonicalization that becomes
+    `ADD(EXP2(MUL(x, +1/ln2)), MUL(EXP2(MUL(x, -1/ln2)), -1))` then
+    `MUL(..., 0.5)`. We match both shapes; for sinh the negated
+    branch carries an extra `MUL(..., -1)` wrapper.
+
+    Emits per tile:
+        LOAD v0 = broadcast +1/ln2
+        LOAD v1 = broadcast -1/ln2
+        LOAD v2 = broadcast 0.5
+        LOAD v3 = x
+        v4 = FMUL(v3, v0)         # x/ln2
+        v5 = EXP2(v4)             # e^x
+        v6 = FMUL(v3, v1)         # -x/ln2
+        v7 = EXP2(v6)             # e^-x
+        v8 = FADD(v5, v7)  cosh   or   FSUB(v5, v7)  sinh
+        v9 = FMUL(v8, v2)         # *0.5
+        STORE v9
+    """
+    assert kind in ("sinh", "cosh")
+    op_counts = Counter(u.op.name for u in uops)
+    if op_counts.get("EXP2", 0) < 1:
+        return None
+    if op_counts.get("LOG2", 0) > 0 or op_counts.get("SIN", 0) > 0 or \
+       op_counts.get("SQRT", 0) > 0 or op_counts.get("RECIPROCAL", 0) > 0 or \
+       op_counts.get("WHERE", 0) > 0:
+        return None
+    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
+    if len(params) != 2 or 0 not in params:
+        return None
+    src_arg = next((k for k in params if k != 0), None)
+    if src_arg is None:
+        return None
+    if not ("float" in str(params[0].dtype) and "float" in str(params[src_arg].dtype)):
+        return None
+    out_size = params[0].dtype.size
+    if out_size != params[src_arg].dtype.size or out_size <= 0:
+        return None
+
+    stores = [u for u in uops if u.op is Ops.STORE]
+    if not stores:
+        return None
+    # Outer pattern: MUL(ADD(EXP2_pos, EXP2_neg_branch), 0.5)
+    val = _chase(stores[0].src[1])
+    if val.op is not Ops.MUL:
+        return None
+    half_const = next((s for s in val.src if _chase(s).op is Ops.CONST and
+                       float(_chase(s).arg) == 0.5), None)
+    add_node = next((s for s in val.src if s is not half_const), None)
+    if half_const is None or add_node is None:
+        return None
+    add_node = _chase(add_node)
+    if add_node.op is not Ops.ADD:
+        return None
+    a, b = _chase(add_node.src[0]), _chase(add_node.src[1])
+    # cosh: both EXP2 directly. sinh: one EXP2, the other MUL(EXP2, -1)
+    def _is_exp2_with_scale(node, want_sign: int):
+        """Return the scale-const float if node = EXP2(MUL(x, c)) with sign(c) == want_sign, else None."""
+        if node.op is not Ops.EXP2:
+            return None
+        m = _chase(node.src[0])
+        if m.op is not Ops.MUL:
+            return None
+        cst = next((s for s in m.src if _chase(s).op is Ops.CONST), None)
+        x   = next((s for s in m.src if s is not cst), None)
+        if cst is None or x is None or not _has_load_src(x):
+            return None
+        c = float(_chase(cst).arg)
+        if (want_sign > 0 and c <= 0) or (want_sign < 0 and c >= 0):
+            return None
+        return c
+
+    if kind == "cosh":
+        c_pos = _is_exp2_with_scale(a, +1) or _is_exp2_with_scale(b, +1)
+        c_neg = _is_exp2_with_scale(a, -1) or _is_exp2_with_scale(b, -1)
+        if c_pos is None or c_neg is None:
+            return None
+    else:  # sinh: locate the MUL(EXP2(...), -1) branch
+        neg_branch = None
+        pos_branch = None
+        for cand in (a, b):
+            if cand.op is Ops.MUL:
+                m_const = next((s for s in cand.src if _chase(s).op is Ops.CONST and
+                                float(_chase(s).arg) == -1.0), None)
+                exp_n   = next((s for s in cand.src if s is not m_const), None)
+                if m_const is not None and exp_n is not None and _chase(exp_n).op is Ops.EXP2:
+                    neg_branch = _chase(exp_n)
+            elif cand.op is Ops.EXP2:
+                pos_branch = cand
+        if neg_branch is None or pos_branch is None:
+            return None
+        c_pos = _is_exp2_with_scale(pos_branch, +1)
+        c_neg = _is_exp2_with_scale(neg_branch, -1)
+        if c_pos is None or c_neg is None:
+            return None
+
+    cpos_bits = int(np.frombuffer(np.float32(c_pos).tobytes(), dtype=np.int32)[0])
+    cneg_bits = int(np.frombuffer(np.float32(c_neg).tobytes(), dtype=np.int32)[0])
+    half_bits = int(np.frombuffer(np.float32(0.5).tobytes(), dtype=np.int32)[0])
+
+    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
+    data_plan = [
+        {"type": "VMEM", "addr": 0, "layout": "broadcast_const",
+         "value": cpos_bits, "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 1, "layout": "broadcast_const",
+         "value": cneg_bits, "count": _TILE_ELEMS, "dtype": "int32"},
+        {"type": "VMEM", "addr": 2, "layout": "broadcast_const",
+         "value": half_bits, "count": _TILE_ELEMS, "dtype": "int32"},
+    ]
+    all_instrs = [_load(0, 0), _load(1, 1), _load(2, 2)]
+    FMUL_OP = _VPU_OPS["FMUL"]
+    FADD_OP = _VPU_OPS["FADD"]
+    FSUB_OP = _VPU_OPS["FSUB"]
+    COMBINE_OP = FADD_OP if kind == "cosh" else FSUB_OP
+    outputs = []
+    for tile_idx in range(num_tiles):
+        offset = tile_idx * _TILE_ELEMS
+        count  = min(_TILE_ELEMS, out_size - offset)
+        in_vmem  = 3 + tile_idx * 2
+        out_vmem = 4 + tile_idx * 2
+        data_plan.append({"type": "VMEM", "addr": in_vmem, "param": src_arg,
+                          "offset": offset, "count": count, "dtype": "int32"})
+        all_instrs += [
+            _load(3, in_vmem),
+            _vpu(4, 3, FMUL_OP, 0),
+            _vpu_exp2(5, 4),
+            _vpu(6, 3, FMUL_OP, 1),
+            _vpu_exp2(7, 6),
+            _vpu(8, 5, COMBINE_OP, 7),
+            _vpu(9, 8, FMUL_OP, 2),
+            _store(out_vmem, 9),
+        ]
+        outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
+    all_instrs.append(_halt())
+    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
+            "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
+
+
+def _render_cosh_sxu_program(uops: list[UOp]) -> dict | None:
+    return _render_hyperbolic_sxu_program(uops, "cosh")
+
+
+def _render_sinh_sxu_program(uops: list[UOp]) -> dict | None:
+    return _render_hyperbolic_sxu_program(uops, "sinh")
 
 
 def _render_self_cube_sxu_program(uops: list[UOp]) -> dict | None:
