@@ -64,7 +64,8 @@ class TestTypeSpec(unittest.TestCase):
     tested = 0
     for dtype_str, dtype in [
       ("bool", dtypes.bool), ("int8", dtypes.int8), ("int", dtypes.int), ("uint32", dtypes.uint32), ("float32", dtypes.float32)]:
-      np.testing.assert_equal(Tensor(n, dtype=dtype_str).numpy(), Tensor(n, dtype=dtype).numpy())
+      with np.errstate(invalid='ignore'):
+        np.testing.assert_equal(Tensor(n, dtype=dtype_str).numpy(), Tensor(n, dtype=dtype).numpy())
       np.testing.assert_equal(Tensor(n).cast(dtype_str).numpy(), Tensor(n).cast(dtype).numpy())
       if dtype.itemsize == 4:
         np.testing.assert_equal(Tensor(n).bitcast(dtype_str).numpy(), Tensor(n).bitcast(dtype).numpy())
@@ -193,7 +194,7 @@ class TestAutoCastType(unittest.TestCase):
         if not is_dtype_supported(dtype): continue
         if DEBUG >= 2:
           print(f"testing {default_dtype=}, {dtype=}")
-        a = Tensor([1, 2, 3], dtype=dtype, requires_grad=True)
+        a = Tensor([1, 2, 3], dtype=dtype)
         b = (a * 5).sum()
         b.backward()  # if there is dtype mismatch, lazy should assert
         assert a.grad.dtype == a.dtype
@@ -208,14 +209,14 @@ class TestAutoCastType(unittest.TestCase):
   def test_mean_half_precision_underflow(self):
     N = 10000
     x = 0.001
-    t = Tensor([[x]], dtype=dtypes.half, requires_grad=True).expand(N, N).contiguous()
+    t = Tensor([[x]], dtype=dtypes.half).expand(N, N).contiguous()
     np.testing.assert_allclose(t.mean(axis=1).numpy(), np.array([x] * N, dtype=np.float16), rtol=1e-3)
 
   @unittest.skip("this test only works with SPLIT_REDUCEOP=1")
   @unittest.skipUnless(is_dtype_supported(dtypes.half), "need half")
   def test_mean_half_precision_overflow(self):
     N = 256
-    t = Tensor([60000] * N*N, dtype=dtypes.half, requires_grad=True).reshape(N, N)
+    t = Tensor([60000] * N*N, dtype=dtypes.half).reshape(N, N)
     np.testing.assert_allclose(t.mean().numpy(), 60000)
     t.square().mean().backward()
     np.testing.assert_allclose(t.grad.numpy().flatten(), [60000 * 2 / (N*N)] * N*N)
