@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import numpy as np
 from tinygrad.uop.ops import Ops, UOp
-from tinygrad.dtype import PtrDType
+from tinygrad.dtype import PtrDType, dtypes
 
 # ---------------------------------------------------------------------------
 # Tile geometry and opcode tables (kept in sync with ops_tinytpu.py)
@@ -108,9 +108,19 @@ class TpuKernel:
 # Graph helpers
 # ---------------------------------------------------------------------------
 def _canon(u: UOp) -> UOp:
-  """Strip transparent GEP lane-selection — GEP(x, i) reduces to x."""
-  while u.op is Ops.GEP: u = u.src[0]
-  return u
+  """Strip transparent wrappers the walker sees through:
+
+  - GEP lane-selection — GEP(x, i) reduces to x.
+  - value-preserving bool->int casts — a bool is physically 0/1 and is
+    loaded straight into an int32 tile, so the cast is a no-op.
+  """
+  while True:
+    if u.op is Ops.GEP:
+      u = u.src[0]
+    elif u.op is Ops.CAST and u.src[0].dtype == dtypes.bool and "float" not in str(u.dtype):
+      u = u.src[0]
+    else:
+      return u
 
 def _unique_param(u: UOp) -> int | None:
   """The single PARAM arg reachable from u, or None if not unique."""
@@ -180,8 +190,11 @@ def can_lower(uops: list[UOp]) -> bool:
       elif shape != ref_shape: return False              # non-uniform: not a plain elementwise map
       for n in nodes:
         if n.op in _DATA_OPS:
-          if n.op is not Ops.WHERE and _float_operands(n) and n.op not in _FLOAT_VPU:
-            return False                                  # float op with no F-variant
+          # Float CMPNE/CMPEQ are valid as integer bit-compares; other float
+          # arithmetic needs an F-variant opcode.
+          if (n.op is not Ops.WHERE and _float_operands(n)
+              and n.op not in _FLOAT_VPU and n.op not in (Ops.CMPNE, Ops.CMPEQ)):
+            return False
           continue
         if n.op is Ops.LOAD:
           p = _unique_param(n)
