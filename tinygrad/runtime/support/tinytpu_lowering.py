@@ -26,18 +26,29 @@ _TILE_ELEMS = _ROWS * _COLS
 # VPU op codes — subset used by the elementwise walker.
 _VPU = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6, "SUB": 7,
         "CMPEQ": 8, "SHL": 10, "SHR": 11, "MIN": 12, "DIV": 14,
-        "AND": 15, "OR": 16, "XOR": 17}
+        "AND": 15, "OR": 16, "XOR": 17,
+        "FADD": 18, "FMUL": 19, "FSUB": 20, "FMAX": 21, "FCMPLT": 22}
 
-# tinygrad ALU op -> VPU op name.
+# tinygrad ALU op -> integer VPU op name.
 _ALU_TO_VPU = {Ops.ADD: "ADD", Ops.MUL: "MUL", Ops.SUB: "SUB", Ops.MAX: "MAX",
                Ops.CMPLT: "CMPLT", Ops.CMPNE: "CMPNE", Ops.CMPEQ: "CMPEQ",
                Ops.AND: "AND", Ops.OR: "OR", Ops.XOR: "XOR",
                Ops.SHL: "SHL", Ops.SHR: "SHR", Ops.IDIV: "DIV"}
+# tinygrad ALU op -> float VPU op name (operands are float).
+_FLOAT_VPU = {Ops.ADD: "FADD", Ops.MUL: "FMUL", Ops.SUB: "FSUB",
+              Ops.MAX: "FMAX", Ops.CMPLT: "FCMPLT"}
 
-_CMP_OPS = {Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ}
-# Ops the walker emits an instruction for. LOAD/CONST are leaves.
+# Ops the walker emits an instruction for. LOAD/CONST are leaves; GEP is
+# transparent lane-selection that the walker sees through.
 _ALU_OPS = frozenset(_ALU_TO_VPU)
 _DATA_OPS = _ALU_OPS | {Ops.WHERE}
+
+def _is_float(u: UOp) -> bool:
+  return "float" in str(u.dtype)
+
+def _float_operands(u: UOp) -> bool:
+  """True if the op operates on float operands (so it needs an F-variant)."""
+  return any(_is_float(s) for s in u.src)
 
 # ---------------------------------------------------------------------------
 # Typed instruction
@@ -96,20 +107,26 @@ class TpuKernel:
 # ---------------------------------------------------------------------------
 # Graph helpers
 # ---------------------------------------------------------------------------
+def _canon(u: UOp) -> UOp:
+  """Strip transparent GEP lane-selection — GEP(x, i) reduces to x."""
+  while u.op is Ops.GEP: u = u.src[0]
+  return u
+
 def _unique_param(u: UOp) -> int | None:
   """The single PARAM arg reachable from u, or None if not unique."""
   args = {n.arg for n in u.toposort() if n.op is Ops.PARAM}
   return next(iter(args)) if len(args) == 1 and isinstance(next(iter(args)), int) else None
 
 def _data_dag(val: UOp) -> list[UOp]:
-  """Walk the stored-value tree, returning data nodes in topological order.
+  """Walk a stored-value tree, returning data nodes in topological order.
 
-  LOAD and CONST are leaves — their index subtrees are not entered, so
-  index arithmetic never reaches the walker.
+  GEP is transparent; LOAD and CONST are leaves — their index subtrees are
+  not entered, so index arithmetic never reaches the walker.
   """
   order: list[UOp] = []
   seen: set[UOp] = set()
   def visit(u: UOp) -> None:
+    u = _canon(u)
     if u in seen: return
     seen.add(u)
     if u.op in _DATA_OPS:
@@ -118,19 +135,28 @@ def _data_dag(val: UOp) -> list[UOp]:
   visit(val)
   return order
 
+def _store_lanes(store: UOp) -> list[UOp]:
+  """The per-lane value computations of a STORE.
+
+  Float kernels store a VECTORIZE of N lane computations; int kernels store
+  one scalar value (and are unrolled into many STOREs instead).
+  """
+  v = store.src[1]
+  return list(v.src) if v.op is Ops.VECTORIZE else [v]
+
 # ---------------------------------------------------------------------------
 # can_lower — positive predicate selecting walker-owned kernels
 # ---------------------------------------------------------------------------
 def can_lower(uops: list[UOp]) -> bool:
   """True iff the elementwise walker fully owns this kernel.
 
-  Scope (iteration 1): int32/bool elementwise — ALU and WHERE over equal-size
-  or size-1 (scalar broadcast) operands. No float, cast, transcendental,
-  reduction, WMMA, or structured broadcast.
+  Scope: int32/bool/float elementwise — ALU and WHERE over equal-size or
+  size-1 (scalar broadcast) operands. No cast, transcendental, reduction,
+  WMMA, or structured row/column broadcast.
 
-  tinygrad delivers elementwise kernels per-element unrolled (one STORE per
-  output lane, sometimes inside a RANGE). Every STORE must compute the same
-  data-DAG shape so a single STORE can template the tiled program.
+  Kernels arrive per-element unrolled (one STORE per lane) or vectorized
+  (one STORE of a VECTORIZE). Every lane must compute the same data-DAG
+  shape so one lane can template the tiled program.
   """
   if any(u.op is Ops.WMMA for u in uops): return False
   params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
@@ -141,51 +167,55 @@ def can_lower(uops: list[UOp]) -> bool:
   if len(out_args) != 1: return False
   out_arg = next(iter(out_args))
   if out_arg is None or out_arg not in params: return False
-
-  out_dtype = params[out_arg].dtype
-  if "float" in str(out_dtype): return False
-  out_size = out_dtype.size
+  out_size = params[out_arg].dtype.size
   if out_size <= 0: return False
 
   ref_shape: tuple | None = None
   for s in stores:
-    val = s.src[1]
-    if val.op not in _DATA_OPS: return False   # bare copy / const-fill stays elsewhere
-    nodes = _data_dag(val)
-    shape = tuple(n.op for n in nodes)
-    if ref_shape is None: ref_shape = shape
-    elif shape != ref_shape: return False      # non-uniform: not a plain elementwise map
-    for n in nodes:
-      if n.op in _DATA_OPS: continue
-      if n.op is Ops.LOAD:
-        p = _unique_param(n)
-        if p is None or p not in params: return False
-        psize = params[p].dtype.size
-        if psize not in (out_size, 1): return False
-        if "float" in str(params[p].dtype): return False
-        continue
-      if n.op is Ops.CONST:
-        if isinstance(n.arg, float): return False
-        continue
-      return False   # unknown op (CAST, transcendental, VECTORIZE, ...)
+    for lane in _store_lanes(s):
+      if _canon(lane).op not in _DATA_OPS: return False  # bare copy / const-fill stays elsewhere
+      nodes = _data_dag(lane)
+      shape = tuple(n.op for n in nodes)
+      if ref_shape is None: ref_shape = shape
+      elif shape != ref_shape: return False              # non-uniform: not a plain elementwise map
+      for n in nodes:
+        if n.op in _DATA_OPS:
+          if n.op is not Ops.WHERE and _float_operands(n) and n.op not in _FLOAT_VPU:
+            return False                                  # float op with no F-variant
+          continue
+        if n.op is Ops.LOAD:
+          p = _unique_param(n)
+          if p is None or p not in params: return False
+          if params[p].dtype.size not in (out_size, 1): return False
+          continue
+        if n.op is Ops.CONST:
+          continue
+        return False   # unknown op (CAST, transcendental, ...)
   return True
 
 # ---------------------------------------------------------------------------
 # lower_kernel — the InstSel pass + UOp walker
 # ---------------------------------------------------------------------------
+def _const_bits(arg) -> int:
+  """Encode a CONST operand as the int32 the broadcast tile carries."""
+  if isinstance(arg, float):
+    return int(np.frombuffer(np.float32(arg).tobytes(), dtype=np.int32)[0])
+  return int(arg)
+
 def lower_kernel(uops: list[UOp]) -> dict:
   """Lower an elementwise kernel to an SXU_PROGRAM descriptor.
 
   Caller must have checked can_lower(uops) first.
   """
   params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
-  store = next(u for u in uops if u.op is Ops.STORE)
-  out_arg = _unique_param(store.src[0])
+  stores = [u for u in uops if u.op is Ops.STORE]
+  out_arg = _unique_param(stores[0].src[0])
   out_param = params[out_arg]
   out_size = out_param.dtype.size
   out_is_bool = out_param.dtype.base.itemsize == 1
 
-  nodes = _data_dag(store.src[1])
+  # One lane templates the whole tiled program (can_lower proved uniformity).
+  nodes = _data_dag(_store_lanes(stores[0])[0])
   leaves = [n for n in nodes if n.op in (Ops.LOAD, Ops.CONST)]
   interior = [n for n in nodes if n.op in _DATA_OPS]
 
@@ -208,7 +238,7 @@ def lower_kernel(uops: list[UOp]) -> dict:
       vreg[leaf] = reg
       if leaf.op is Ops.CONST:
         kern.data_plan.append({"type": "VMEM", "addr": vmem, "layout": "broadcast_const",
-                               "value": int(leaf.arg), "count": count, "dtype": "int32"})
+                               "value": _const_bits(leaf.arg), "count": count, "dtype": "int32"})
         kern.instructions.append(TpuInst("LOAD", reg, (vmem,)))
         continue
       p = _unique_param(leaf)
@@ -235,11 +265,12 @@ def lower_kernel(uops: list[UOp]) -> dict:
       vreg[node] = reg
       if node.op is Ops.WHERE:
         kern.instructions.append(TpuInst("SELECT", reg,
-          (vreg[node.src[0]], vreg[node.src[1]], vreg[node.src[2]])))
+          tuple(vreg[_canon(s)] for s in node.src)))
         kern.primitives.add("SELECT")
       else:
+        table = _FLOAT_VPU if _float_operands(node) and node.op in _FLOAT_VPU else _ALU_TO_VPU
         kern.instructions.append(TpuInst("VPU", reg,
-          (vreg[node.src[0]], vreg[node.src[1]]), vpu_op=_VPU[_ALU_TO_VPU[node.op]]))
+          tuple(vreg[_canon(s)] for s in node.src), vpu_op=_VPU[table[node.op]]))
 
     out_vmem = base + len(leaves)
     kern.instructions.append(TpuInst("STORE", out_vmem, (vreg[interior[-1]],)))
