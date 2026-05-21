@@ -27,7 +27,8 @@ _TILE_ELEMS = _ROWS * _COLS
 _VPU = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6, "SUB": 7,
         "CMPEQ": 8, "SHL": 10, "SHR": 11, "MIN": 12, "DIV": 14,
         "AND": 15, "OR": 16, "XOR": 17,
-        "FADD": 18, "FMUL": 19, "FSUB": 20, "FMAX": 21, "FCMPLT": 22}
+        "FADD": 18, "FMUL": 19, "FSUB": 20, "FMAX": 21, "FCMPLT": 22,
+        "EXP2": 51, "LOG2": 52, "SIN": 53}
 
 # tinygrad ALU op -> integer VPU op name.
 _ALU_TO_VPU = {Ops.ADD: "ADD", Ops.MUL: "MUL", Ops.SUB: "SUB", Ops.MAX: "MAX",
@@ -37,11 +38,13 @@ _ALU_TO_VPU = {Ops.ADD: "ADD", Ops.MUL: "MUL", Ops.SUB: "SUB", Ops.MAX: "MAX",
 # tinygrad ALU op -> float VPU op name (operands are float).
 _FLOAT_VPU = {Ops.ADD: "FADD", Ops.MUL: "FMUL", Ops.SUB: "FSUB",
               Ops.MAX: "FMAX", Ops.CMPLT: "FCMPLT"}
+# tinygrad unary transcendental -> VPU op name (single hardware opcode).
+_UNARY_VPU = {Ops.EXP2: "EXP2", Ops.LOG2: "LOG2", Ops.SIN: "SIN"}
 
 # Ops the walker emits an instruction for. LOAD/CONST are leaves; GEP is
 # transparent lane-selection that the walker sees through.
 _ALU_OPS = frozenset(_ALU_TO_VPU)
-_DATA_OPS = _ALU_OPS | {Ops.WHERE}
+_DATA_OPS = _ALU_OPS | {Ops.WHERE} | frozenset(_UNARY_VPU)
 
 def _is_float(u: UOp) -> bool:
   return "float" in str(u.dtype)
@@ -190,9 +193,10 @@ def can_lower(uops: list[UOp]) -> bool:
       elif shape != ref_shape: return False              # non-uniform: not a plain elementwise map
       for n in nodes:
         if n.op in _DATA_OPS:
-          # Float CMPNE/CMPEQ are valid as integer bit-compares; other float
-          # arithmetic needs an F-variant opcode.
-          if (n.op is not Ops.WHERE and _float_operands(n)
+          # Float arithmetic ALU ops need an F-variant opcode. Float
+          # CMPNE/CMPEQ are valid as integer bit-compares; transcendentals
+          # and WHERE have their own opcodes and are exempt.
+          if (n.op in _ALU_OPS and _float_operands(n)
               and n.op not in _FLOAT_VPU and n.op not in (Ops.CMPNE, Ops.CMPEQ)):
             return False
           continue
@@ -280,6 +284,9 @@ def lower_kernel(uops: list[UOp]) -> dict:
         kern.instructions.append(TpuInst("SELECT", reg,
           tuple(vreg[_canon(s)] for s in node.src)))
         kern.primitives.add("SELECT")
+      elif node.op in _UNARY_VPU:
+        kern.instructions.append(TpuInst("VPU", reg,
+          (vreg[_canon(node.src[0])],), vpu_op=_VPU[_UNARY_VPU[node.op]]))
       else:
         table = _FLOAT_VPU if _float_operands(node) and node.op in _FLOAT_VPU else _ALU_TO_VPU
         kern.instructions.append(TpuInst("VPU", reg,
