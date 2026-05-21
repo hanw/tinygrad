@@ -261,16 +261,13 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
         # lower_broadcast(); they never reach this fallback renderer.
         if (pad_desc := _render_pad_sxu_program(uops)) is not None:
             return pad_desc
-        if (fill_desc := _render_const_fill_sxu_program(uops)) is not None:
-            return fill_desc
         if (trans_desc := _render_transpose_sxu_program(uops)) is not None:
             return trans_desc
-        if (cast_desc := _render_cast_sxu_program(uops)) is not None:
-            return cast_desc
-        if (copy_desc := _render_copy_sxu_program(uops)) is not None:
-            return copy_desc
-        # Plain elementwise kernels are owned by the InstSel walker, selected
-        # up front in render() via can_lower(). Anything reaching here is an
+        if (rowbc_desc := _render_rowbc_copy_sxu_program(uops)) is not None:
+            return rowbc_desc
+        # Plain elementwise kernels — including degenerate copy, cast, and
+        # const-fill maps — are owned by the InstSel walker, selected up front
+        # in render() via can_lower(). Anything reaching here is an
         # unrecognized kernel — surface it rather than silently mishandling.
         return None
 
@@ -399,85 +396,6 @@ def _render_sxu_program(uops: list[UOp]) -> dict | None:
     }
 
 
-_ALU_OP_NAMES = {"ADD", "SUB", "MUL", "MAX", "MIN", "IDIV", "MOD", "AND", "OR",
-                 "XOR", "NOT", "CMPLT", "CMPEQ", "CMPNE", "SHL", "SHR", "WHERE",
-                 "RECIP", "RECIPROCAL", "TRUNC", "SELECT", "WMMA", "MULACC"}
-
-
-def _render_cast_sxu_program(uops: list[UOp]) -> dict | None:
-    """Render int32↔float32 CAST kernels as SXU_PROGRAM using VPU_I2F / VPU_F2I.
-
-    Pattern: 2 params (out, src), exactly one CAST op, int↔float type pair.
-    bool↔int casts are handled by the legacy analyzer (bit-level, not value conversion).
-    """
-    op_counts = Counter(u.op.name for u in uops)
-    if op_counts.get("CAST", 0) == 0:
-        return None
-    # Reject if anything beyond CAST/movement/indexing ops is present
-    _allowed = {"CAST", "CONST", "INDEX", "LOAD", "STORE", "PARAM", "SINK", "GROUP",
-                "END", "RANGE", "VECTORIZE", "GEP", "MUL", "ADD"}
-    if any(c > 0 and n not in _allowed for n, c in op_counts.items()):
-        return None
-    # The MUL/ADD must be index arithmetic (no LOAD in source tree).
-    for u in uops:
-        if u.op in (Ops.MUL, Ops.ADD) and _has_load_src(u):
-            return None
-    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
-    if len(params) != 2 or 0 not in params:
-        return None
-    out_dtype = str(params[0].dtype)
-    src_arg = next((k for k in params if k != 0), None)
-    if src_arg is None:
-        return None
-    src_dtype = str(params[src_arg].dtype)
-    # Only handle the value-conversion cases (not bool/int bitwidth changes).
-    src_is_bool = "bool" in src_dtype
-    out_is_bool = "bool" in out_dtype
-    if "float" in out_dtype and ("int" in src_dtype and not src_is_bool):
-        vpu_op = _VPU_OPS["I2F"]
-    elif "int" in out_dtype and not out_is_bool and "float" in src_dtype:
-        vpu_op = _VPU_OPS["F2I"]
-    elif "int" in out_dtype and not out_is_bool and src_is_bool:
-        # bool → int32: LOAD lifts the bool into an int32 register; COPY passes it through.
-        vpu_op = _VPU_OPS["COPY"]
-    elif ("float" in out_dtype and "float" in src_dtype) or (
-            "int" in out_dtype and not out_is_bool and
-            "int" in src_dtype and not src_is_bool):
-        # Same-dtype cast chain (e.g. int→float→int fused): emit identity via COPY
-        vpu_op = _VPU_OPS["COPY"]
-    else:
-        return None
-
-    out_size = params[0].dtype.size
-    src_size = params[src_arg].dtype.size
-    if out_size != src_size or out_size <= 0:
-        return None
-
-    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
-    all_instrs: list[str] = []
-    data_plan: list[dict] = []
-    outputs: list[dict] = []
-    for tile_idx in range(num_tiles):
-        offset = tile_idx * _TILE_ELEMS
-        count = min(_TILE_ELEMS, out_size - offset)
-        base = tile_idx * 2  # src, out
-        entry = {"type": "VMEM", "addr": base, "param": src_arg,
-                 "offset": offset, "count": count, "dtype": "int32"}
-        if src_is_bool:
-            entry["bool"] = True
-        data_plan.append(entry)
-        out_vmem = base + 1
-        all_instrs += [
-            _load(0, base),         # v0 = src (int bits)
-            _vpu(1, 0, vpu_op),     # v1 = I2F(v0) or F2I(v0) or COPY(v0)
-            _store(out_vmem, 1),
-        ]
-        outputs.append({"addr": out_vmem, "param": 0, "offset": offset, "count": count})
-    all_instrs.append(_halt())
-    return {"op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
-            "outputs": outputs, "num_output_tiles": num_tiles, "out": 0}
-
-
 def _render_pad_sxu_program(uops: list[UOp]) -> dict | None:
     """Render single-tile unrolled movement kernels (PAD / FLIP / permute)
     as a LOAD/STORE with a PAD_FILL VMEM preload that scatters source
@@ -567,22 +485,20 @@ def _render_pad_sxu_program(uops: list[UOp]) -> dict | None:
     }
 
 
-def _render_copy_sxu_program(uops: list[UOp]) -> dict | None:
-    """Render a pure data-movement kernel (no ALU) as a LOAD/STORE SXU_PROGRAM.
+def _render_rowbc_copy_sxu_program(uops: list[UOp]) -> dict | None:
+    """Render a single-input row-broadcast copy as LOAD + BROADCAST_ROW.
 
-    Covers the simple reshape-as-copy pattern tinygrad emits: 2 params (out, src),
-    matching sizes, a LOAD/STORE pair per tile with no arithmetic. Each tile
-    LOADs from VMEM[tile_in] and STOREs to VMEM[tile_out] without a VPU op.
+    Covers ``Tensor([[v0, .., vM]]).expand(N, M)``: a small source row (<=_COLS
+    elements, no RANGE dependence) replicated down every output row. This is a
+    structured broadcast, not a per-element map, so it stays a recognizer.
     """
     op_counts = Counter(u.op.name for u in uops)
     if not op_counts.get("STORE") or not op_counts.get("LOAD"):
         return None
-    # Only block on data-path ALU ops (index arithmetic is allowed).
-    data_alu = _data_alu_ops(uops)
-    if sum(data_alu.values()) > 0:
+    if sum(_data_alu_ops(uops).values()) > 0:
         return None
-    # Guard against other op classes that must still block copy-detection.
-    for n in ("WHERE", "MOD", "RECIP", "RECIPROCAL", "TRUNC", "WMMA", "MULACC", "SELECT"):
+    for n in ("WHERE", "MOD", "RECIP", "RECIPROCAL", "TRUNC", "WMMA", "MULACC",
+              "SELECT", "CAST"):
         if op_counts.get(n, 0):
             return None
 
@@ -603,35 +519,12 @@ def _render_copy_sxu_program(uops: list[UOp]) -> dict | None:
     src_size = params[src_arg].dtype.size
     if out_size <= 0 or src_size <= 0:
         return None
-    # Require matching element dtype — dtype conversions (bool<->int32 casts)
-    # need the VPU_BINARY widening path.
-    out_base = params[out_arg].dtype.base.itemsize
-    src_base = params[src_arg].dtype.base.itemsize
-    if out_base != src_base:
+    if params[out_arg].dtype.base.itemsize != params[src_arg].dtype.base.itemsize:
         return None
-    # Require LOAD and STORE index expressions to differ by a constant offset
-    # (possibly zero). This accepts reshape (offset=0) and contiguous slice /
-    # shrink (offset=K) while rejecting permute/transpose/flip/stride.
+
     def _index_of(addr_uop):
-        if addr_uop.op is Ops.INDEX:
-            return addr_uop.src[1]
-        return None
+        return addr_uop.src[1] if addr_uop.op is Ops.INDEX else None
 
-    def _split_const(idx):
-        # Return (base_expr_or_None, const) if idx == ADD(base, CONST) or CONST.
-        if idx.op is Ops.CONST and isinstance(idx.arg, int):
-            return (None, idx.arg)
-        if idx.op is Ops.ADD:
-            # ADD(x, CONST) — tinygrad canonicalizes with const on the right.
-            a, b = idx.src
-            if b.op is Ops.CONST and isinstance(b.arg, int):
-                return (a, b.arg)
-            if a.op is Ops.CONST and isinstance(a.arg, int):
-                return (b, a.arg)
-        return (idx, 0)
-
-    # Detect scalar-broadcast: LOAD index is a literal CONST (no RANGE
-    # dependence). Emit a single load + BROADCAST_SCALAR per tile.
     def _has_range(u, seen=None):
         if seen is None: seen = set()
         if id(u) in seen: return False
@@ -640,176 +533,34 @@ def _render_copy_sxu_program(uops: list[UOp]) -> dict | None:
         return any(_has_range(s, seen) for s in u.src)
 
     load_idxs_all = [_index_of(s.src[1].src[0]) for s in stores if s.src[1].op is Ops.LOAD]
-    load_idxs = set(load_idxs_all)
+    if len(load_idxs_all) != len(stores):
+        return None
     all_loads_no_range = all(li is not None and not _has_range(li) for li in load_idxs_all)
-    if len(load_idxs) == 1 and all_loads_no_range:
-        li = load_idxs_all[0]
-        # Scalar broadcast path: single LOAD index, constant
-        load_const = li.arg if li.op is Ops.CONST else None
-        if load_const is not None:
-            num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
-            data_plan = [{
-                "type": "VMEM", "addr": 0, "param": src_arg,
-                "offset": load_const, "count": 1, "dtype": "int32",
-            }]
-            all_instrs = [_load(0, 0), f"2 9 0 1 0 0 0 0 0 0"]  # SXU_BROADCAST_SCALAR vd=1 vs=0 row=0 col=0
-            outputs = []
-            for t in range(num_tiles):
-                offset = t * _TILE_ELEMS
-                count = min(_TILE_ELEMS, out_size - offset)
-                out_addr = 1 + t
-                all_instrs.append(_store(out_addr, 1))
-                outputs.append({
-                    "addr": out_addr, "param": out_arg,
-                    "offset": offset, "count": count,
-                })
-            all_instrs.append(_halt())
-            return {
-                "op": "SXU_PROGRAM", "instructions": all_instrs,
-                "data_plan": data_plan, "outputs": outputs,
-                "num_output_tiles": num_tiles, "out": out_arg,
-            }
-    # Row-broadcast: all LOAD indices are CONSTs (no RANGE), out_size is a
-    # multiple of src_size, and src_size is small (<=_COLS). Emit
-    # LOAD + BROADCAST_ROW + STOREs per tile. This handles
-    # Tensor([[v0, v1, ..., vM]]).expand(N, M).
-    if (all_loads_no_range and src_size <= _COLS and out_size % src_size == 0
+    # Row-broadcast: every LOAD index is range-independent, the output is a
+    # multiple of a small source row. The InstSel walker rejects this — its
+    # source-offset relation to the STORE index is not a constant.
+    if not (all_loads_no_range and src_size <= _COLS and out_size % src_size == 0
             and out_size > src_size):
-        num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
-        data_plan = [{
-            "type": "VMEM", "addr": 0, "param": src_arg,
-            "offset": 0, "count": src_size, "dtype": "int32",
-        }]
-        all_instrs = [_load(0, 0), f"2 10 0 1 0 0 0 0 0 0"]  # SXU_BROADCAST_ROW vd=1 vs=0 srcRow=0
-        outputs = []
-        for t in range(num_tiles):
-            offset = t * _TILE_ELEMS
-            count = min(_TILE_ELEMS, out_size - offset)
-            out_addr = 1 + t
-            all_instrs.append(_store(out_addr, 1))
-            outputs.append({
-                "addr": out_addr, "param": out_arg,
-                "offset": offset, "count": count,
-            })
-        all_instrs.append(_halt())
-        return {
-            "op": "SXU_PROGRAM", "instructions": all_instrs,
-            "data_plan": data_plan, "outputs": outputs,
-            "num_output_tiles": num_tiles, "out": out_arg,
-        }
-
-    # Non-broadcast copy path requires src_size >= out_size.
-    if src_size < out_size:
         return None
 
-    src_offset = None  # constant offset (elements) from out to in
-    for store in stores:
-        out_addr = store.src[0]
-        val = store.src[1]
-        if val.op is not Ops.LOAD:
-            return None
-        in_addr = val.src[0]
-        out_idx = _index_of(out_addr)
-        in_idx = _index_of(in_addr)
-        if out_idx is None or in_idx is None:
-            return None
-        if out_idx is in_idx:
-            k = 0
-        else:
-            out_base, out_k = _split_const(out_idx)
-            in_base,  in_k  = _split_const(in_idx)
-            if out_base is not in_base:
-                return None
-            k = in_k - out_k
-        if src_offset is None:
-            src_offset = k
-        elif src_offset != k:
-            return None
-    if src_offset is None or src_offset < 0:
-        return None
-
-    num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
-    all_instrs: list[str] = []
-    data_plan: list[dict] = []
-    outputs: list[dict] = []
-    for tile_idx in range(num_tiles):
-        offset = tile_idx * _TILE_ELEMS
-        count = min(_TILE_ELEMS, out_size - offset)
-        in_addr = tile_idx
-        out_addr = num_tiles + tile_idx
-        data_plan.append({
-            "type": "VMEM", "addr": in_addr, "param": src_arg,
-            "offset": offset + src_offset, "count": count, "dtype": "int32",
-        })
-        all_instrs.append(_load(0, in_addr))
-        all_instrs.append(_store(out_addr, 0))
-        outputs.append({
-            "addr": out_addr, "param": out_arg,
-            "offset": offset, "count": count,
-        })
-    all_instrs.append(_halt())
-    return {
-        "op": "SXU_PROGRAM", "instructions": all_instrs, "data_plan": data_plan,
-        "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg,
-    }
-
-def _render_const_fill_sxu_program(uops: list[UOp]) -> dict | None:
-    """Render a pure STORE-CONST kernel (Tensor.zeros/ones/full) as broadcast store."""
-    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
-    if len(params) != 1:
-        return None
-    out_arg = next(iter(params))
-    out_size = params[out_arg].dtype.size
-    if out_size <= 0:
-        return None
-    stores = [u for u in uops if u.op is Ops.STORE]
-    if not stores:
-        return None
-    # Every STORE must write the same CONST (directly or through CAST).
-    values = set()
-    for s in stores:
-        v = s.src[1]
-        while v.op in (Ops.CAST, Ops.VECTORIZE):
-            v = v.src[0] if len(v.src) > 0 else v
-        if v.op is not Ops.CONST:
-            return None
-        values.add(v.arg)
-    if len(values) != 1:
-        return None
-    const_val = next(iter(values))
-    if isinstance(const_val, bool):
-        const_bits = int(const_val)
-    elif isinstance(const_val, float):
-        const_bits = int(np.frombuffer(np.float32(const_val).tobytes(), dtype=np.int32)[0])
-    else:
-        const_bits = int(const_val)
-    # Reject anything besides STORE/CONST/PARAM/INDEX/CAST/VECTORIZE/GROUP/SINK/END/RANGE.
-    allowed = {"STORE", "CONST", "PARAM", "INDEX", "CAST", "VECTORIZE", "GROUP", "SINK", "END", "RANGE"}
-    op_counts = Counter(u.op.name for u in uops)
-    if any(c > 0 and n not in allowed for n, c in op_counts.items()):
-        return None
-
-    is_bool_out = (isinstance(params[out_arg].dtype, PtrDType)
-                   and params[out_arg].dtype.base.itemsize == 1)
     num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
     data_plan = [{
-        "type": "VMEM", "addr": 0, "layout": "broadcast_const",
-        "value": const_bits, "count": _TILE_ELEMS, "dtype": "int32",
+        "type": "VMEM", "addr": 0, "param": src_arg,
+        "offset": 0, "count": src_size, "dtype": "int32",
     }]
-    instructions = [_load(0, 0)]
+    all_instrs = [_load(0, 0), "2 10 0 1 0 0 0 0 0 0"]  # SXU_BROADCAST_ROW vd=1 vs=0 srcRow=0
     outputs = []
     for t in range(num_tiles):
         offset = t * _TILE_ELEMS
         count = min(_TILE_ELEMS, out_size - offset)
         out_addr = 1 + t
-        instructions.append(_store(out_addr, 0))
+        all_instrs.append(_store(out_addr, 1))
         outputs.append({"addr": out_addr, "param": out_arg, "offset": offset, "count": count})
-    instructions.append(_halt())
+    all_instrs.append(_halt())
     return {
-        "op": "SXU_PROGRAM", "primitive": "CONST_FILL",
-        "instructions": instructions, "data_plan": data_plan,
-        "outputs": outputs, "num_output_tiles": num_tiles, "out": out_arg,
-        "bool_out": is_bool_out,
+        "op": "SXU_PROGRAM", "instructions": all_instrs,
+        "data_plan": data_plan, "outputs": outputs,
+        "num_output_tiles": num_tiles, "out": out_arg,
     }
 
 

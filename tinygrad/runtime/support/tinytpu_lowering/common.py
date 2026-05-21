@@ -50,10 +50,25 @@ _UNARY_VPU = {Ops.EXP2: "EXP2", Ops.LOG2: "LOG2", Ops.SIN: "SIN",
 # transparent lane-selection that the walker sees through.
 _ALU_OPS = frozenset(_ALU_TO_VPU)
 # TRUNC has no single VPU opcode — the walker emits an F2I+I2F micro-pair.
-_DATA_OPS = _ALU_OPS | {Ops.WHERE, Ops.TRUNC} | frozenset(_UNARY_VPU)
+# CAST is an interior unary: a value-converting int<->float CAST maps to one
+# VPU opcode (I2F / F2I). Transparent bool->int casts are stripped by _canon
+# before they ever reach the data DAG, so an interior CAST is always a convert.
+_DATA_OPS = _ALU_OPS | {Ops.WHERE, Ops.TRUNC, Ops.CAST} | frozenset(_UNARY_VPU)
 
 def _is_float(u: UOp) -> bool:
   return "float" in str(u.dtype)
+
+def _cast_vpu(u: UOp) -> str | None:
+  """VPU opcode name for a value-converting CAST node, or None if it has no
+  per-element opcode (e.g. a same-class cast, which the walker rejects).
+
+  bool->int casts never reach here — _canon strips them as transparent.
+  """
+  dst_float = _is_float(u)
+  src_float = _is_float(u.src[0])
+  if src_float and not dst_float: return "F2I"   # float -> int
+  if dst_float and not src_float: return "I2F"   # int -> float
+  return None                                     # float<->float / int<->int
 
 def _float_operands(u: UOp) -> bool:
   """True if the op operates on float operands (so it needs an F-variant)."""
