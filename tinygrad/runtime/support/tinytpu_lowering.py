@@ -13,7 +13,7 @@ table so that ``ops_tinytpu.py`` can import it without an import cycle.
 from __future__ import annotations
 from dataclasses import dataclass, field
 import numpy as np
-from tinygrad.uop.ops import Ops, UOp
+from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, graph_rewrite
 from tinygrad.dtype import PtrDType, dtypes
 
 # ---------------------------------------------------------------------------
@@ -28,7 +28,7 @@ _VPU = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6, "SUB": 7,
         "CMPEQ": 8, "SHL": 10, "SHR": 11, "MIN": 12, "DIV": 14,
         "AND": 15, "OR": 16, "XOR": 17,
         "FADD": 18, "FMUL": 19, "FSUB": 20, "FMAX": 21, "FCMPLT": 22,
-        "EXP2": 51, "LOG2": 52, "SIN": 53}
+        "FRECIP": 23, "EXP2": 51, "LOG2": 52, "SIN": 53}
 
 # tinygrad ALU op -> integer VPU op name.
 _ALU_TO_VPU = {Ops.ADD: "ADD", Ops.MUL: "MUL", Ops.SUB: "SUB", Ops.MAX: "MAX",
@@ -38,8 +38,9 @@ _ALU_TO_VPU = {Ops.ADD: "ADD", Ops.MUL: "MUL", Ops.SUB: "SUB", Ops.MAX: "MAX",
 # tinygrad ALU op -> float VPU op name (operands are float).
 _FLOAT_VPU = {Ops.ADD: "FADD", Ops.MUL: "FMUL", Ops.SUB: "FSUB",
               Ops.MAX: "FMAX", Ops.CMPLT: "FCMPLT"}
-# tinygrad unary transcendental -> VPU op name (single hardware opcode).
-_UNARY_VPU = {Ops.EXP2: "EXP2", Ops.LOG2: "LOG2", Ops.SIN: "SIN"}
+# tinygrad unary op -> VPU op name (single hardware opcode).
+_UNARY_VPU = {Ops.EXP2: "EXP2", Ops.LOG2: "LOG2", Ops.SIN: "SIN",
+              Ops.RECIPROCAL: "FRECIP"}
 
 # Ops the walker emits an instruction for. LOAD/CONST are leaves; GEP is
 # transparent lane-selection that the walker sees through.
@@ -158,6 +159,23 @@ def _store_lanes(store: UOp) -> list[UOp]:
   return list(v.src) if v.op is Ops.VECTORIZE else [v]
 
 # ---------------------------------------------------------------------------
+# InstSel pass — graph rewrites expanding ops with no single VPU opcode
+# ---------------------------------------------------------------------------
+def _expand_sqrt(x: UOp) -> UOp:
+  # sqrt(x) = exp2(0.5 * log2(x)); the VPU has no direct sqrt opcode.
+  a = x.src[0]
+  return (a.alu(Ops.LOG2) * a.const_like(0.5)).alu(Ops.EXP2)
+
+_INSTSEL = PatternMatcher([(UPat(Ops.SQRT, name="x"), _expand_sqrt)])
+
+def _run_instsel(uops: list[UOp]) -> list[UOp]:
+  """Apply InstSel graph rewrites; return the (possibly rewritten) uop list."""
+  if not any(u.op is Ops.SQRT for u in uops):
+    return uops
+  sink = next(u for u in uops if u.op is Ops.SINK)
+  return list(graph_rewrite(sink, _INSTSEL).toposort())
+
+# ---------------------------------------------------------------------------
 # can_lower — positive predicate selecting walker-owned kernels
 # ---------------------------------------------------------------------------
 def can_lower(uops: list[UOp]) -> bool:
@@ -172,6 +190,7 @@ def can_lower(uops: list[UOp]) -> bool:
   shape so one lane can template the tiled program.
   """
   if any(u.op is Ops.WMMA for u in uops): return False
+  uops = _run_instsel(uops)
   params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
   stores = [u for u in uops if u.op is Ops.STORE]
   if not stores or not params: return False
@@ -224,6 +243,7 @@ def lower_kernel(uops: list[UOp]) -> dict:
 
   Caller must have checked can_lower(uops) first.
   """
+  uops = _run_instsel(uops)
   params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
   stores = [u for u in uops if u.op is Ops.STORE]
   out_arg = _unique_param(stores[0].src[0])
