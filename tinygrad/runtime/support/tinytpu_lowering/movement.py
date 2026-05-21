@@ -19,25 +19,12 @@ from __future__ import annotations
 from collections import Counter
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.dtype import PtrDType
-# Shared infrastructure — one geometry / encoders for the package.
+# Shared infrastructure — one geometry / encoders / graph helpers for the package.
 from tinygrad.runtime.support.tinytpu_lowering.common import (
   _COLS, _TILE_ELEMS, _ALU_TO_VPU,
-  _load, _store, _halt, _find_unique_param_arg)
+  _load, _store, _halt, _find_unique_param_arg,
+  _has_load_src, _data_alu_ops)
 from tinygrad.runtime.support.tinytpu_lowering.elementwise import can_lower
-
-
-# ---------------------------------------------------------------------------
-# Graph helpers
-# ---------------------------------------------------------------------------
-def _has_load_src(u: UOp) -> bool:
-  """True if a UOp has a LOAD anywhere in its source tree (data-path)."""
-  return any(n.op is Ops.LOAD for n in u.toposort())
-
-
-def _data_alu_ops(uops: list[UOp]) -> Counter:
-  """Count only data-path ALU ops (ones with LOAD in their source tree)."""
-  return Counter(_ALU_TO_VPU[u.op] for u in uops
-                 if u.op in _ALU_TO_VPU and _has_load_src(u))
 
 
 # ---------------------------------------------------------------------------
@@ -57,11 +44,13 @@ def _lower_pad(uops: list[UOp]) -> dict | None:
   op_counts = Counter(u.op.name for u in uops)
   if not op_counts.get("STORE") or not op_counts.get("LOAD"):
     return None
-  # Pure movement only: no data-path ALU, ternary, cast, or WMMA.
+  # Pure movement only: no data-path ALU, ternary, or cast.
+  # (WMMA is not listed: classify() routes WMMA kernels to GEMM before
+  # is_movement, so a WMMA kernel never reaches this recognizer.)
   data_alu = _data_alu_ops(uops)
   if sum(data_alu.values()) > 0:
     return None
-  for n in ("WHERE", "MOD", "RECIP", "RECIPROCAL", "TRUNC", "WMMA", "MULACC",
+  for n in ("WHERE", "MOD", "RECIP", "RECIPROCAL", "TRUNC", "MULACC",
             "SELECT", "CAST"):
     if op_counts.get(n, 0):
       return None
@@ -147,7 +136,8 @@ def _lower_rowbc_copy(uops: list[UOp]) -> dict | None:
     return None
   if sum(_data_alu_ops(uops).values()) > 0:
     return None
-  for n in ("WHERE", "MOD", "RECIP", "RECIPROCAL", "TRUNC", "WMMA", "MULACC",
+  # WMMA omitted: classify() routes WMMA kernels to GEMM before is_movement.
+  for n in ("WHERE", "MOD", "RECIP", "RECIPROCAL", "TRUNC", "MULACC",
             "SELECT", "CAST"):
     if op_counts.get(n, 0):
       return None
@@ -175,12 +165,9 @@ def _lower_rowbc_copy(uops: list[UOp]) -> dict | None:
   def _index_of(addr_uop):
     return addr_uop.src[1] if addr_uop.op is Ops.INDEX else None
 
-  def _has_range(u, seen=None):
-    if seen is None: seen = set()
-    if id(u) in seen: return False
-    seen.add(id(u))
-    if u.op is Ops.RANGE: return True
-    return any(_has_range(s, seen) for s in u.src)
+  def _has_range(u):
+    # toposort() yields u plus its transitive source closure.
+    return any(n.op is Ops.RANGE for n in u.toposort())
 
   load_idxs_all = [_index_of(s.src[1].src[0]) for s in stores if s.src[1].op is Ops.LOAD]
   if len(load_idxs_all) != len(stores):
@@ -292,15 +279,11 @@ def _lower_transpose(uops: list[UOp]) -> dict | None:
   # load vs store index expressions. Reshape: matching const sets (e.g. 0/1/2/3
   # each side). Transpose: store consts are {0,1,2,3} while load consts are
   # multiples of row stride {0,4,8,12}.
-  def _consts_in(u, seen=None):
-    if seen is None: seen = set()
-    if id(u) in seen: return []
-    seen.add(id(u))
-    if u.op is Ops.CONST and isinstance(u.arg, int):
-      return [u.arg]
-    out = []
-    for s in u.src: out += _consts_in(s, seen)
-    return out
+  def _consts_in(u):
+    # toposort() yields u plus its transitive source closure; collect every
+    # integer CONST arg. Callers wrap the result in set(), so per-node
+    # collection over the deduplicated closure matches the legacy walk.
+    return [n.arg for n in u.toposort() if n.op is Ops.CONST and isinstance(n.arg, int)]
   load_idx_uops = [l.src[0].src[1] if l.src[0].op is Ops.INDEX else None for l in loads]
   if any(u is None for u in store_idx_uops) or any(u is None for u in load_idx_uops):
     return None
@@ -308,7 +291,7 @@ def _lower_transpose(uops: list[UOp]) -> dict | None:
   load_consts = sorted(set(sum([_consts_in(u) for u in load_idx_uops], [])))
   if not ({4, 8, 12} <= set(load_consts)):
     return None
-  if len({id(u) for u in load_idx_uops}) != 4:
+  if len(set(load_idx_uops)) != 4:
     return None
   if set(load_consts) == set(store_consts):
     return None

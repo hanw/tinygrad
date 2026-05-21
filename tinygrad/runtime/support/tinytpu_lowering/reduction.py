@@ -18,10 +18,10 @@ from __future__ import annotations
 from collections import Counter
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.dtype import PtrDType
-# Shared infrastructure — one opcode table / geometry / encoders for the package.
+# Shared infrastructure — one opcode table / geometry / encoders / graph helpers.
 from tinygrad.runtime.support.tinytpu_lowering.common import (
   _ROWS, _COLS, _TILE_ELEMS, _VPU, _ALU_TO_VPU, _const_bits,
-  _load, _store, _vpu, _halt)
+  _load, _store, _vpu, _halt, _has_load_src, _data_alu_ops)
 
 # Reduction-identity bit patterns used to pad partial tiles.
 _INT32_MIN = -(1 << 31)
@@ -29,20 +29,6 @@ _INT32_MAX = (1 << 31) - 1
 _FLOAT_NEG_INF_BITS = -(1 << 23)   # 0xFF800000 as signed int32
 _FLOAT_POS_INF_BITS = 0x7F800000
 _FLOAT_ONE_BITS = 0x3F800000       # 1.0
-
-
-# ---------------------------------------------------------------------------
-# Graph helpers
-# ---------------------------------------------------------------------------
-def _has_load_src(u: UOp) -> bool:
-  """True if a UOp has a LOAD anywhere in its source tree (data-path)."""
-  return any(n.op is Ops.LOAD for n in u.toposort())
-
-
-def _data_alu_ops(uops: list[UOp]) -> Counter:
-  """Count only data-path ALU ops (ones with LOAD in their source tree)."""
-  return Counter(_ALU_TO_VPU[u.op] for u in uops
-                 if u.op in _ALU_TO_VPU and _has_load_src(u))
 
 
 def _is_float_min_negation(uops: list[UOp]) -> bool:
