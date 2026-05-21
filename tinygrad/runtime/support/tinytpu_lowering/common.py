@@ -151,6 +151,17 @@ def _unique_param(u: UOp) -> int | None:
   args = {n.arg for n in u.toposort() if n.op is Ops.PARAM}
   return next(iter(args)) if len(args) == 1 and isinstance(next(iter(args)), int) else None
 
+def _find_unique_param_arg(u: UOp) -> int | None:
+  """The single PARAM arg in u's source tree, or None if not unique.
+
+  Shared by the GEMM lowerer and the structural recognizers in ops_tinytpu.py.
+  """
+  params = {node.arg for node in u.toposort() if node.op is Ops.PARAM}
+  if len(params) != 1:
+    return None
+  arg = next(iter(params))
+  return arg if isinstance(arg, int) else None
+
 def _data_dag(val: UOp) -> list[UOp]:
   """Walk a stored-value tree, returning data nodes in topological order.
 
@@ -212,3 +223,241 @@ def _const_bits(arg) -> int:
   if isinstance(arg, float):
     return int(np.frombuffer(np.float32(arg).tobytes(), dtype=np.int32)[0])
   return int(arg)
+
+
+# ---------------------------------------------------------------------------
+# Compact TASM helpers for bundle construction
+# ---------------------------------------------------------------------------
+# These produce the wire-format integer lines consumed by TbTinyTPURuntime.
+# See doc/tinytpu_asm.md for the full TASM specification. All lowerers and
+# ops_tinytpu.py share this single set of encoders (ops_tinytpu re-exports
+# them so existing imports keep working).
+
+def _vmem(addr: int, vals: list[int]) -> str:
+    return "5 " + str(addr) + " " + " ".join(str(v) for v in vals)
+
+def _wmem(addr: int, vals: list[int]) -> str:
+    return "0 " + str(addr) + " " + " ".join(str(v) for v in vals)
+
+def _amem(addr: int, vals: list[int]) -> str:
+    return "1 " + str(addr) + " " + " ".join(str(v) for v in vals)
+
+def _load(vd: int, vmem_src: int) -> str:
+    return f"2 0 {vmem_src} {vd} 0 0 0 0 0 0"
+
+def _store(vmem_dst: int, vs: int) -> str:
+    return f"2 1 {vmem_dst} 0 {vs} 0 0 0 0 0"
+
+def _vpu(vd: int, va: int, op: int, vb: int = 0) -> str:
+    return f"2 2 0 {vd} {va} {op} {vb} 0 0 0"
+
+def _vpu_bg(vd: int, va: int, op: int, vb: int = 0) -> str:
+    # DISPATCH_VPU_BG (opcode 41). Background-collect dual-issue path
+    # for single-cycle VPU ops. Main FSM advances pc the same cycle;
+    # a background rule retires the vreg write when vpu.isDone.
+    return f"2 41 0 {vd} {va} {op} {vb} 0 0 0"
+
+def _vpu_exp2(vd: int, va: int) -> str:
+    # VPU_EXP2 (opcode 51). Multi-cycle walker — SXU stalls on vpu.isDone
+    # until TranscUnit finishes its lane-by-lane Horner. ~80 cycles per tile.
+    return _vpu(vd, va, _VPU["EXP2"])
+
+def _vpu_log2(vd: int, va: int) -> str:
+    # VPU_LOG2 (opcode 52). Range-reduced (split x = m * 2^e) polynomial
+    # in the TranscUnit walker. Exact at powers of two, ~28% error at
+    # worst-case fractional inputs. ~96 cycles per tile (6 steps/lane).
+    return _vpu(vd, va, _VPU["LOG2"])
+
+def _vpu_sin(vd: int, va: int) -> str:
+    # VPU_SIN (opcode 53). Degree-5 Taylor through the TranscUnit walker.
+    # Accurate for |x| <= π/2; diverges for |x| > π. Upstream range
+    # reduction (mod 2π + quadrant fold) must be emitted by the renderer.
+    return _vpu(vd, va, _VPU["SIN"])
+
+def _select(vd: int, cond: int, lhs: int, rhs: int) -> str:
+    return f"2 8 0 {vd} {cond} 0 {lhs} {rhs} 0 0"
+
+def _broadcast_scalar(vd: int, vs: int, row: int = 0, col: int = 0) -> str:
+    sel = ((row & 0x3) << 2) | (col & 0x3)
+    return f"2 9 0 {vd} {vs} 0 {sel} 0 0 0"
+
+def _broadcast_row(vd: int, vs: int, row: int = 0) -> str:
+    return f"2 10 0 {vd} {vs} 0 {row} 0 0 0"
+
+def _broadcast_col(vd: int, vs: int, col: int = 0) -> str:
+    return f"2 11 0 {vd} {vs} 0 {col} 0 0 0"
+
+def _broadcast(vn: int, lane: int = 0) -> str:
+    return f"2 3 0 {vn} {vn} 0 {lane} 0 0 0"
+
+def _mxu(wbase: int, abase: int, tiles: int,
+         psum_addr: int = 0, psum_row: int = 0, psum_mode: int = 0) -> str:
+    # PSUM target fields repurpose unused vreg slots in DISPATCH_MXU:
+    #   vregDst=psum_addr, vregSrc=psum_row, vregSrc2=psum_mode
+    # Mode encoding: 0=PSUM_OFF, 1=PSUM_WRITE, 2=PSUM_ACCUMULATE.
+    return (f"2 4 0 {psum_addr} {psum_row} 0 {psum_mode} "
+            f"{wbase} {abase} {tiles}")
+
+def _mxu_psum_write(wbase: int, abase: int, tiles: int,
+                    psum_addr: int, psum_row: int) -> str:
+    return _mxu(wbase, abase, tiles, psum_addr, psum_row, 1)
+
+def _mxu_psum_acc(wbase: int, abase: int, tiles: int,
+                  psum_addr: int, psum_row: int) -> str:
+    return _mxu(wbase, abase, tiles, psum_addr, psum_row, 2)
+
+def _mxu_accumulate(wbase: int, abase: int, tiles: int) -> str:
+    # SXU_DISPATCH_MXU_ACCUMULATE opcode = 23. Routes through
+    # Controller.startAccumulate: WS feed path with drain-time PE
+    # clear skipped, so consecutive dispatches sum into the same PE
+    # accumulator (multi-K-tile GEMM). Not a distinct dataflow — the
+    # PE still holds a preloaded weight. PSUM plumbing not available.
+    return f"2 23 0 0 0 0 0 {wbase} {abase} {tiles}"
+
+def _mxu_clear() -> str:
+    # SXU_MXU_CLEAR opcode = 24. Zeroes the systolic-array PE
+    # accumulators. Needed between accumulate epochs and when
+    # re-entering WS from a previous accumulate/OS dispatch.
+    return "2 24 0 0 0 0 0 0 0 0"
+
+def _mxu_os(wbase: int, abase: int, klen: int) -> str:
+    # SXU_DISPATCH_MXU_OS opcode = 25. Routes through Controller.startOS:
+    # real output-stationary — weights + activations both stream as a
+    # staircase, each PE holds its own psum, full (rows x cols) psum
+    # drained via resultsMatrix(). klen reuses the MXU tileLen field
+    # (<= rows for the current single-tile weight SRAM read).
+    return f"2 25 0 0 0 0 0 {wbase} {abase} {klen}"
+
+def _load_mxu_matrix_row(vd: int, row: int) -> str:
+    # SXU_LOAD_MXU_MATRIX_ROW opcode = 26. Copies ctrl.resultsMatrix[row]
+    # into row 0 of vd. Intended for draining an OS dispatch row-by-row.
+    return f"2 26 0 {vd} {row} 0 0 0 0 0"
+
+def _read_cycle(vd: int) -> str:
+    # SXU_READ_CYCLE opcode = 27. Writes the SXU's free-running cycle
+    # counter as Int#(32) into row 0, lane 0 of vd (other lanes zeroed).
+    # Pair two READ_CYCLE calls with a STORE + host parse to measure
+    # the span of a program region from inside the bundle itself.
+    return f"2 27 0 {vd} 0 0 0 0 0 0"
+
+def _load_loop_depth(vd: int) -> str:
+    # SXU_LOAD_LOOP_DEPTH opcode = 36. Writes the current LOOP stack
+    # depth (0..4) into row 0, lane 0 of vd (other lanes zeroed).
+    # Intended for debug/test of nested SXU_LOOP frames.
+    return f"2 36 0 {vd} 0 0 0 0 0 0"
+
+def _xlu_rotate(vd: int, vs: int, amount: int) -> str:
+    # SXU_DISPATCH_XLU_ROTATE opcode = 37. Cyclic lane rotation via the
+    # XLU: vd[s][i] = vs[s][(i + amount) mod lanes]. Dual-issue like
+    # other XLU dispatches. `amount` stored in vregSrc2 low bits.
+    return f"2 37 0 {vd} {vs} 0 {amount} 0 0 0"
+
+def _loop_begin(count: int) -> str:
+    # SXU_LOOP_BEGIN opcode = 28. Sets loopCounter := count and marks
+    # the next instruction as the loop-return pc. Count must be 1..255.
+    assert 1 <= count <= 255, "loop count out of range"
+    return f"2 28 0 0 0 0 0 0 0 {count}"
+
+def _loop_end() -> str:
+    # SXU_LOOP_END opcode = 29. Decrements loopCounter; jumps back to
+    # the instruction after LOOP_BEGIN if more iterations remain.
+    return "2 29 0 0 0 0 0 0 0 0"
+
+def _vzero(vd: int) -> str:
+    # SXU_VZERO opcode = 30. One-cycle tile-of-zeros into vd. Skips
+    # the "preload zero in VMEM + LOAD" two-instruction dance.
+    return f"2 30 0 {vd} 0 0 0 0 0 0"
+
+def _vfill(vd: int, imm_i8: int) -> str:
+    # SXU_VFILL opcode = 31. Broadcast a signed 8-bit constant to all
+    # 16 lanes of vd. Encoded with imm in mxuWBase (unsigned byte).
+    assert -128 <= imm_i8 <= 127, "VFILL immediate out of int8 range"
+    enc = imm_i8 & 0xFF
+    return f"2 31 0 {vd} 0 0 0 {enc} 0 0"
+
+def _vmov(vd: int, vs: int) -> str:
+    # SXU_VMOV opcode = 32. vd := vs in one cycle.
+    return f"2 32 0 {vd} {vs} 0 0 0 0 0"
+
+def _vneg(vd: int, vs: int) -> str:
+    # SXU_VNEG opcode = 34. vd := -vs lane-wise in one cycle.
+    return f"2 34 0 {vd} {vs} 0 0 0 0 0"
+
+def _vabs(vd: int, vs: int) -> str:
+    # SXU_VABS opcode = 35. vd := |vs| lane-wise in one cycle.
+    return f"2 35 0 {vd} {vs} 0 0 0 0 0"
+
+def _mxu_os_accumulate(wbase: int, abase: int, klen: int) -> str:
+    # SXU_DISPATCH_MXU_OS_ACCUMULATE opcode = 33. Routes through
+    # Controller.startOsAccumulate: real-OS dispatch that skips the
+    # drain-time clearAll, so consecutive dispatches add another
+    # kLen worth of psums into the same matrix. Lets multi-K-tile OS
+    # scale past K == rows.
+    return f"2 33 0 0 0 0 0 {wbase} {abase} {klen}"
+
+def _psum_read(vd: int, psum_addr: int) -> str:
+    # SXU_PSUM_READ opcode = 17; vmemAddr doubles as PSUM bucket index.
+    return f"2 17 {psum_addr} {vd} 0 0 0 0 0 0"
+
+def _psum_read_row(vd: int, psum_addr: int, psum_row: int) -> str:
+    # SXU_PSUM_READ_ROW opcode = 18. Reads one row of a bucket into
+    # row 0 of vd with the other rows zeroed — same shape as
+    # LOAD_MXU_RESULT, so downstream bias/relu/store don't care that
+    # the row came from PSUM.
+    return f"2 18 {psum_addr} {vd} {psum_row} 0 0 0 0 0"
+
+def _psum_clear(psum_addr: int) -> str:
+    # SXU_PSUM_CLEAR opcode = 19. Zeros the whole bucket in one cycle
+    # without touching any vreg, so multi-K-tile GEMM can drop the
+    # "preload zero tile + LOAD v15 + PSUM_WRITE" boilerplate.
+    return f"2 19 {psum_addr} 0 0 0 0 0 0 0"
+
+def _psum_clear_all() -> str:
+    # SXU_PSUM_CLEAR_ALL opcode = 38. Multi-cycle walker inside SXU
+    # zeroes every bucket (psumDepth cycles total, one instruction).
+    # Replaces the 8-instruction PSUM_CLEAR sweep a multi-K-tile GEMM
+    # does before re-using buckets for a new K chain.
+    return f"2 38 0 0 0 0 0 0 0 0"
+
+def _set_pred_if_zero(vs: int) -> str:
+    # SXU_SET_PRED_IF_ZERO opcode = 20; pred := (vs[0][0] == 0).
+    return f"2 20 0 0 {vs} 0 0 0 0 0"
+
+def _skip_if_pred() -> str:
+    # SXU_SKIP_IF_PRED opcode = 21; if pred, skip the next instruction.
+    return f"2 21 0 0 0 0 0 0 0 0"
+
+def _set_pred_ne_zero(vs: int) -> str:
+    # SXU_SET_PRED_NE_ZERO opcode = 39; pred := (vs[0][0] != 0).
+    return f"2 39 0 0 {vs} 0 0 0 0 0"
+
+def _skip_if_not_pred() -> str:
+    # SXU_SKIP_IF_NOT_PRED opcode = 40; if !pred, skip the next instruction.
+    return f"2 40 0 0 0 0 0 0 0 0"
+
+def _psum_accumulate_row(vs: int, psum_addr: int, psum_row: int) -> str:
+    # SXU_PSUM_ACCUMULATE_ROW opcode = 22; accumulate row 0 of vs into
+    # psum[psum_addr][psum_row]. VPU-side row-granular deposit,
+    # symmetric with the MXU dispatch's psum_acc path.
+    return f"2 22 {psum_addr} {psum_row} {vs} 0 0 0 0 0"
+
+def _wait_mxu() -> str: return "2 5 0 0 0 0 0 0 0 0"
+def _load_mxu_result(vd: int) -> str: return f"2 6 0 {vd} 0 0 0 0 0 0"
+
+def _load_vpu_result(vd: int) -> str:
+    # SXU_LOAD_VPU_RESULT opcode = 13; copies vpu.resultReg (linger
+    # register) into vd so subsequent ops can reuse the last VPU
+    # output without re-dispatch.
+    return f"2 13 0 {vd} 0 0 0 0 0 0"
+
+def _load_xlu_result(vd: int) -> str:
+    # SXU_LOAD_XLU_RESULT opcode = 14; same pattern for the XLU output
+    # register.
+    return f"2 14 0 {vd} 0 0 0 0 0 0"
+def _halt()     -> str: return "2 7 0 0 0 0 0 0 0 0"
+def _output_mxu()           -> str: return "3 1"
+def _output_vmem(addr: int) -> str: return f"6 {addr}"
+def _end()      -> str: return "4"
+
+def _bundle(*lines: str) -> str:
+    return "\n".join(lines) + "\n"

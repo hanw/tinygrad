@@ -9,7 +9,7 @@ The BSV simulator binary is located via the TINYTPU_SIM environment variable
 """
 
 from __future__ import annotations
-import os, json, subprocess, tempfile, math
+import os, json, subprocess, tempfile
 from collections import Counter
 import numpy as np
 from tinygrad.device import Compiled, Allocator, BufferSpec, Compiler
@@ -17,7 +17,27 @@ from tinygrad.renderer import Renderer
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.dtype import PtrDType, dtypes
 from tinygrad.codegen.opt.tc import TensorCore
-from tinygrad.runtime.support.tinytpu_lowering import can_lower, lower_kernel, lower_reduction, lower_broadcast, classify, KernelClass
+from tinygrad.runtime.support.tinytpu_lowering import (
+    can_lower, lower_kernel, lower_reduction, lower_broadcast,
+    lower_gemm, lower_gemm_fallback, classify, KernelClass)
+# Bundle-instruction encoders, shared graph helpers, and GEMM tiling helpers
+# now live in the tinytpu_lowering package. They are re-imported here so the
+# long-standing `from tinygrad.runtime.ops_tinytpu import _vmem, ...` imports
+# in tests/ and scripts/ keep working unchanged.
+from tinygrad.runtime.support.tinytpu_lowering.common import (
+    _vmem, _wmem, _amem, _load, _store, _vpu, _vpu_bg,
+    _vpu_exp2, _vpu_log2, _vpu_sin, _select,
+    _broadcast_scalar, _broadcast_row, _broadcast_col, _broadcast,
+    _mxu, _mxu_psum_write, _mxu_psum_acc, _mxu_accumulate, _mxu_clear,
+    _mxu_os, _mxu_os_accumulate, _load_mxu_matrix_row,
+    _read_cycle, _load_loop_depth, _xlu_rotate, _loop_begin, _loop_end,
+    _vzero, _vfill, _vmov, _vneg, _vabs,
+    _psum_read, _psum_read_row, _psum_clear, _psum_clear_all,
+    _psum_accumulate_row, _set_pred_if_zero, _skip_if_pred,
+    _set_pred_ne_zero, _skip_if_not_pred,
+    _wait_mxu, _load_mxu_result, _load_vpu_result, _load_xlu_result,
+    _halt, _output_mxu, _output_vmem, _end, _bundle, _find_unique_param_arg)
+from tinygrad.runtime.support.tinytpu_lowering.gemm import _infer_tiling, _tiling_failure_note
 
 # ---------------------------------------------------------------------------
 # Constants matching the BSV TensorCore#(4,4,16) prototype
@@ -119,69 +139,6 @@ class TinyTPUCompiler(Compiler):
 # Legacy descriptor renderer — handles patterns not yet migrated to SXU_PROGRAM
 # ---------------------------------------------------------------------------
 
-def _render_gemm_fallback_sxu_program(uops: list[UOp]) -> dict | None:
-    """Render MULACC or scalar MUL+RANGE GEMMs (no WMMA UOp) as SXU_PROGRAM.
-
-    Same structure as the WMMA SXU path but triggered by the non-WMMA lowering
-    pattern. No epilogue support (bias/relu) — that still requires the WMMA
-    UOp path in `_render_sxu_program`.
-    """
-    op_counts = Counter(u.op.name for u in uops)
-    params = [u for u in uops if u.op is Ops.PARAM]
-    param_sizes: dict[int, int] = {}
-    for p in params:
-        if not isinstance(p.dtype, PtrDType):
-            return None
-        param_sizes[p.arg] = p.dtype.size
-
-    has_mulacc = any(u.op is Ops.MULACC for u in uops)
-    has_store = op_counts.get("STORE", 0) > 0
-    is_gemm = has_mulacc or (len(params) == 3 and op_counts.get("MUL", 0) > 0
-                              and op_counts.get("RANGE", 0) > 0 and has_store)
-    if is_gemm and len(param_sizes) == 3 and op_counts.get("GROUP", 0) == 0:
-        tiling = _infer_tiling(param_sizes.get(0), param_sizes.get(1), param_sizes.get(2, 0))
-        if tiling is not None:
-            num_vecs, num_k_tiles, num_weight_tiles = tiling
-            out_arg, act_arg, weight_arg = 0, 1, 2
-            out_cols = num_weight_tiles * _COLS
-            k_cols = num_k_tiles * _ROWS
-            total_weight_tiles = num_k_tiles * num_weight_tiles
-            data_plan = [
-                {"type": "WMEM", "addr": 0, "param": weight_arg,
-                 "offset": 0, "count": total_weight_tiles * _ROWS * _COLS,
-                 "dtype": "int8", "layout": "weight_tiles",
-                 "num_k_tiles": num_k_tiles, "num_weight_tiles": num_weight_tiles},
-                {"type": "AMEM", "addr": 0, "param": act_arg,
-                 "offset": 0, "count": num_vecs * k_cols,
-                 "dtype": "int8", "layout": "act_tiles",
-                 "num_vecs": num_vecs, "num_k_tiles": num_k_tiles},
-            ]
-            instructions = _generate_gemm_sxu_instructions(
-                num_vecs, num_k_tiles, num_weight_tiles,
-                has_bias=False, bias_vmem_base=0, has_relu=False,
-            )
-            outputs = []
-            for row in range(num_vecs):
-                for tile_idx in range(num_weight_tiles):
-                    out_addr = row * num_weight_tiles + tile_idx
-                    outputs.append({
-                        "addr": out_addr, "param": out_arg,
-                        "offset": row * out_cols + tile_idx * _COLS,
-                        "count": _COLS,
-                    })
-            return {
-                "op": "SXU_PROGRAM",
-                "instructions": instructions,
-                "data_plan": data_plan,
-                "outputs": outputs,
-                "num_output_tiles": num_vecs * num_weight_tiles,
-                "num_vecs": num_vecs,
-                "num_k_tiles": num_k_tiles,
-                "num_weight_tiles": num_weight_tiles,
-                "out": out_arg,
-            }
-
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -230,9 +187,11 @@ class TinyTPURenderer(Renderer):
             return _dump_lowering(json.dumps(lower_reduction(uops)))
         if klass is KernelClass.BROADCAST:
             return _dump_lowering(json.dumps(lower_broadcast(uops)))
+        if klass is KernelClass.GEMM and (gemm_desc := lower_gemm(uops)) is not None:
+            return _dump_lowering(json.dumps(gemm_desc))
         if (sxu_desc := _render_sxu_program(uops)) is not None:
             return _dump_lowering(json.dumps(sxu_desc))
-        if (gemm_desc := _render_gemm_fallback_sxu_program(uops)) is not None:
+        if (gemm_desc := lower_gemm_fallback(uops)) is not None:
             return _dump_lowering(json.dumps(gemm_desc))
         op_counts = dict(sorted(Counter(u.op.name for u in uops).items()))
         return _dump_lowering(json.dumps({
@@ -245,155 +204,34 @@ class TinyTPURenderer(Renderer):
 
 
 def _render_sxu_program(uops: list[UOp]) -> dict | None:
-    """Render a kernel as an SXU_PROGRAM descriptor.
+    """Render a non-GEMM kernel as an SXU_PROGRAM descriptor.
 
     Returns a dict with op="SXU_PROGRAM", pre-built SXU instructions, and a
     data_plan that maps buffer param indices to WMEM/AMEM/VMEM addresses.
     The runtime fills in actual data at call time.
 
-    Handles: WMMA GEMM kernels, elementwise binary/unary VPU kernels.
+    WMMA GEMM kernels are classified as KernelClass.GEMM and lowered by
+    lower_gemm() in the tinytpu_lowering package; they never reach here.
     Returns None if the kernel pattern is not recognized.
     """
-    wmmas = [u for u in uops if u.op is Ops.WMMA]
-    if not wmmas:
-        # Broadcast kernels (row / column / column-where) are classified up
-        # front in render() via is_broadcast() and dispatched to
-        # lower_broadcast(); they never reach this fallback renderer.
-        if (pad_desc := _render_pad_sxu_program(uops)) is not None:
-            return pad_desc
-        if (trans_desc := _render_transpose_sxu_program(uops)) is not None:
-            return trans_desc
-        if (rowbc_desc := _render_rowbc_copy_sxu_program(uops)) is not None:
-            return rowbc_desc
-        # Plain elementwise kernels — including degenerate copy, cast, and
-        # const-fill maps — are owned by the InstSel walker, selected up front
-        # in render() via can_lower(). Anything reaching here is an
-        # unrecognized kernel — surface it rather than silently mishandling.
+    if any(u.op is Ops.WMMA for u in uops):
+        # WMMA kernels are owned by lower_gemm(); if that returned None the
+        # kernel does not factor into a supported tiling/epilogue shape.
         return None
-
-    wmma = wmmas[0]
-
-    # Extract param mappings (same logic as _render_wmma_descriptor)
-    out_params = {_find_unique_param_arg(store.src[0]) for store in uops if store.op is Ops.STORE}
-    out_params.discard(None)
-    src0_param = _find_unique_param_arg(wmma.src[0])
-    src1_param = _find_unique_param_arg(wmma.src[1])
-    if len(out_params) != 1 or src0_param is None or src1_param is None:
-        return None  # fall back to old path
-
-    out_arg = next(iter(out_params))
-    act_arg, weight_arg = src0_param, src1_param
-    params = {u.arg: u for u in uops if u.op is Ops.PARAM and isinstance(u.dtype, PtrDType)}
-    if out_arg not in params or act_arg not in params or weight_arg not in params:
-        return None
-
-    out_size = params[out_arg].dtype.size
-    act_size = params[act_arg].dtype.size
-    weight_size = params[weight_arg].dtype.size
-    if (tiling := _infer_tiling(out_size, act_size, weight_size)) is None:
-        return None
-
-    num_vecs, num_k_tiles, num_weight_tiles = tiling
-    out_cols = num_weight_tiles * _COLS
-    k_cols = num_k_tiles * _ROWS
-
-    # Detect epilogue (bias add, relu)
-    epilogue, epilogue_error = _extract_wmma_epilogue(uops, params, out_arg, act_arg, weight_arg, out_size, out_cols)
-    if epilogue_error is not None:
-        return None
-
-    has_bias = any(step["op"] == "ADD" for step in epilogue)
-    has_relu = any(step["op"] == "RELU" for step in epilogue)
-    bias_arg = None
-    bias_mode = None
-    if has_bias:
-        bias_step = next(s for s in epilogue if s["op"] == "ADD")
-        bias_arg = bias_step["arg"]
-        bias_mode = bias_step["mode"]
-
-    # Build data_plan: describe which buffers map to which memory addresses
-    data_plan: list[dict] = []
-
-    # Weight tiles → WMEM: address = k * num_weight_tiles + tile_idx
-    total_weight_tiles = num_k_tiles * num_weight_tiles
-    data_plan.append({
-        "type": "WMEM",
-        "addr": 0,
-        "param": weight_arg,
-        "offset": 0,
-        "count": total_weight_tiles * _ROWS * _COLS,
-        "dtype": "int8",
-        "layout": "weight_tiles",
-        "num_k_tiles": num_k_tiles,
-        "num_weight_tiles": num_weight_tiles,
-    })
-
-    # Activation rows → AMEM: address = row * num_k_tiles + k
-    data_plan.append({
-        "type": "AMEM",
-        "addr": 0,
-        "param": act_arg,
-        "offset": 0,
-        "count": num_vecs * k_cols,
-        "dtype": "int8",
-        "layout": "act_tiles",
-        "num_vecs": num_vecs,
-        "num_k_tiles": num_k_tiles,
-    })
-
-    # Bias → VMEM (if present)
-    bias_vmem_base = 0
-    if has_bias:
-        bias_size = params[bias_arg].dtype.size
-        data_plan.append({
-            "type": "VMEM",
-            "addr": bias_vmem_base,
-            "param": bias_arg,
-            "offset": 0,
-            "count": bias_size,
-            "dtype": "int32",
-            "layout": "bias",
-            "mode": bias_mode,
-            "num_weight_tiles": num_weight_tiles,
-        })
-
-    # Output VMEM addresses
-    out_vmem_base = num_weight_tiles if has_bias else 0
-
-    # PSUM accumulation path eliminates the VPU_ADD chain and per-K
-    # LOAD_MXU_RESULT for multi-K-tile GEMM. SXU_PSUM_CLEAR zeroes the
-    # bucket in one cycle, so no zero-tile preload is needed.
-    use_psum = num_k_tiles > 1
-
-    # Generate SXU instructions
-    instructions = _generate_gemm_sxu_instructions(
-        num_vecs, num_k_tiles, num_weight_tiles,
-        has_bias=has_bias, bias_vmem_base=bias_vmem_base,
-        has_relu=has_relu,
-        use_psum=use_psum,
-    )
-    outputs: list[dict] = []
-    for row in range(num_vecs):
-        for tile_idx in range(num_weight_tiles):
-            out_addr = out_vmem_base + row * num_weight_tiles + tile_idx
-            outputs.append({
-                "addr": out_addr,
-                "param": out_arg,
-                "offset": (row * out_cols + tile_idx * _COLS),
-                "count": _COLS,
-            })
-
-    return {
-        "op": "SXU_PROGRAM",
-        "instructions": instructions,
-        "data_plan": data_plan,
-        "outputs": outputs,
-        "num_output_tiles": num_vecs * num_weight_tiles,
-        "num_vecs": num_vecs,
-        "num_k_tiles": num_k_tiles,
-        "num_weight_tiles": num_weight_tiles,
-        "out": out_arg,
-    }
+    # Broadcast kernels (row / column / column-where) are classified up
+    # front in render() via is_broadcast() and dispatched to
+    # lower_broadcast(); they never reach this fallback renderer.
+    if (pad_desc := _render_pad_sxu_program(uops)) is not None:
+        return pad_desc
+    if (trans_desc := _render_transpose_sxu_program(uops)) is not None:
+        return trans_desc
+    if (rowbc_desc := _render_rowbc_copy_sxu_program(uops)) is not None:
+        return rowbc_desc
+    # Plain elementwise kernels — including degenerate copy, cast, and
+    # const-fill maps — are owned by the InstSel walker, selected up front
+    # in render() via can_lower(). Anything reaching here is an
+    # unrecognized kernel — surface it rather than silently mishandling.
+    return None
 
 
 def _render_pad_sxu_program(uops: list[UOp]) -> dict | None:
@@ -682,140 +520,6 @@ def _render_transpose_sxu_program(uops: list[UOp]) -> dict | None:
         "num_output_tiles": 1,
         "out": out_arg,
     }
-
-def _generate_gemm_sxu_instructions(num_vecs: int, num_k_tiles: int, num_weight_tiles: int,
-                                     *, has_bias: bool = False, bias_vmem_base: int = 0,
-                                     has_relu: bool = False,
-                                     use_psum: bool = False) -> list[str]:
-    """Generate SXU instruction strings for a GEMM kernel.
-
-    When use_psum=True and num_k_tiles>1, accumulate K-tiles in the
-    PSUM bucket bank instead of reading each partial into a vreg and
-    chaining VPU_ADDs. This eliminates num_k_tiles-1 VPU_ADDs and
-    num_k_tiles LOAD_MXU_RESULT instructions per output tile.
-    """
-    out_vmem_base = num_weight_tiles if has_bias else 0
-    prog_lines: list[str] = []
-
-    psum_path = use_psum and num_k_tiles > 1
-
-    for row in range(num_vecs):
-        for tile_idx in range(num_weight_tiles):
-            if psum_path:
-                # Zero bucket 0 in one cycle, accumulate every K-tile
-                # into row 0, then extract the accumulated row into v0.
-                prog_lines.append(_psum_clear(0))
-                for k in range(num_k_tiles):
-                    wmem_addr = k * num_weight_tiles + tile_idx
-                    amem_addr = row * num_k_tiles + k
-                    prog_lines.append(_mxu_psum_acc(wmem_addr, amem_addr, 1, 0, 0))
-                    prog_lines.append(_wait_mxu())
-                prog_lines.append(_psum_read_row(0, 0, 0))  # v0 := psum[0].row[0]
-                cur = 0
-            else:
-                # MXU dispatches for K-tile accumulation (legacy VPU path)
-                for k in range(num_k_tiles):
-                    wmem_addr = k * num_weight_tiles + tile_idx
-                    amem_addr = row * num_k_tiles + k
-                    vreg_k = k
-                    prog_lines.append(_mxu(wmem_addr, amem_addr, 1))
-                    prog_lines.append(_wait_mxu())
-                    prog_lines.append(_load_mxu_result(vreg_k))
-
-                # Accumulate K-tiles
-                if num_k_tiles == 1:
-                    cur = 0
-                else:
-                    acc = num_k_tiles
-                    prog_lines.append(_vpu(acc, 0, _VPU_OPS["ADD"], 1))
-                    cur = acc
-                    for k in range(2, num_k_tiles):
-                        nxt = cur + 1
-                        prog_lines.append(_vpu(nxt, cur, _VPU_OPS["ADD"], k))
-                        cur = nxt
-
-            # Bias epilogue
-            if has_bias:
-                bias_vreg = cur + 1
-                prog_lines.append(_load(bias_vreg, bias_vmem_base + tile_idx))
-                result_vreg = bias_vreg + 1
-                prog_lines.append(_vpu(result_vreg, cur, _VPU_OPS["ADD"], bias_vreg))
-                cur = result_vreg
-
-            # ReLU epilogue
-            if has_relu:
-                nxt = cur + 1
-                prog_lines.append(_vpu(nxt, cur, 2))  # VPU_RELU opcode
-                cur = nxt
-
-            # Store result
-            out_addr = out_vmem_base + row * num_weight_tiles + tile_idx
-            prog_lines.append(_store(out_addr, cur))
-
-    prog_lines.append(_halt())
-    return prog_lines
-
-
-def _find_unique_param_arg(u: UOp) -> int | None:
-    params = {node.arg for node in u.toposort() if node.op is Ops.PARAM}
-    if len(params) != 1:
-        return None
-    arg = next(iter(params))
-    return arg if isinstance(arg, int) else None
-
-def _extract_wmma_epilogue(uops: list[UOp], params: dict[int, UOp], out_arg: int, act_arg: int, weight_arg: int,
-                           out_size: int, out_cols: int) -> tuple[list[dict], str | None]:
-    op_counts = Counter(u.op.name for u in uops)
-    extra_params = sorted(k for k in params if k not in {out_arg, act_arg, weight_arg})
-    epilogue: list[dict] = []
-
-    if op_counts.get("ADD", 0) and len(extra_params) > 0:
-        if len(extra_params) != 1:
-            return [], f"wmma add epilogue expected one extra param, found {len(extra_params)}"
-        bias_arg = extra_params[0]
-        bias_size = params[bias_arg].dtype.size
-        if bias_size == out_cols:
-            epilogue.append({"op": "ADD", "arg": bias_arg, "mode": "ROW_BROADCAST"})
-        elif bias_size == out_size:
-            epilogue.append({"op": "ADD", "arg": bias_arg, "mode": "FULL"})
-        else:
-            return [], f"wmma add epilogue unsupported bias size {bias_size}"
-
-    if op_counts.get("WHERE", 0) or op_counts.get("CMPLT", 0):
-        if op_counts.get("WHERE", 0) != out_size or op_counts.get("CMPLT", 0) != out_size:
-            return [], f"wmma relu epilogue expected {out_size} lane ops, got where={op_counts.get('WHERE', 0)} cmplt={op_counts.get('CMPLT', 0)}"
-        epilogue.append({"op": "RELU"})
-
-    unsupported = {name for name, count in op_counts.items() if count and name in {"MAX", "CMPNE", "CMPEQ"}}
-    if unsupported:
-        return [], f"wmma epilogue present: {', '.join(sorted(unsupported))}"
-    return epilogue, None
-
-
-def _apply_gemm_epilogue(bufs: tuple[bytearray, ...], out_i32: np.ndarray, prog: dict) -> np.ndarray:
-    out = out_i32
-    num_vecs = int(prog["num_vecs"])
-    out_cols = int(prog["num_weight_tiles"]) * _COLS
-    out_size = num_vecs * out_cols
-    for step in prog.get("epilogue", []):
-        if step["op"] == "ADD":
-            raw = np.frombuffer(bytes(bufs[int(step["arg"])]), dtype="<i4")
-            if step["mode"] == "ROW_BROADCAST":
-                if raw.size < out_cols:
-                    raise RuntimeError(f"TinyTPU row-broadcast bias expected at least {out_cols} elements, got {raw.size}")
-                out = (out.reshape(num_vecs, out_cols) + raw[:out_cols].reshape(1, out_cols)).reshape(out_size)
-            elif step["mode"] == "FULL":
-                if raw.size < out_size:
-                    raise RuntimeError(f"TinyTPU full bias expected at least {out_size} elements, got {raw.size}")
-                out = out + raw[:out_size]
-            else:
-                raise RuntimeError(f"unknown TinyTPU GEMM epilogue mode {step['mode']}")
-        elif step["op"] == "RELU":
-            out = np.maximum(out, 0)
-        else:
-            raise RuntimeError(f"unknown TinyTPU GEMM epilogue op {step['op']}")
-    return np.asarray(out, dtype=np.int32)
-
 
 def _dump_lowering(desc:str) -> str:
     target = os.environ.get("TINYTPU_DUMP_LOWERING")
@@ -1444,242 +1148,6 @@ def _arg_needs_broadcast(arg: int | None, param_sizes: dict[int, int], out_size:
 
 
 # ---------------------------------------------------------------------------
-# Compact TASM helpers for bundle construction
-# ---------------------------------------------------------------------------
-# These produce the wire-format integer lines consumed by TbTinyTPURuntime.
-# See doc/tinytpu_asm.md for the full TASM specification.
-
-def _vmem(addr: int, vals: list[int]) -> str:
-    return "5 " + str(addr) + " " + " ".join(str(v) for v in vals)
-
-def _wmem(addr: int, vals: list[int]) -> str:
-    return "0 " + str(addr) + " " + " ".join(str(v) for v in vals)
-
-def _amem(addr: int, vals: list[int]) -> str:
-    return "1 " + str(addr) + " " + " ".join(str(v) for v in vals)
-
-def _load(vd: int, vmem_src: int) -> str:
-    return f"2 0 {vmem_src} {vd} 0 0 0 0 0 0"
-
-def _store(vmem_dst: int, vs: int) -> str:
-    return f"2 1 {vmem_dst} 0 {vs} 0 0 0 0 0"
-
-def _vpu(vd: int, va: int, op: int, vb: int = 0) -> str:
-    return f"2 2 0 {vd} {va} {op} {vb} 0 0 0"
-
-def _vpu_bg(vd: int, va: int, op: int, vb: int = 0) -> str:
-    # DISPATCH_VPU_BG (opcode 41). Background-collect dual-issue path
-    # for single-cycle VPU ops. Main FSM advances pc the same cycle;
-    # a background rule retires the vreg write when vpu.isDone.
-    return f"2 41 0 {vd} {va} {op} {vb} 0 0 0"
-
-def _vpu_exp2(vd: int, va: int) -> str:
-    # VPU_EXP2 (opcode 51). Multi-cycle walker — SXU stalls on vpu.isDone
-    # until TranscUnit finishes its lane-by-lane Horner. ~80 cycles per tile.
-    return _vpu(vd, va, _VPU_OPS["EXP2"])
-
-def _vpu_log2(vd: int, va: int) -> str:
-    # VPU_LOG2 (opcode 52). Range-reduced (split x = m * 2^e) polynomial
-    # in the TranscUnit walker. Exact at powers of two, ~28% error at
-    # worst-case fractional inputs. ~96 cycles per tile (6 steps/lane).
-    return _vpu(vd, va, _VPU_OPS["LOG2"])
-
-def _vpu_sin(vd: int, va: int) -> str:
-    # VPU_SIN (opcode 53). Degree-5 Taylor through the TranscUnit walker.
-    # Accurate for |x| <= π/2; diverges for |x| > π. Upstream range
-    # reduction (mod 2π + quadrant fold) must be emitted by the renderer.
-    return _vpu(vd, va, _VPU_OPS["SIN"])
-
-def _select(vd: int, cond: int, lhs: int, rhs: int) -> str:
-    return f"2 8 0 {vd} {cond} 0 {lhs} {rhs} 0 0"
-
-def _broadcast_scalar(vd: int, vs: int, row: int = 0, col: int = 0) -> str:
-    sel = ((row & 0x3) << 2) | (col & 0x3)
-    return f"2 9 0 {vd} {vs} 0 {sel} 0 0 0"
-
-def _broadcast_row(vd: int, vs: int, row: int = 0) -> str:
-    return f"2 10 0 {vd} {vs} 0 {row} 0 0 0"
-
-def _broadcast_col(vd: int, vs: int, col: int = 0) -> str:
-    return f"2 11 0 {vd} {vs} 0 {col} 0 0 0"
-
-def _broadcast(vn: int, lane: int = 0) -> str:
-    return f"2 3 0 {vn} {vn} 0 {lane} 0 0 0"
-
-def _mxu(wbase: int, abase: int, tiles: int,
-         psum_addr: int = 0, psum_row: int = 0, psum_mode: int = 0) -> str:
-    # PSUM target fields repurpose unused vreg slots in DISPATCH_MXU:
-    #   vregDst=psum_addr, vregSrc=psum_row, vregSrc2=psum_mode
-    # Mode encoding: 0=PSUM_OFF, 1=PSUM_WRITE, 2=PSUM_ACCUMULATE.
-    return (f"2 4 0 {psum_addr} {psum_row} 0 {psum_mode} "
-            f"{wbase} {abase} {tiles}")
-
-def _mxu_psum_write(wbase: int, abase: int, tiles: int,
-                    psum_addr: int, psum_row: int) -> str:
-    return _mxu(wbase, abase, tiles, psum_addr, psum_row, 1)
-
-def _mxu_psum_acc(wbase: int, abase: int, tiles: int,
-                  psum_addr: int, psum_row: int) -> str:
-    return _mxu(wbase, abase, tiles, psum_addr, psum_row, 2)
-
-def _mxu_accumulate(wbase: int, abase: int, tiles: int) -> str:
-    # SXU_DISPATCH_MXU_ACCUMULATE opcode = 23. Routes through
-    # Controller.startAccumulate: WS feed path with drain-time PE
-    # clear skipped, so consecutive dispatches sum into the same PE
-    # accumulator (multi-K-tile GEMM). Not a distinct dataflow — the
-    # PE still holds a preloaded weight. PSUM plumbing not available.
-    return f"2 23 0 0 0 0 0 {wbase} {abase} {tiles}"
-
-def _mxu_clear() -> str:
-    # SXU_MXU_CLEAR opcode = 24. Zeroes the systolic-array PE
-    # accumulators. Needed between accumulate epochs and when
-    # re-entering WS from a previous accumulate/OS dispatch.
-    return "2 24 0 0 0 0 0 0 0 0"
-
-def _mxu_os(wbase: int, abase: int, klen: int) -> str:
-    # SXU_DISPATCH_MXU_OS opcode = 25. Routes through Controller.startOS:
-    # real output-stationary — weights + activations both stream as a
-    # staircase, each PE holds its own psum, full (rows x cols) psum
-    # drained via resultsMatrix(). klen reuses the MXU tileLen field
-    # (<= rows for the current single-tile weight SRAM read).
-    return f"2 25 0 0 0 0 0 {wbase} {abase} {klen}"
-
-def _load_mxu_matrix_row(vd: int, row: int) -> str:
-    # SXU_LOAD_MXU_MATRIX_ROW opcode = 26. Copies ctrl.resultsMatrix[row]
-    # into row 0 of vd. Intended for draining an OS dispatch row-by-row.
-    return f"2 26 0 {vd} {row} 0 0 0 0 0"
-
-def _read_cycle(vd: int) -> str:
-    # SXU_READ_CYCLE opcode = 27. Writes the SXU's free-running cycle
-    # counter as Int#(32) into row 0, lane 0 of vd (other lanes zeroed).
-    # Pair two READ_CYCLE calls with a STORE + host parse to measure
-    # the span of a program region from inside the bundle itself.
-    return f"2 27 0 {vd} 0 0 0 0 0 0"
-
-def _load_loop_depth(vd: int) -> str:
-    # SXU_LOAD_LOOP_DEPTH opcode = 36. Writes the current LOOP stack
-    # depth (0..4) into row 0, lane 0 of vd (other lanes zeroed).
-    # Intended for debug/test of nested SXU_LOOP frames.
-    return f"2 36 0 {vd} 0 0 0 0 0 0"
-
-def _xlu_rotate(vd: int, vs: int, amount: int) -> str:
-    # SXU_DISPATCH_XLU_ROTATE opcode = 37. Cyclic lane rotation via the
-    # XLU: vd[s][i] = vs[s][(i + amount) mod lanes]. Dual-issue like
-    # other XLU dispatches. `amount` stored in vregSrc2 low bits.
-    return f"2 37 0 {vd} {vs} 0 {amount} 0 0 0"
-
-def _loop_begin(count: int) -> str:
-    # SXU_LOOP_BEGIN opcode = 28. Sets loopCounter := count and marks
-    # the next instruction as the loop-return pc. Count must be 1..255.
-    assert 1 <= count <= 255, "loop count out of range"
-    return f"2 28 0 0 0 0 0 0 0 {count}"
-
-def _loop_end() -> str:
-    # SXU_LOOP_END opcode = 29. Decrements loopCounter; jumps back to
-    # the instruction after LOOP_BEGIN if more iterations remain.
-    return "2 29 0 0 0 0 0 0 0 0"
-
-def _vzero(vd: int) -> str:
-    # SXU_VZERO opcode = 30. One-cycle tile-of-zeros into vd. Skips
-    # the "preload zero in VMEM + LOAD" two-instruction dance.
-    return f"2 30 0 {vd} 0 0 0 0 0 0"
-
-def _vfill(vd: int, imm_i8: int) -> str:
-    # SXU_VFILL opcode = 31. Broadcast a signed 8-bit constant to all
-    # 16 lanes of vd. Encoded with imm in mxuWBase (unsigned byte).
-    assert -128 <= imm_i8 <= 127, "VFILL immediate out of int8 range"
-    enc = imm_i8 & 0xFF
-    return f"2 31 0 {vd} 0 0 0 {enc} 0 0"
-
-def _vmov(vd: int, vs: int) -> str:
-    # SXU_VMOV opcode = 32. vd := vs in one cycle.
-    return f"2 32 0 {vd} {vs} 0 0 0 0 0"
-
-def _vneg(vd: int, vs: int) -> str:
-    # SXU_VNEG opcode = 34. vd := -vs lane-wise in one cycle.
-    return f"2 34 0 {vd} {vs} 0 0 0 0 0"
-
-def _vabs(vd: int, vs: int) -> str:
-    # SXU_VABS opcode = 35. vd := |vs| lane-wise in one cycle.
-    return f"2 35 0 {vd} {vs} 0 0 0 0 0"
-
-def _mxu_os_accumulate(wbase: int, abase: int, klen: int) -> str:
-    # SXU_DISPATCH_MXU_OS_ACCUMULATE opcode = 33. Routes through
-    # Controller.startOsAccumulate: real-OS dispatch that skips the
-    # drain-time clearAll, so consecutive dispatches add another
-    # kLen worth of psums into the same matrix. Lets multi-K-tile OS
-    # scale past K == rows.
-    return f"2 33 0 0 0 0 0 {wbase} {abase} {klen}"
-
-def _psum_read(vd: int, psum_addr: int) -> str:
-    # SXU_PSUM_READ opcode = 17; vmemAddr doubles as PSUM bucket index.
-    return f"2 17 {psum_addr} {vd} 0 0 0 0 0 0"
-
-def _psum_read_row(vd: int, psum_addr: int, psum_row: int) -> str:
-    # SXU_PSUM_READ_ROW opcode = 18. Reads one row of a bucket into
-    # row 0 of vd with the other rows zeroed — same shape as
-    # LOAD_MXU_RESULT, so downstream bias/relu/store don't care that
-    # the row came from PSUM.
-    return f"2 18 {psum_addr} {vd} {psum_row} 0 0 0 0 0"
-
-def _psum_clear(psum_addr: int) -> str:
-    # SXU_PSUM_CLEAR opcode = 19. Zeros the whole bucket in one cycle
-    # without touching any vreg, so multi-K-tile GEMM can drop the
-    # "preload zero tile + LOAD v15 + PSUM_WRITE" boilerplate.
-    return f"2 19 {psum_addr} 0 0 0 0 0 0 0"
-
-def _psum_clear_all() -> str:
-    # SXU_PSUM_CLEAR_ALL opcode = 38. Multi-cycle walker inside SXU
-    # zeroes every bucket (psumDepth cycles total, one instruction).
-    # Replaces the 8-instruction PSUM_CLEAR sweep a multi-K-tile GEMM
-    # does before re-using buckets for a new K chain.
-    return f"2 38 0 0 0 0 0 0 0 0"
-
-def _set_pred_if_zero(vs: int) -> str:
-    # SXU_SET_PRED_IF_ZERO opcode = 20; pred := (vs[0][0] == 0).
-    return f"2 20 0 0 {vs} 0 0 0 0 0"
-
-def _skip_if_pred() -> str:
-    # SXU_SKIP_IF_PRED opcode = 21; if pred, skip the next instruction.
-    return f"2 21 0 0 0 0 0 0 0 0"
-
-def _set_pred_ne_zero(vs: int) -> str:
-    # SXU_SET_PRED_NE_ZERO opcode = 39; pred := (vs[0][0] != 0).
-    return f"2 39 0 0 {vs} 0 0 0 0 0"
-
-def _skip_if_not_pred() -> str:
-    # SXU_SKIP_IF_NOT_PRED opcode = 40; if !pred, skip the next instruction.
-    return f"2 40 0 0 0 0 0 0 0 0"
-
-def _psum_accumulate_row(vs: int, psum_addr: int, psum_row: int) -> str:
-    # SXU_PSUM_ACCUMULATE_ROW opcode = 22; accumulate row 0 of vs into
-    # psum[psum_addr][psum_row]. VPU-side row-granular deposit,
-    # symmetric with the MXU dispatch's psum_acc path.
-    return f"2 22 {psum_addr} {psum_row} {vs} 0 0 0 0 0"
-
-def _wait_mxu() -> str: return "2 5 0 0 0 0 0 0 0 0"
-def _load_mxu_result(vd: int) -> str: return f"2 6 0 {vd} 0 0 0 0 0 0"
-
-def _load_vpu_result(vd: int) -> str:
-    # SXU_LOAD_VPU_RESULT opcode = 13; copies vpu.resultReg (linger
-    # register) into vd so subsequent ops can reuse the last VPU
-    # output without re-dispatch.
-    return f"2 13 0 {vd} 0 0 0 0 0 0"
-
-def _load_xlu_result(vd: int) -> str:
-    # SXU_LOAD_XLU_RESULT opcode = 14; same pattern for the XLU output
-    # register.
-    return f"2 14 0 {vd} 0 0 0 0 0 0"
-def _halt()     -> str: return "2 7 0 0 0 0 0 0 0 0"
-def _output_mxu()           -> str: return "3 1"
-def _output_vmem(addr: int) -> str: return f"6 {addr}"
-def _end()      -> str: return "4"
-
-def _bundle(*lines: str) -> str:
-    return "\n".join(lines) + "\n"
-
-
-# ---------------------------------------------------------------------------
 # Helpers: build text bundle, parse BSV sim output
 # ---------------------------------------------------------------------------
 
@@ -1914,49 +1382,6 @@ def _run_bundle(sim: str, bundle_text: str) -> str:
             f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
         )
     return proc.stdout
-
-
-def _infer_tiling(out_size: int | None, act_size: int | None, weight_size: int) -> tuple[int, int, int] | None:
-    if out_size is None or act_size is None:
-        return None
-    if out_size <= 0 or act_size <= 0 or weight_size <= 0:
-        return None
-    if act_size % _ROWS != 0 or out_size % _COLS != 0 or weight_size % (_ROWS * _COLS) != 0:
-        return None
-    act_quads = act_size // _ROWS
-    out_quads = out_size // _COLS
-    weight_tiles = weight_size // (_ROWS * _COLS)
-    numer = act_quads * out_quads
-    if numer % weight_tiles != 0:
-        return None
-    num_vecs_sq = numer // weight_tiles
-    num_vecs = math.isqrt(num_vecs_sq)
-    if num_vecs <= 0 or num_vecs * num_vecs != num_vecs_sq:
-        return None
-    if act_quads % num_vecs != 0 or out_quads % num_vecs != 0:
-        return None
-    num_k_tiles = act_quads // num_vecs
-    num_n_tiles = out_quads // num_vecs
-    if num_k_tiles <= 0 or num_n_tiles <= 0 or num_k_tiles * num_n_tiles != weight_tiles:
-        return None
-    return num_vecs, num_k_tiles, num_n_tiles
-
-
-def _tiling_failure_note(out_size: int | None, act_size: int | None, weight_size: int) -> str:
-    issues: list[str] = []
-    if act_size is None or out_size is None:
-        return "missing activation or output buffer size for GEMM factoring"
-    if act_size <= 0 or out_size <= 0 or weight_size <= 0:
-        return "zero-sized GEMM buffers are not lowered through the current TinyTPU path"
-    if act_size % _ROWS != 0:
-        issues.append(f"activation size {act_size} is not divisible by {_ROWS}")
-    if out_size % _COLS != 0:
-        issues.append(f"output size {out_size} is not divisible by {_COLS}")
-    if weight_size % (_ROWS * _COLS) != 0:
-        issues.append(f"weight size {weight_size} is not divisible by {_ROWS * _COLS}")
-    if not issues:
-        issues.append(f"sizes out={out_size}, act={act_size}, weight={weight_size} do not factor into MxK, KxN, MxN tiles")
-    return "; ".join(issues)
 
 
 def _require_int8_range(name: str, values: np.ndarray) -> None:

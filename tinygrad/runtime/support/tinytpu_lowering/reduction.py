@@ -18,9 +18,10 @@ from __future__ import annotations
 from collections import Counter
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.dtype import PtrDType
-# Shared infrastructure — one opcode table / geometry / encoder for the package.
+# Shared infrastructure — one opcode table / geometry / encoders for the package.
 from tinygrad.runtime.support.tinytpu_lowering.common import (
-  _ROWS, _COLS, _TILE_ELEMS, _VPU, _ALU_TO_VPU, _const_bits)
+  _ROWS, _COLS, _TILE_ELEMS, _VPU, _ALU_TO_VPU, _const_bits,
+  _load, _store, _vpu, _halt)
 
 # Reduction-identity bit patterns used to pad partial tiles.
 _INT32_MIN = -(1 << 31)
@@ -28,15 +29,6 @@ _INT32_MAX = (1 << 31) - 1
 _FLOAT_NEG_INF_BITS = -(1 << 23)   # 0xFF800000 as signed int32
 _FLOAT_POS_INF_BITS = 0x7F800000
 _FLOAT_ONE_BITS = 0x3F800000       # 1.0
-
-
-# ---------------------------------------------------------------------------
-# SXU instruction encoders (identical strings to ops_tinytpu._load/_store/...)
-# ---------------------------------------------------------------------------
-def _load(vd: int, vmem_src: int) -> str: return f"2 0 {vmem_src} {vd} 0 0 0 0 0 0"
-def _store(vmem_dst: int, vs: int) -> str: return f"2 1 {vmem_dst} 0 {vs} 0 0 0 0 0"
-def _vpu(vd: int, va: int, op: int, vb: int = 0) -> str: return f"2 2 0 {vd} {va} {op} {vb} 0 0 0"
-def _halt() -> str: return "2 7 0 0 0 0 0 0 0 0"
 
 
 # ---------------------------------------------------------------------------
