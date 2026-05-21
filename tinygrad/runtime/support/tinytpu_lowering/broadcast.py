@@ -22,21 +22,10 @@ from __future__ import annotations
 from collections import Counter
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.dtype import PtrDType
-# Shared infrastructure — one opcode table / geometry for the package.
+# Shared infrastructure — one opcode table / geometry / encoders for the package.
 from tinygrad.runtime.support.tinytpu_lowering.common import (
-  _ROWS, _COLS, _TILE_ELEMS, _VPU)
-
-
-# ---------------------------------------------------------------------------
-# SXU instruction encoders (identical strings to ops_tinytpu._load/_store/...)
-# ---------------------------------------------------------------------------
-def _load(vd: int, vmem_src: int) -> str: return f"2 0 {vmem_src} {vd} 0 0 0 0 0 0"
-def _store(vmem_dst: int, vs: int) -> str: return f"2 1 {vmem_dst} 0 {vs} 0 0 0 0 0"
-def _vpu(vd: int, va: int, op: int, vb: int = 0) -> str: return f"2 2 0 {vd} {va} {op} {vb} 0 0 0"
-def _select(vd: int, cond: int, lhs: int, rhs: int) -> str: return f"2 8 0 {vd} {cond} 0 {lhs} {rhs} 0 0"
-def _broadcast_row(vd: int, vs: int, row: int = 0) -> str: return f"2 10 0 {vd} {vs} 0 {row} 0 0 0"
-def _broadcast_col(vd: int, vs: int, col: int = 0) -> str: return f"2 11 0 {vd} {vs} 0 {col} 0 0 0"
-def _halt() -> str: return "2 7 0 0 0 0 0 0 0 0"
+  _ROWS, _COLS, _TILE_ELEMS, _VPU,
+  _load, _store, _vpu, _select, _broadcast_row, _broadcast_col, _halt)
 
 # VPU op codes that produce a boolean (0/1) tile.
 _VPU_BOOL_OPS = {_VPU["CMPLT"], _VPU["CMPNE"], _VPU["CMPEQ"]}
