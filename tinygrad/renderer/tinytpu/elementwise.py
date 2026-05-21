@@ -17,7 +17,7 @@ row/column broadcast — those route to their own lowerers via ``classify``.
 from __future__ import annotations
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.dtype import PtrDType
-from tinygrad.runtime.support.tinytpu_lowering.common import (
+from tinygrad.renderer.tinytpu.common import (
   _ALU_OPS, _ALU_TO_VPU, _FLOAT_VPU, _UNARY_VPU, _VPU, _DATA_OPS,
   _NUM_VREGS, _TILE_ELEMS,
   TpuInst, TpuKernel,

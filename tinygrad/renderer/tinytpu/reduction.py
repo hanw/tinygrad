@@ -19,7 +19,7 @@ from collections import Counter
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.dtype import PtrDType
 # Shared infrastructure — one opcode table / geometry / encoders / graph helpers.
-from tinygrad.runtime.support.tinytpu_lowering.common import (
+from tinygrad.renderer.tinytpu.common import (
   _ROWS, _COLS, _TILE_ELEMS, _VPU, _ALU_TO_VPU, _const_bits,
   _load, _store, _vpu, _halt, _has_load_src, _data_alu_ops)
 

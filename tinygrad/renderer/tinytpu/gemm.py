@@ -14,7 +14,7 @@ import math
 from collections import Counter
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.dtype import PtrDType
-from tinygrad.runtime.support.tinytpu_lowering.common import (
+from tinygrad.renderer.tinytpu.common import (
   _ROWS, _COLS, _VPU, _find_unique_param_arg,
   _psum_clear, _mxu_psum_acc, _wait_mxu, _psum_read_row, _mxu,
   _load_mxu_result, _vpu, _load, _store, _halt)

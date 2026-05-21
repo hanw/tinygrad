@@ -17,14 +17,14 @@ from tinygrad.renderer import Renderer
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.dtype import PtrDType, dtypes
 from tinygrad.codegen.opt.tc import TensorCore
-from tinygrad.runtime.support.tinytpu_lowering import (
+from tinygrad.renderer.tinytpu import (
     can_lower, lower_kernel, lower_reduction, lower_broadcast, lower_movement,
     lower_gemm, lower_gemm_fallback, classify, KernelClass)
 # Bundle-instruction encoders, shared graph helpers, and GEMM tiling helpers
 # now live in the tinytpu_lowering package. They are re-imported here so the
 # long-standing `from tinygrad.runtime.ops_tinytpu import _vmem, ...` imports
 # in tests/ and scripts/ keep working unchanged.
-from tinygrad.runtime.support.tinytpu_lowering.common import (
+from tinygrad.renderer.tinytpu.common import (
     _vmem, _wmem, _amem, _load, _store, _vpu, _vpu_bg,
     _vpu_exp2, _vpu_log2, _vpu_sin, _select,
     _broadcast_scalar, _broadcast_row, _broadcast_col, _broadcast,
@@ -37,7 +37,7 @@ from tinygrad.runtime.support.tinytpu_lowering.common import (
     _set_pred_ne_zero, _skip_if_not_pred,
     _wait_mxu, _load_mxu_result, _load_vpu_result, _load_xlu_result,
     _halt, _output_mxu, _output_vmem, _end, _bundle, _find_unique_param_arg)
-from tinygrad.runtime.support.tinytpu_lowering.gemm import _infer_tiling, _tiling_failure_note
+from tinygrad.renderer.tinytpu.gemm import _infer_tiling, _tiling_failure_note
 
 # ---------------------------------------------------------------------------
 # Constants matching the BSV TensorCore#(4,4,16) prototype
