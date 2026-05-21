@@ -6,10 +6,10 @@ predicate logic.
 """
 from enum import Enum, auto
 from tinygrad.uop.ops import Ops, UOp
-from tinygrad.runtime.support.tinytpu_lowering.elementwise import can_lower
-from tinygrad.runtime.support.tinytpu_lowering.reduction import is_reduction
-from tinygrad.runtime.support.tinytpu_lowering.broadcast import is_broadcast
-from tinygrad.runtime.support.tinytpu_lowering.movement import is_movement
+from tinygrad.renderer.tinytpu.elementwise import can_lower
+from tinygrad.renderer.tinytpu.reduction import is_reduction
+from tinygrad.renderer.tinytpu.broadcast import is_broadcast
+from tinygrad.renderer.tinytpu.movement import is_movement
 
 
 class KernelClass(Enum):

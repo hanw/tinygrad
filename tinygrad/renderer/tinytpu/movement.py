@@ -20,11 +20,11 @@ from collections import Counter
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.dtype import PtrDType
 # Shared infrastructure — one geometry / encoders / graph helpers for the package.
-from tinygrad.runtime.support.tinytpu_lowering.common import (
+from tinygrad.renderer.tinytpu.common import (
   _COLS, _TILE_ELEMS, _ALU_TO_VPU,
   _load, _store, _halt, _find_unique_param_arg,
   _has_load_src, _data_alu_ops)
-from tinygrad.runtime.support.tinytpu_lowering.elementwise import can_lower
+from tinygrad.renderer.tinytpu.elementwise import can_lower
 
 
 # ---------------------------------------------------------------------------
