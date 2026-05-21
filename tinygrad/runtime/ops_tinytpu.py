@@ -17,7 +17,7 @@ from tinygrad.renderer import Renderer
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.dtype import PtrDType, dtypes
 from tinygrad.codegen.opt.tc import TensorCore
-from tinygrad.runtime.support.tinytpu_lowering import can_lower, lower_kernel
+from tinygrad.runtime.support.tinytpu_lowering import can_lower, lower_kernel, classify, KernelClass
 
 # ---------------------------------------------------------------------------
 # Constants matching the BSV TensorCore#(4,4,16) prototype
@@ -264,11 +264,10 @@ class TinyTPURenderer(Renderer):
     )]
 
     def render(self, uops: list[UOp]) -> str:  # type: ignore[override]
-        # InstSel pass: int32/bool elementwise kernels are owned by the
-        # UOp-walking lowerer (doc/plan-tinytpu-instsel.md). can_lower is a
-        # positive predicate — disjoint from the legacy recognizers below,
-        # not a fallback into them.
-        if can_lower(uops):
+        # Classify the kernel first; ELEMENTWISE goes to the UOp-walking
+        # lowerer, everything else falls through to the structural recognizers.
+        klass = classify(uops)
+        if klass is KernelClass.ELEMENTWISE:
             return _dump_lowering(json.dumps(lower_kernel(uops)))
         if (sxu_desc := _render_sxu_program(uops)) is not None:
             return _dump_lowering(json.dumps(sxu_desc))
