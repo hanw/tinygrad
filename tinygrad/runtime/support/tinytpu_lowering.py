@@ -29,6 +29,7 @@ _VPU = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6, "SUB": 7,
         "CMPEQ": 8, "SHL": 10, "SHR": 11, "MIN": 12, "DIV": 14,
         "AND": 15, "OR": 16, "XOR": 17,
         "FADD": 18, "FMUL": 19, "FSUB": 20, "FMAX": 21, "FCMPLT": 22,
+        "I2F": 24, "F2I": 25,
         "FRECIP": 23, "EXP2": 51, "LOG2": 52, "SIN": 53}
 
 # tinygrad ALU op -> integer VPU op name.
@@ -46,7 +47,8 @@ _UNARY_VPU = {Ops.EXP2: "EXP2", Ops.LOG2: "LOG2", Ops.SIN: "SIN",
 # Ops the walker emits an instruction for. LOAD/CONST are leaves; GEP is
 # transparent lane-selection that the walker sees through.
 _ALU_OPS = frozenset(_ALU_TO_VPU)
-_DATA_OPS = _ALU_OPS | {Ops.WHERE} | frozenset(_UNARY_VPU)
+# TRUNC has no single VPU opcode — the walker emits an F2I+I2F micro-pair.
+_DATA_OPS = _ALU_OPS | {Ops.WHERE, Ops.TRUNC} | frozenset(_UNARY_VPU)
 
 def _is_float(u: UOp) -> bool:
   return "float" in str(u.dtype)
@@ -167,11 +169,20 @@ def _expand_sqrt(x: UOp) -> UOp:
   a = x.src[0]
   return (a.alu(Ops.LOG2) * a.const_like(0.5)).alu(Ops.EXP2)
 
-_INSTSEL = PatternMatcher([(UPat(Ops.SQRT, name="x"), _expand_sqrt)])
+def _expand_mod(x: UOp) -> UOp:
+  # mod(a, b) = a - (a // b) * b; the VPU has no direct mod opcode.
+  a, b = x.src[0], x.src[1]
+  return a.alu(Ops.SUB, a.alu(Ops.IDIV, b).alu(Ops.MUL, b))
+
+_INSTSEL = PatternMatcher([
+  (UPat(Ops.SQRT, name="x"), _expand_sqrt),
+  (UPat(Ops.MOD, name="x"), _expand_mod),
+])
+_INSTSEL_OPS = (Ops.SQRT, Ops.MOD)
 
 def _run_instsel(uops: list[UOp]) -> list[UOp]:
   """Apply InstSel graph rewrites; return the (possibly rewritten) uop list."""
-  if not any(u.op is Ops.SQRT for u in uops):
+  if not any(u.op in _INSTSEL_OPS for u in uops):
     return uops
   sink = next(u for u in uops if u.op is Ops.SINK)
   return list(graph_rewrite(sink, _INSTSEL).toposort())
@@ -321,6 +332,11 @@ def lower_kernel(uops: list[UOp]) -> dict:
       elif node.op in _UNARY_VPU:
         kern.instructions.append(TpuInst("VPU", reg,
           (vreg[_canon(node.src[0])],), vpu_op=_VPU[_UNARY_VPU[node.op]]))
+      elif node.op is Ops.TRUNC:
+        # trunc(x) = (float)(int)x — round toward zero via an int round-trip.
+        kern.instructions.append(TpuInst("VPU", reg,
+          (vreg[_canon(node.src[0])],), vpu_op=_VPU["F2I"]))
+        kern.instructions.append(TpuInst("VPU", reg, (reg,), vpu_op=_VPU["I2F"]))
       else:
         table = _FLOAT_VPU if _float_operands(node) and node.op in _FLOAT_VPU else _ALU_TO_VPU
         kern.instructions.append(TpuInst("VPU", reg,
