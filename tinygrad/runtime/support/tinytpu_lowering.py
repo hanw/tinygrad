@@ -22,6 +22,7 @@ from tinygrad.dtype import PtrDType, dtypes
 _ROWS = 4
 _COLS = 4
 _TILE_ELEMS = _ROWS * _COLS
+_NUM_VREGS = 16
 
 # VPU op codes — subset used by the elementwise walker.
 _VPU = {"ADD": 0, "MUL": 1, "MAX": 3, "CMPLT": 5, "CMPNE": 6, "SUB": 7,
@@ -259,48 +260,61 @@ def lower_kernel(uops: list[UOp]) -> dict:
   num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
   addrs_per_tile = len(leaves) + 1
 
+  # --- linear-scan register allocation over the per-lane DAG ---
+  # seq is the emission order; a value's VREG is freed after its last use,
+  # so a vreg is reused rather than burned monotonically (deep activation
+  # and divmod graphs have far more than 16 nodes but a small live set).
+  seq = leaves + interior
+  pos = {n: i for i, n in enumerate(seq)}
+  last_use: dict[UOp, int] = {}
+  for node in interior:
+    for s in node.src:
+      c = _canon(s)
+      if c in pos: last_use[c] = max(last_use.get(c, -1), pos[node])
+  last_use[interior[-1]] = len(seq)   # the final value is consumed by the STORE
+
   kern = TpuKernel(out_arg=out_arg, bool_out=out_is_bool)
   for tile_idx in range(num_tiles):
     offset = tile_idx * _TILE_ELEMS
     count = min(_TILE_ELEMS, out_size - offset)
     base = tile_idx * addrs_per_tile
-
+    free = list(range(_NUM_VREGS - 1, -1, -1))   # pop() hands out low indices first
     vreg: dict[UOp, int] = {}
-    next_vreg = 0
 
-    # --- leaves: plan VMEM + emit LOAD (+ scalar broadcast) ---
-    for leaf_idx, leaf in enumerate(leaves):
-      vmem = base + leaf_idx
-      reg = next_vreg; next_vreg += 1
-      vreg[leaf] = reg
-      if leaf.op is Ops.CONST:
-        kern.data_plan.append({"type": "VMEM", "addr": vmem, "layout": "broadcast_const",
-                               "value": _const_bits(leaf.arg), "count": count, "dtype": "int32"})
-        kern.instructions.append(TpuInst("LOAD", reg, (vmem,)))
-        continue
-      p = _unique_param(leaf)
-      psize = params[p].dtype.size
-      is_bool = params[p].dtype.base.itemsize == 1
-      if psize == 1 and out_size > 1:
-        entry = {"type": "VMEM", "addr": vmem, "param": p, "offset": 0,
-                 "count": 1, "dtype": "int32"}
-        if is_bool: entry["bool"] = True
-        kern.data_plan.append(entry)
-        kern.instructions.append(TpuInst("LOAD", reg, (vmem,)))
-        kern.instructions.append(TpuInst("BROADCAST_SCALAR", reg, (reg,)))
-        kern.primitives.add("BROADCAST_SCALAR")
-      else:
-        entry = {"type": "VMEM", "addr": vmem, "param": p, "offset": offset,
-                 "count": count, "dtype": "int32"}
-        if is_bool: entry["bool"] = True
-        kern.data_plan.append(entry)
-        kern.instructions.append(TpuInst("LOAD", reg, (vmem,)))
-
-    # --- interior: emit one VPU/SELECT per node ---
-    for node in interior:
-      reg = next_vreg; next_vreg += 1
+    for i, node in enumerate(seq):
+      # free operand VREGs whose last use is this node, before allocating dst
+      if node.op not in (Ops.LOAD, Ops.CONST):
+        for s in node.src:
+          c = _canon(s)
+          if last_use.get(c) == i and vreg[c] not in free:
+            free.append(vreg[c])
+      if not free:
+        raise RuntimeError("TinyTPU InstSel walker: kernel live set exceeds 16 VREGs")
+      reg = free.pop()
       vreg[node] = reg
-      if node.op is Ops.WHERE:
+
+      if node.op is Ops.CONST:
+        kern.data_plan.append({"type": "VMEM", "addr": base + i, "layout": "broadcast_const",
+                               "value": _const_bits(node.arg), "count": count, "dtype": "int32"})
+        kern.instructions.append(TpuInst("LOAD", reg, (base + i,)))
+      elif node.op is Ops.LOAD:
+        p = _unique_param(node)
+        is_bool = params[p].dtype.base.itemsize == 1
+        if params[p].dtype.size == 1 and out_size > 1:
+          entry = {"type": "VMEM", "addr": base + i, "param": p, "offset": 0,
+                   "count": 1, "dtype": "int32"}
+          if is_bool: entry["bool"] = True
+          kern.data_plan.append(entry)
+          kern.instructions.append(TpuInst("LOAD", reg, (base + i,)))
+          kern.instructions.append(TpuInst("BROADCAST_SCALAR", reg, (reg,)))
+          kern.primitives.add("BROADCAST_SCALAR")
+        else:
+          entry = {"type": "VMEM", "addr": base + i, "param": p, "offset": offset,
+                   "count": count, "dtype": "int32"}
+          if is_bool: entry["bool"] = True
+          kern.data_plan.append(entry)
+          kern.instructions.append(TpuInst("LOAD", reg, (base + i,)))
+      elif node.op is Ops.WHERE:
         kern.instructions.append(TpuInst("SELECT", reg,
           tuple(vreg[_canon(s)] for s in node.src)))
         kern.primitives.add("SELECT")
