@@ -4,6 +4,7 @@ Shared types (TpuInst, TpuKernel), tile geometry constants, opcode tables,
 graph helpers, and the InstSel PatternMatcher used by all lowerers.
 """
 from __future__ import annotations
+from collections import Counter
 from dataclasses import dataclass, field
 import numpy as np
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, graph_rewrite
@@ -161,6 +162,16 @@ def _find_unique_param_arg(u: UOp) -> int | None:
     return None
   arg = next(iter(params))
   return arg if isinstance(arg, int) else None
+
+def _has_load_src(u: UOp) -> bool:
+  """True if a UOp has a LOAD anywhere in its source tree (data-path)."""
+  return any(n.op is Ops.LOAD for n in u.toposort())
+
+
+def _data_alu_ops(uops: list[UOp]) -> Counter:
+  """Count only data-path ALU ops (ones with LOAD in their source tree)."""
+  return Counter(_ALU_TO_VPU[u.op] for u in uops
+                 if u.op in _ALU_TO_VPU and _has_load_src(u))
 
 def _data_dag(val: UOp) -> list[UOp]:
   """Walk a stored-value tree, returning data nodes in topological order.

@@ -22,10 +22,11 @@ from __future__ import annotations
 from collections import Counter
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.dtype import PtrDType
-# Shared infrastructure — one opcode table / geometry / encoders for the package.
+# Shared infrastructure — one opcode table / geometry / encoders / graph helpers.
 from tinygrad.runtime.support.tinytpu_lowering.common import (
   _ROWS, _COLS, _TILE_ELEMS, _VPU,
-  _load, _store, _vpu, _select, _broadcast_row, _broadcast_col, _halt)
+  _load, _store, _vpu, _select, _broadcast_row, _broadcast_col, _halt,
+  _has_load_src)
 
 # VPU op codes that produce a boolean (0/1) tile.
 _VPU_BOOL_OPS = {_VPU["CMPLT"], _VPU["CMPNE"], _VPU["CMPEQ"]}
@@ -37,11 +38,6 @@ _FLOAT_REMAP = {"ADD": "FADD", "SUB": "FSUB", "MUL": "FMUL",
 # ---------------------------------------------------------------------------
 # Graph helpers
 # ---------------------------------------------------------------------------
-def _has_load_src(u: UOp) -> bool:
-  """True if a UOp has a LOAD anywhere in its source tree (data-path)."""
-  return any(n.op is Ops.LOAD for n in u.toposort())
-
-
 def _unique_param_arg(u: UOp) -> int | None:
   """The single PARAM arg reachable from u, or None if not unique."""
   args = {n.arg for n in u.toposort() if n.op is Ops.PARAM}
@@ -53,6 +49,9 @@ def _unique_param_arg(u: UOp) -> int | None:
 
 def _classify_broadcast_axis(uops: list[UOp], param_arg: int) -> str | None:
   """Infer row/column broadcast orientation for a short 2D operand."""
+  # TODO(InstSel): faithful legacy port — the chunk==1 address-arithmetic
+  # heuristic below should later be replaced with a principled index-relationship
+  # check between the bias index and the store index.
   param_indices = [u.src[1] for u in uops
                    if u.op is Ops.INDEX and u.src[0].op is Ops.PARAM and u.src[0].arg == param_arg]
   if not param_indices:

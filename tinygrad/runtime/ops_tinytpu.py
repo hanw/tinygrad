@@ -153,8 +153,8 @@ class TinyTPURenderer(Renderer):
     )]
 
     def render(self, uops: list[UOp]) -> str:  # type: ignore[override]
-        # Classify the kernel first; ELEMENTWISE goes to the UOp-walking
-        # lowerer, everything else falls through to the structural recognizers.
+        # Classify the kernel, then dispatch to the matching lowerer in the
+        # tinytpu_lowering package. All kernel lowering lives behind classify().
         klass = classify(uops)
         if klass is KernelClass.ELEMENTWISE:
             return _dump_lowering(json.dumps(lower_kernel(uops)))
@@ -166,8 +166,9 @@ class TinyTPURenderer(Renderer):
             return _dump_lowering(json.dumps(lower_movement(uops)))
         if klass is KernelClass.GEMM and (gemm_desc := lower_gemm(uops)) is not None:
             return _dump_lowering(json.dumps(gemm_desc))
-        if (sxu_desc := _render_sxu_program(uops)) is not None:
-            return _dump_lowering(json.dumps(sxu_desc))
+        # Non-WMMA matmul kernels are not classified as GEMM (classify only
+        # tags WMMA kernels GEMM); they fall through to the GEMM fallback
+        # lowerer, which was previously reached after _render_sxu_program.
         if (gemm_desc := lower_gemm_fallback(uops)) is not None:
             return _dump_lowering(json.dumps(gemm_desc))
         op_counts = dict(sorted(Counter(u.op.name for u in uops).items()))
@@ -179,19 +180,6 @@ class TinyTPURenderer(Renderer):
             "op_counts": op_counts,
         }))
 
-
-def _render_sxu_program(uops: list[UOp]) -> dict | None:
-    """Legacy structural-recognizer fallback — now empty.
-
-    Every recognizer that used to live here has been relocated into the
-    tinytpu_lowering package: GEMM -> lower_gemm, reduction -> lower_reduction,
-    broadcast -> lower_broadcast, movement (pad/flip/permute, 4x4 transpose,
-    row-broadcast copy) -> lower_movement. All are dispatched up front in
-    render() via classify(). Nothing reaches this shell anymore.
-
-    TODO(Task 9): delete this empty shell and its call site in render().
-    """
-    return None
 
 def _dump_lowering(desc:str) -> str:
     target = os.environ.get("TINYTPU_DUMP_LOWERING")

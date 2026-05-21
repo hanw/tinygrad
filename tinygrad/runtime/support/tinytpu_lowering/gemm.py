@@ -3,7 +3,7 @@
 Relocated verbatim from ops_tinytpu.py: the WMMA-driven GEMM lowering path
 (``lower_gemm``), the non-WMMA matmul fallback (``lower_gemm_fallback``), and
 the GEMM-only helpers they call (tiling inference, SXU instruction generation,
-epilogue extraction/application).
+epilogue extraction).
 
 ``classify(uops)`` returns ``KernelClass.GEMM`` when a WMMA UOp is present;
 ``render()`` dispatches that to ``lower_gemm``. The non-WMMA matmul fallback is
@@ -12,7 +12,6 @@ reached after the structural recognizers via ``lower_gemm_fallback``.
 from __future__ import annotations
 import math
 from collections import Counter
-import numpy as np
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.dtype import PtrDType
 from tinygrad.runtime.support.tinytpu_lowering.common import (
@@ -164,31 +163,6 @@ def _extract_wmma_epilogue(uops: list[UOp], params: dict[int, UOp], out_arg: int
     if unsupported:
         return [], f"wmma epilogue present: {', '.join(sorted(unsupported))}"
     return epilogue, None
-
-
-def _apply_gemm_epilogue(bufs: tuple[bytearray, ...], out_i32: np.ndarray, prog: dict) -> np.ndarray:
-    out = out_i32
-    num_vecs = int(prog["num_vecs"])
-    out_cols = int(prog["num_weight_tiles"]) * _COLS
-    out_size = num_vecs * out_cols
-    for step in prog.get("epilogue", []):
-        if step["op"] == "ADD":
-            raw = np.frombuffer(bytes(bufs[int(step["arg"])]), dtype="<i4")
-            if step["mode"] == "ROW_BROADCAST":
-                if raw.size < out_cols:
-                    raise RuntimeError(f"TinyTPU row-broadcast bias expected at least {out_cols} elements, got {raw.size}")
-                out = (out.reshape(num_vecs, out_cols) + raw[:out_cols].reshape(1, out_cols)).reshape(out_size)
-            elif step["mode"] == "FULL":
-                if raw.size < out_size:
-                    raise RuntimeError(f"TinyTPU full bias expected at least {out_size} elements, got {raw.size}")
-                out = out + raw[:out_size]
-            else:
-                raise RuntimeError(f"unknown TinyTPU GEMM epilogue mode {step['mode']}")
-        elif step["op"] == "RELU":
-            out = np.maximum(out, 0)
-        else:
-            raise RuntimeError(f"unknown TinyTPU GEMM epilogue op {step['op']}")
-    return np.asarray(out, dtype=np.int32)
 
 
 def lower_gemm(uops: list[UOp]) -> dict | None:
