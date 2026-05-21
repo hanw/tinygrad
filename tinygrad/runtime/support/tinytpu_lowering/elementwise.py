@@ -1,7 +1,18 @@
 """TinyTPU elementwise lowerer.
 
-Lowers int32/bool/float elementwise kernels (ALU, WHERE, unary transcendentals)
-to an SXU_PROGRAM descriptor via a UOp-walking linear-scan register allocator.
+Lowers int32/bool/float elementwise kernels to an SXU_PROGRAM descriptor via a
+UOp-walking linear-scan register allocator.
+
+Scope (a kernel the walker fully owns):
+  - ALU / WHERE / unary-transcendental maps over equal-size operands;
+  - degenerate maps — a bare ``LOAD`` (copy) or bare ``CONST`` (const-fill);
+  - ``CAST`` value converts — int<->float via the ``I2F`` / ``F2I`` VPU ops,
+    bool->int handled transparently in ``_canon``;
+  - per-``LOAD`` constant source offsets, so a contiguous slice / shrink copy
+    (``LOAD`` index shifted from the ``STORE`` index by a constant) is a copy.
+
+Out of scope: transcendentals with no opcode, reductions, WMMA, and structured
+row/column broadcast — those route to their own lowerers via ``classify``.
 """
 from __future__ import annotations
 from tinygrad.uop.ops import Ops, UOp
@@ -11,18 +22,46 @@ from tinygrad.runtime.support.tinytpu_lowering.common import (
   _NUM_VREGS, _TILE_ELEMS,
   TpuInst, TpuKernel,
   _canon, _unique_param, _data_dag, _store_lanes, _float_operands,
-  _const_bits, _run_instsel,
+  _const_bits, _cast_vpu, _run_instsel,
 )
+
+# ---------------------------------------------------------------------------
+# LOAD index analysis — constant source offsets and scalar broadcasts
+# ---------------------------------------------------------------------------
+def _addr_index(node: UOp) -> UOp | None:
+  """The element-index expression of a LOAD / STORE address.
+
+  The address is an ``INDEX(PARAM, idx)``; a vectorized (float) kernel wraps it
+  in a ``CAST`` to the vector pointer type, which is transparent here.
+  """
+  addr = node.src[0]
+  while addr.op is Ops.CAST:
+    addr = addr.src[0]
+  return addr.src[1] if addr.op is Ops.INDEX and len(addr.src) > 1 else None
+
+def _copy_offset(store: UOp) -> int | None:
+  """Constant source offset of a degenerate copy (a ``STORE`` of a bare ``LOAD``).
+
+  A copy's LOAD and STORE indices share the same RANGE structure, so their
+  difference is a constant: 0 for a plain reshape-as-copy, K for a contiguous
+  slice / shrink. Returns that constant, or None when the relationship is not
+  a constant shift (transpose / flip / strided gather) — not a foldable copy.
+  Only meaningful for a kernel with no interior op; an elementwise kernel's
+  operands are always read at offset 0.
+  """
+  store_idx = _addr_index(store)
+  load = _canon(store.src[1])
+  if load.op is not Ops.LOAD or store_idx is None: return None
+  load_idx = _addr_index(load)
+  if load_idx is None: return None
+  delta = (load_idx - store_idx).simplify()
+  return int(delta.arg) if delta.op is Ops.CONST and isinstance(delta.arg, int) else None
 
 # ---------------------------------------------------------------------------
 # can_lower — positive predicate selecting walker-owned kernels
 # ---------------------------------------------------------------------------
 def can_lower(uops: list[UOp]) -> bool:
   """True iff the elementwise walker fully owns this kernel.
-
-  Scope: int32/bool/float elementwise — ALU and WHERE over equal-size or
-  size-1 (scalar broadcast) operands. No cast, transcendental, reduction,
-  WMMA, or structured row/column broadcast.
 
   Kernels arrive per-element unrolled (one STORE per lane) or vectorized
   (one STORE of a VECTORIZE). Every lane must compute the same data-DAG
@@ -41,15 +80,35 @@ def can_lower(uops: list[UOp]) -> bool:
   out_size = params[out_arg].dtype.size
   if out_size <= 0: return False
 
+  # A degenerate copy writes a bare LOAD from every STORE; a copy may read a
+  # larger source (a contiguous slice), so the load-size check below is relaxed
+  # only for copies. Everything else is a per-element map.
+  copy_lanes = [_canon(lane) for s in stores for lane in _store_lanes(s)]
+  is_copy = all(c.op is Ops.LOAD for c in copy_lanes)
+
+  # A const-fill writes a bare CONST from every STORE. The walker owns the
+  # single-tile fill (the shape tinygrad emits with literal-CONST indexing); a
+  # fill needing RANGE-loop index arithmetic (MUL/ADD over a RANGE) stays
+  # unsupported — it never had a renderer, and folding it would also silently
+  # accept a zero-sized-contraction GEMM that must be reported instead.
+  is_fill = all(c.op is Ops.CONST for c in copy_lanes)
+  if is_fill and any(u.op in (Ops.MUL, Ops.ADD) for u in uops): return False
+
+  # One lane templates the whole tiled program: every lane of every STORE must
+  # compute the same data-DAG shape, and every node must be a leaf (LOAD/CONST)
+  # or an interior op the VPU can issue. A bare-LOAD DAG is a copy and a bare
+  # CONST DAG is a const-fill — both degenerate elementwise maps.
   ref_shape: tuple | None = None
   for s in stores:
     for lane in _store_lanes(s):
-      if _canon(lane).op not in _DATA_OPS: return False  # bare copy / const-fill stays elsewhere
       nodes = _data_dag(lane)
       shape = tuple(n.op for n in nodes)
       if ref_shape is None: ref_shape = shape
       elif shape != ref_shape: return False              # non-uniform: not a plain elementwise map
       for n in nodes:
+        if n.op is Ops.CAST:
+          if _cast_vpu(n) is None: return False           # no per-element opcode
+          continue
         if n.op in _DATA_OPS:
           # Float arithmetic ALU ops need an F-variant opcode. Float
           # CMPNE/CMPEQ are valid as integer bit-compares; transcendentals
@@ -61,11 +120,26 @@ def can_lower(uops: list[UOp]) -> bool:
         if n.op is Ops.LOAD:
           p = _unique_param(n)
           if p is None or p not in params: return False
-          if params[p].dtype.size not in (out_size, 1): return False
+          # An interior-op kernel reads operands lane-for-lane: a LOAD buffer
+          # must match the output size (or be a size-1 scalar broadcast). A
+          # mismatched size is a gather / GEMM-as-elementwise the walker must
+          # not own. A copy may legitimately read a larger sliced source.
+          if not is_copy and params[p].dtype.size not in (out_size, 1): return False
           continue
         if n.op is Ops.CONST:
           continue
-        return False   # unknown op (CAST, transcendental, ...)
+        return False   # unknown op (transcendental with no opcode, ...)
+
+  # A copy from a full-size buffer may carry a constant source offset — a
+  # contiguous slice / shrink. The offset must be a uniform constant across
+  # STOREs; a non-constant relationship (transpose / flip / strided gather) is
+  # a movement kernel the walker does not own. A size-1 copy source is a scalar
+  # broadcast, not a slice, so its offset is not consulted. A negative offset is
+  # rejected too: it preserves the legacy _render_copy_sxu_program guard, so the
+  # walker never emits a negative VMEM source offset.
+  if is_copy and not all(params[_unique_param(c)].dtype.size == 1 for c in copy_lanes):
+    offs = {_copy_offset(s) for s in stores}
+    if len(offs) != 1 or None in offs or next(iter(offs)) < 0: return False
   return True
 
 # ---------------------------------------------------------------------------
@@ -85,17 +159,22 @@ def lower_kernel(uops: list[UOp]) -> dict:
   out_is_bool = out_param.dtype.base.itemsize == 1
 
   # One lane templates the whole tiled program (can_lower proved uniformity).
-  nodes = _data_dag(_store_lanes(stores[0])[0])
+  templ_store = stores[0]
+  lane = _store_lanes(templ_store)[0]
+  nodes = _data_dag(lane)
   leaves = [n for n in nodes if n.op in (Ops.LOAD, Ops.CONST)]
   interior = [n for n in nodes if n.op in _DATA_OPS]
+  # A degenerate copy (no interior op) from a full-size buffer may carry a
+  # constant source offset — a contiguous slice / shrink. A size-1 source is a
+  # scalar broadcast (offset unused); elementwise kernels read at offset 0.
+  copy_offset = (_copy_offset(templ_store) or 0) if not interior else 0
 
   num_tiles = (out_size + _TILE_ELEMS - 1) // _TILE_ELEMS
   addrs_per_tile = len(leaves) + 1
 
   # --- linear-scan register allocation over the per-lane DAG ---
   # seq is the emission order; a value's VREG is freed after its last use,
-  # so a vreg is reused rather than burned monotonically (deep activation
-  # and divmod graphs have far more than 16 nodes but a small live set).
+  # so a vreg is reused rather than burned monotonically.
   seq = leaves + interior
   pos = {n: i for i, n in enumerate(seq)}
   last_use: dict[UOp, int] = {}
@@ -103,7 +182,10 @@ def lower_kernel(uops: list[UOp]) -> dict:
     for s in node.src:
       c = _canon(s)
       if c in pos: last_use[c] = max(last_use.get(c, -1), pos[node])
-  last_use[interior[-1]] = len(seq)   # the final value is consumed by the STORE
+  # The final value is consumed by the STORE; for a degenerate copy / fill the
+  # DAG is a single leaf and that leaf is itself the stored value.
+  result = interior[-1] if interior else leaves[-1]
+  last_use[result] = len(seq)
 
   kern = TpuKernel(out_arg=out_arg, bool_out=out_is_bool)
   for tile_idx in range(num_tiles):
@@ -126,6 +208,9 @@ def lower_kernel(uops: list[UOp]) -> dict:
       vreg[node] = reg
 
       if node.op is Ops.CONST:
+        # A bare-CONST DAG is a const-fill. The legacy "primitive": "CONST_FILL"
+        # diagnostic tag is intentionally not emitted — the walker only tags
+        # architectural primitives, and no test depends on the CONST_FILL tag.
         kern.data_plan.append({"type": "VMEM", "addr": base + i, "layout": "broadcast_const",
                                "value": _const_bits(node.arg), "count": count, "dtype": "int32"})
         kern.instructions.append(TpuInst("LOAD", reg, (base + i,)))
@@ -133,6 +218,7 @@ def lower_kernel(uops: list[UOp]) -> dict:
         p = _unique_param(node)
         is_bool = params[p].dtype.base.itemsize == 1
         if params[p].dtype.size == 1 and out_size > 1:
+          # Size-1 buffer: load the single element and broadcast over the tile.
           entry = {"type": "VMEM", "addr": base + i, "param": p, "offset": 0,
                    "count": 1, "dtype": "int32"}
           if is_bool: entry["bool"] = True
@@ -141,7 +227,9 @@ def lower_kernel(uops: list[UOp]) -> dict:
           kern.instructions.append(TpuInst("BROADCAST_SCALAR", reg, (reg,)))
           kern.primitives.add("BROADCAST_SCALAR")
         else:
-          entry = {"type": "VMEM", "addr": base + i, "param": p, "offset": offset,
+          # Full-size load: read the tile, shifted by the constant source
+          # offset (0 for a plain map, K for a contiguous slice copy).
+          entry = {"type": "VMEM", "addr": base + i, "param": p, "offset": offset + copy_offset,
                    "count": count, "dtype": "int32"}
           if is_bool: entry["bool"] = True
           kern.data_plan.append(entry)
@@ -150,6 +238,9 @@ def lower_kernel(uops: list[UOp]) -> dict:
         kern.instructions.append(TpuInst("SELECT", reg,
           tuple(vreg[_canon(s)] for s in node.src)))
         kern.primitives.add("SELECT")
+      elif node.op is Ops.CAST:
+        kern.instructions.append(TpuInst("VPU", reg,
+          (vreg[_canon(node.src[0])],), vpu_op=_VPU[_cast_vpu(node)]))
       elif node.op in _UNARY_VPU:
         kern.instructions.append(TpuInst("VPU", reg,
           (vreg[_canon(node.src[0])],), vpu_op=_VPU[_UNARY_VPU[node.op]]))
@@ -164,7 +255,7 @@ def lower_kernel(uops: list[UOp]) -> dict:
           tuple(vreg[_canon(s)] for s in node.src), vpu_op=_VPU[table[node.op]]))
 
     out_vmem = base + len(leaves)
-    kern.instructions.append(TpuInst("STORE", out_vmem, (vreg[interior[-1]],)))
+    kern.instructions.append(TpuInst("STORE", out_vmem, (vreg[result],)))
     kern.outputs.append({"addr": out_vmem, "param": out_arg, "offset": offset, "count": count})
 
   kern.instructions.append(TpuInst("HALT"))
