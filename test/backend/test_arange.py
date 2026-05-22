@@ -2,23 +2,18 @@ import unittest
 import numpy as np
 from tinygrad import Tensor, GlobalCounters, dtypes, nn, Device, Variable
 from tinygrad.helpers import Context, getenv, DEV
-from tinygrad.engine.realize import run_schedule
-from tinygrad.engine.realize import CompiledRunner, get_program
-from tinygrad.engine.schedule import ExecItem
-from tinygrad.uop.ops import Ops
-from tinygrad.renderer import Estimates
+from tinygrad.engine.realize import run_linear, estimate_uop, compile_linear
 from tinygrad.renderer.ptx import PTXRenderer
 from test.helpers import needs_second_gpu
 
 class TestArange(unittest.TestCase):
   def _get_flops(self, tensor, desired):
     GlobalCounters.reset()
-    sched = tensor.schedule()
-    self.assertEqual(len(sched), 1)
-    p = get_program(sched[-1].ast, renderer=Device[Device.DEFAULT].renderer)
-    ExecItem(sched[-1].ast, [tensor.uop.buffer], prg=CompiledRunner(p)).run()
+    linear = compile_linear(tensor.schedule_linear())
+    self.assertEqual(len(linear.src), 1)
+    run_linear(linear)
     np.testing.assert_equal(tensor.numpy(), desired)
-    return p.estimates.ops
+    return estimate_uop(linear.src[-1]).ops
 
   def test_arange_complexity(self):
     self.assertEqual(self._get_flops(Tensor.arange(256), np.arange(256)), 0)
@@ -41,9 +36,8 @@ class TestArange(unittest.TestCase):
   def test_tri_complexity(self):
     with Context(NOOPT=1):
       t = Tensor.ones(256, 256).contiguous().realize()
-      sched = t.triu().schedule()
-      p = get_program(sched[-1].ast, renderer=Device[Device.DEFAULT].renderer)
-      self.assertLessEqual(Estimates.from_uops(p.uops).ops, 4 * 256 * 256)
+      linear = compile_linear(t.triu().schedule_linear())
+      self.assertLessEqual(estimate_uop(linear.src[-1]).ops, 4 * 256 * 256)
 
 DSET, DDIM = 2048, 32
 
@@ -55,9 +49,9 @@ class TestIndexing(unittest.TestCase):
     with Context(NOOPT=1):
       GlobalCounters.reset()
       out = ((Tensor.arange(1,16385)-1)*needle).sum()
-      sched = out.schedule()
-      self.assertEqual(len(sched), 1)
-      run_schedule(sched)
+      linear, var_vals = out.linear_with_vars()
+      self.assertEqual(len(linear.src), 1)
+      run_linear(linear, var_vals)
     self.assertEqual(out.item(), 1337)
 
   def test_manual_index(self):
@@ -67,14 +61,14 @@ class TestIndexing(unittest.TestCase):
     print("*** indexing ***")
     with Context(NOOPT=1):
       GlobalCounters.reset()
-      rng = Tensor.ones(4, DDIM, DSET, dtype=dtypes.int)._cumalu(axis=-1, op=Ops.ADD, _include_initial=True).reshape(4, DDIM, DSET, 1)
+      rng = Tensor.arange(DSET, dtype=dtypes.int).reshape(1, 1, DSET, 1).expand(4, DDIM, DSET, 1)
       idxs = idxs.reshape(4,1,1,1).expand(4, DDIM, DSET, 1)
       reshape_dataset = dataset.T.reshape(1, DDIM, DSET, 1).expand(4, DDIM, DSET, 1)
       full = (rng==idxs).where(reshape_dataset, Tensor.zeros(4, DDIM, DSET, 1))
       X = full.sum(axis=(2,3))
-      sched = X.schedule()
-      self.assertEqual(len(sched), 1)
-      run_schedule(sched)
+      linear, var_vals = X.linear_with_vars()
+      self.assertEqual(len(linear.src), 1)
+      run_linear(linear, var_vals)
       assert GlobalCounters.global_ops < 4*DSET, f"too many ops {GlobalCounters.global_ops}"
     np.testing.assert_allclose(real_index, X.numpy())
 
@@ -98,9 +92,9 @@ class TestIndexing(unittest.TestCase):
       GlobalCounters.reset()
       X = dataset[idxs]
       assert X.shape == (4,DDIM)
-      sched = X.schedule()
-      self.assertEqual(len(sched), 1)
-      run_schedule(sched)
+      linear, var_vals = X.linear_with_vars()
+      self.assertEqual(len(linear.src), 1)
+      run_linear(linear, var_vals)
       assert GlobalCounters.global_ops < 4*DSET, f"too many ops {GlobalCounters.global_ops}"
     np.testing.assert_allclose(real_index, X.numpy())
 
@@ -113,9 +107,9 @@ class TestIndexing(unittest.TestCase):
       GlobalCounters.reset()
       X = dataset[idxs]
       assert X.shape == (4,DDIM)
-      sched = X.schedule()
-      self.assertEqual(len(sched), 1)
-      run_schedule(sched)
+      linear, var_vals = X.linear_with_vars()
+      self.assertEqual(len(linear.src), 1)
+      run_linear(linear, var_vals)
       assert GlobalCounters.global_ops < 4*DSET, f"too many ops {GlobalCounters.global_ops} != {4*DSET}"
     np.testing.assert_allclose(real_index, X.numpy())
   @unittest.skip("not ready")
@@ -178,7 +172,7 @@ class TestIndexing(unittest.TestCase):
     bs, seqlen = 4, 256
     idx = Tensor.randint(bs, seqlen, high=vocab_size)
     emb = nn.Embedding(vocab_size, embed_size)
-    emb.weight = Tensor.ones(vocab_size, embed_size, requires_grad=True)
+    emb.weight = Tensor.ones(vocab_size, embed_size)
     gt = Tensor.zeros(bs, seqlen, embed_size)
     Tensor.realize(idx, emb.weight, gt)
     GlobalCounters.reset()
@@ -204,14 +198,14 @@ class TestIndexing(unittest.TestCase):
     bs, seqlen = 4, 256
     idx = Tensor.randint(bs, seqlen, high=vocab_size)
     emb = nn.Embedding(vocab_size, embed_size)
-    emb.weight = Tensor.ones(vocab_size, embed_size, requires_grad=True)
+    emb.weight = Tensor.ones(vocab_size, embed_size)
     gt = Tensor.zeros(bs, seqlen, embed_size)
     Tensor.realize(idx, emb.weight, gt)
     # compute expected grad on single device
     expected_grad = np.zeros((vocab_size, embed_size), dtype=np.float32)
     for i in idx.flatten().numpy(): expected_grad[i] += 2
     # now shard the embedding weight on vocab axis and recompute
-    emb.weight = Tensor.ones(vocab_size, embed_size, requires_grad=True)
+    emb.weight = Tensor.ones(vocab_size, embed_size)
     emb.weight.shard_(devices, axis=0)
     idx = idx.shard(devices, axis=None)
     gt = gt.shard(devices, axis=None)
@@ -221,12 +215,12 @@ class TestIndexing(unittest.TestCase):
     np.testing.assert_allclose(emb.weight.grad.numpy(), expected_grad, rtol=1e-5, atol=1e-5)
 
   @unittest.skipUnless(Device.DEFAULT == "AMD" or (Device.DEFAULT == "NULL" and DEV.arch.startswith("gfx")), "tests AMD bf16 cast overhead")
-  def base_test_llama_8b_rope_backward(self, dtype):
+  def base_test_llama_8b_rope_backward(self, dtype, ops_scale=1):
     from extra.models.llama import precompute_freqs_cis, apply_rotary_emb
     bs, seqlen, dim, n_heads = 1, 512, 256, 4
     head_dim = dim // n_heads
     x = Tensor.randn(bs, seqlen, dim, dtype=dtype)
-    wq = Tensor.randn(dim, dim, dtype=dtype, requires_grad=True)
+    wq = Tensor.randn(dim, dim, dtype=dtype)
     freqs_cis = precompute_freqs_cis(head_dim, seqlen).cast(dtype)
     Tensor.realize(x, wq, freqs_cis)
     xq = (x @ wq.T)
@@ -235,19 +229,18 @@ class TestIndexing(unittest.TestCase):
     xq = xq.reshape(bs, seqlen, n_heads, head_dim)
     xq_rope, _ = apply_rotary_emb(xq, xq, freqs_cis)
     xq_rope.sum().backward()
-    sched = wq.grad.schedule()
-    assert len(sched) == 1, f"expected one kernel for backward, got: {len(sched)}"
-    prg = sched[0].lower().prg.p
-    bwd_ops = prg.estimates.ops
-    # bfloat16 on non CDNA4 has ~10x ops overhead because of the software emulation
-    if dtype == dtypes.bfloat16 and not Device[Device.DEFAULT].renderer.target.arch.startswith("gfx950"): ops_scale = 10
-    else: ops_scale = 1
+    linear = compile_linear(wq.grad.schedule_linear())
+    assert len(linear.src) == 1, f"expected one kernel for backward, got: {len(linear.src)}"
+    bwd_ops = estimate_uop(linear.src[0]).ops
     expected_ops = bs*seqlen*dim*dim*ops_scale
     print(f"rope matmul bwd ({dtype}): {GlobalCounters.kernel_count} kernels, {bwd_ops:,} ops")
     self.assertLess(bwd_ops, expected_ops, f"rope bwd ops {bwd_ops:,} should be < {ops_scale} per (got {bwd_ops/(bs*seqlen*dim*dim):.1f})")
 
-  def test_llama_8b_rope_backward_f16(self): self.base_test_llama_8b_rope_backward(dtypes.float16)
-  def test_llama_8b_rope_backward_bf16(self): self.base_test_llama_8b_rope_backward(dtypes.bfloat16)
+  def test_llama_8b_rope_backward_f16(self):
+    self.base_test_llama_8b_rope_backward(dtypes.float16, ops_scale=2)
+  # bfloat16 on non CDNA4 has ~10x ops overhead because of the software emulation
+  def test_llama_8b_rope_backward_bf16(self):
+    self.base_test_llama_8b_rope_backward(dtypes.bfloat16, ops_scale=2 if Device[Device.DEFAULT].renderer.target.arch.startswith("gfx950") else 25)
 
 if __name__ == "__main__":
   unittest.main()

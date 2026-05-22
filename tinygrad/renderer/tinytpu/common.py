@@ -39,7 +39,7 @@ _VPU = {"ADD": 0, "MUL": 1, "MAX": 3, "SUM_REDUCE": 4, "CMPLT": 5, "CMPNE": 6,
 _ALU_TO_VPU = {Ops.ADD: "ADD", Ops.MUL: "MUL", Ops.SUB: "SUB", Ops.MAX: "MAX",
                Ops.CMPLT: "CMPLT", Ops.CMPNE: "CMPNE", Ops.CMPEQ: "CMPEQ",
                Ops.AND: "AND", Ops.OR: "OR", Ops.XOR: "XOR",
-               Ops.SHL: "SHL", Ops.SHR: "SHR", Ops.IDIV: "DIV"}
+               Ops.SHL: "SHL", Ops.SHR: "SHR", Ops.CDIV: "DIV"}
 # tinygrad ALU op -> float VPU op name (operands are float).
 _FLOAT_VPU = {Ops.ADD: "FADD", Ops.MUL: "FMUL", Ops.SUB: "FSUB",
               Ops.MAX: "FMAX", Ops.CMPLT: "FCMPLT"}
@@ -194,11 +194,11 @@ def _data_dag(val: UOp) -> list[UOp]:
 def _store_lanes(store: UOp) -> list[UOp]:
   """The per-lane value computations of a STORE.
 
-  Float kernels store a VECTORIZE of N lane computations; int kernels store
+  Float kernels store a STACK of N lane computations; int kernels store
   one scalar value (and are unrolled into many STOREs instead).
   """
   v = store.src[1]
-  return list(v.src) if v.op is Ops.VECTORIZE else [v]
+  return list(v.src) if v.op is Ops.STACK else [v]
 
 # ---------------------------------------------------------------------------
 # InstSel pass — graph rewrites expanding ops with no single VPU opcode
@@ -209,15 +209,15 @@ def _expand_sqrt(x: UOp) -> UOp:
   return (a.alu(Ops.LOG2) * a.const_like(0.5)).alu(Ops.EXP2)
 
 def _expand_mod(x: UOp) -> UOp:
-  # mod(a, b) = a - (a // b) * b; the VPU has no direct mod opcode.
+  # mod(a, b) = a - (a CDIV b) * b; the VPU has no direct mod opcode.
   a, b = x.src[0], x.src[1]
-  return a.alu(Ops.SUB, a.alu(Ops.IDIV, b).alu(Ops.MUL, b))
+  return a.alu(Ops.SUB, a.alu(Ops.CDIV, b).alu(Ops.MUL, b))
 
 _INSTSEL = PatternMatcher([
   (UPat(Ops.SQRT, name="x"), _expand_sqrt),
-  (UPat(Ops.MOD, name="x"), _expand_mod),
+  (UPat(Ops.CMOD, name="x"), _expand_mod),
 ])
-_INSTSEL_OPS = (Ops.SQRT, Ops.MOD)
+_INSTSEL_OPS = (Ops.SQRT, Ops.CMOD)
 
 def _run_instsel(uops: list[UOp]) -> list[UOp]:
   """Apply InstSel graph rewrites; return the (possibly rewritten) uop list."""

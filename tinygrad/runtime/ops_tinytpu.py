@@ -243,7 +243,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     # tinygrad may leave pointer reads as INDEX nodes for a fully upcast 16-lane
     # tile, while smaller tiles materialize explicit LOAD UOps.
     _has_bool_logic_op = op_counts.get("AND", 0) > 0 or op_counts.get("OR", 0) > 0 or op_counts.get("XOR", 0) > 0
-    _has_complex_op = any(op_counts.get(x, 0) for x in ("IDIV", "MOD", "RECIP"))
+    _has_complex_op = any(op_counts.get(x, 0) for x in ("CDIV", "CMOD", "RECIP"))
     is_single_binary = len(params) == 3 and len(matched_single_binary_ops) == 1 and op_counts.get("LOAD", 0) in {0, 2} and op_counts.get("STORE", 0) == 1 and not _has_bool_logic_op
     _has_fused_cmp = op_counts.get("CMPLT", 0) > 0 and op_counts.get("WHERE", 0) > 0
     is_grouped_binary = len(params) == 3 and len(matched_grouped_binary_ops) == 1 and op_counts.get("STORE", 0) == 4 and op_counts.get("GROUP", 0) == 1 and not _has_bool_logic_op and not _has_fused_cmp
@@ -252,7 +252,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
     _is_grouped_sc = (len(params) == 2 and op_counts.get("GROUP", 0) == 1
                       and op_counts.get("STORE", 0) == 4 and op_counts.get("LOAD", 0) == 4
                       and op_counts.get("RANGE", 0) == 1 and not _has_bool_logic_op)
-    if len(params) in {2, 3} and divmod_pattern is not None and divmod_pattern[0] == "IDIV":
+    if len(params) in {2, 3} and divmod_pattern is not None and divmod_pattern[0] == "CDIV":
         _, rhs_const = divmod_pattern
         out_size, input_args = _resolve_binary_io(param_sizes)
         if out_size is not None and len(input_args) >= 1 and 0 < out_size and all(param_sizes[arg] in {1, out_size} for arg in input_args):
@@ -274,7 +274,7 @@ def analyze_tinytpu_uops(uops:list[UOp]) -> dict:
         diag["reason"] = f"unsupported vpu div sizes {dict(sorted(param_sizes.items()))}"
         diag["notes"].append("Current TinyTPU VPU DIV lowering handles int32 elementwise outputs with optional scalar broadcasting.")
         diag["missing_instructions"] = ["SXU_LOAD_VREG", "SXU_DISPATCH_VPU", "SXU_STORE_VREG"]
-    elif len(params) in {2, 3} and divmod_pattern is not None and divmod_pattern[0] == "MOD":
+    elif len(params) in {2, 3} and divmod_pattern is not None and divmod_pattern[0] == "CMOD":
         _, rhs_const = divmod_pattern
         out_size, input_args = _resolve_binary_io(param_sizes)
         if out_size is not None and len(input_args) >= 1 and 0 < out_size and all(param_sizes[arg] in {1, out_size} for arg in input_args):
@@ -791,10 +791,10 @@ def _classify_divmod_pattern(uops:list[UOp]) -> tuple[str, int | None] | None:
     if not stores:
         return None
     values = [s.src[1] for s in stores]
-    if any(u.op is Ops.IDIV for u in uops) and all(v.op is Ops.WHERE for v in values):
-        return "IDIV", _find_scalar_const_binary(uops, "IDIV")
-    if any(u.op is Ops.MOD for u in uops) and all(v.op is Ops.ADD for v in values):
-        return "MOD", _find_scalar_const_binary(uops, "MOD")
+    if any(u.op is Ops.CDIV for u in uops) and all(v.op is Ops.WHERE for v in values):
+        return "CDIV", _find_scalar_const_binary(uops, "CDIV")
+    if any(u.op is Ops.CMOD for u in uops) and all(v.op is Ops.ADD for v in values):
+        return "CMOD", _find_scalar_const_binary(uops, "CMOD")
     return None
 
 

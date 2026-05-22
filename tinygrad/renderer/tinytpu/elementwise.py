@@ -64,7 +64,7 @@ def can_lower(uops: list[UOp]) -> bool:
   """True iff the elementwise walker fully owns this kernel.
 
   Kernels arrive per-element unrolled (one STORE per lane) or vectorized
-  (one STORE of a VECTORIZE). Every lane must compute the same data-DAG
+  (one STORE of a STACK). Every lane must compute the same data-DAG
   shape so one lane can template the tiled program.
   """
   if any(u.op is Ops.WMMA for u in uops): return False

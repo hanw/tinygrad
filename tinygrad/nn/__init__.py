@@ -322,7 +322,7 @@ def _embedding_bwd(grad_emb:UOp, call:UOp) -> tuple:
 
   # TODO: how do we remove this dumb kernel and use Tensor.zeros?
   def _zero_kernel(out:UOp) -> UOp:
-    i = UOp.range(out.size, 0)
+    i = UOp.range(out.numel(), 0)
     return out.flatten()[i].store(0).end(i).sink(arg=KernelInfo(name="zero"))
   grad_weight_uop = grad_weight_uop.custom_kernel(fxn=_zero_kernel)[0]
 
@@ -331,7 +331,7 @@ def _embedding_bwd(grad_emb:UOp, call:UOp) -> tuple:
 
   # this is the real atomic kernel
   def _embedding_bwd_kernel(grad_weight:UOp, grad_emb:UOp, idx:UOp) -> UOp:
-    idx_flat, grad_emb_flat = idx.flatten(), grad_emb.reshape((idx.size, grad_weight.shape[-1]))
+    idx_flat, grad_emb_flat = idx.flatten(), grad_emb.reshape((idx.numel(), grad_weight.shape[-1]))
 
     embed_size = grad_weight.shape[-1]
     BLOCK_J = min(256, embed_size)
@@ -366,7 +366,7 @@ def _embedding_bwd(grad_emb:UOp, call:UOp) -> tuple:
   return (grad_weight_uop.cast(weight.dtype), None)
 
 def _embedding_fwd(weight:Tensor, idx:Tensor) -> Tensor:
-  arange = Tensor.arange(weight.shape[0], requires_grad=False, device=weight.device)
+  arange = Tensor.arange(weight.shape[0], device=weight.device)
   return (arange == idx.unsqueeze(-1)).unsqueeze(-1).where(weight, 0).sum(-2, dtype=weight.dtype)
 
 @functools.cache

@@ -50,7 +50,7 @@ def _lower_pad(uops: list[UOp]) -> dict | None:
   data_alu = _data_alu_ops(uops)
   if sum(data_alu.values()) > 0:
     return None
-  for n in ("WHERE", "MOD", "RECIP", "RECIPROCAL", "TRUNC", "MULACC",
+  for n in ("WHERE", "CMOD", "RECIP", "RECIPROCAL", "TRUNC", "MULACC",
             "SELECT", "CAST"):
     if op_counts.get(n, 0):
       return None
@@ -137,7 +137,7 @@ def _lower_rowbc_copy(uops: list[UOp]) -> dict | None:
   if sum(_data_alu_ops(uops).values()) > 0:
     return None
   # WMMA omitted: classify() routes WMMA kernels to GEMM before is_movement.
-  for n in ("WHERE", "MOD", "RECIP", "RECIPROCAL", "TRUNC", "MULACC",
+  for n in ("WHERE", "CMOD", "RECIP", "RECIPROCAL", "TRUNC", "MULACC",
             "SELECT", "CAST"):
     if op_counts.get(n, 0):
       return None
@@ -221,11 +221,11 @@ def _lower_transpose(uops: list[UOp]) -> dict | None:
   op_counts = Counter(u.op.name for u in uops)
   # Two shapes match:
   #   - int32 GROUP(4)-unrolled: 4 STOREs + 4 LOADs + 1 RANGE + 1 MUL
-  #   - float32 VECTORIZE-unrolled: 1 STORE + 4 LOADs + 1 VECTORIZE + 1 RANGE + 1 MUL
+  #   - float32 STACK-unrolled: 1 STORE + 4 LOADs + 1 STACK + 1 RANGE + 1 MUL
   shape_int = (op_counts.get("STORE", 0) == 4 and op_counts.get("LOAD", 0) == 4
                and op_counts.get("RANGE", 0) == 1 and op_counts.get("MUL", 0) == 1)
   shape_float = (op_counts.get("STORE", 0) == 1 and op_counts.get("LOAD", 0) == 4
-                 and op_counts.get("VECTORIZE", 0) == 1 and op_counts.get("RANGE", 0) == 1
+                 and op_counts.get("STACK", 0) == 1 and op_counts.get("RANGE", 0) == 1
                  and op_counts.get("MUL", 0) == 1)
   if not (shape_int or shape_float):
     return None
@@ -246,7 +246,7 @@ def _lower_transpose(uops: list[UOp]) -> dict | None:
     return None
   if params[out_arg].dtype.base.itemsize != params[src_arg].dtype.base.itemsize:
     return None
-  # Each STORE value must be a LOAD of src_arg, or a VECTORIZE of LOADs
+  # Each STORE value must be a LOAD of src_arg, or a STACK of LOADs
   # (possibly wrapped in CAST for float bitcasting).
   loads = []
   store_idx_uops = []
@@ -259,7 +259,7 @@ def _lower_transpose(uops: list[UOp]) -> dict | None:
     store_idx_uops.append(addr.src[1] if addr.op is Ops.INDEX else None)
     while val.op is Ops.CAST:
       val = val.src[0]
-    if val.op is Ops.VECTORIZE:
+    if val.op is Ops.STACK:
       for l in val.src:
         while l.op is Ops.CAST:
           l = l.src[0]

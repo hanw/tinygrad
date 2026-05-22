@@ -10,10 +10,6 @@ class Optimizer:
   """
   def __init__(self, params: list[Tensor], lr: float, device=None, fused=FUSE_OPTIM):
     if lr < 0: raise ValueError(f"Invalid learning rate: {lr}")
-    # if requires_grad is None, but being put into an optimizer, set it to True
-    for x in params:
-      if x.requires_grad is None: x.requires_grad_(True)
-
     self.params: list[Tensor] = dedup([x for x in params if x.requires_grad])
     assert len(self.params) != 0, "optimizer must have at least one param"
     self.buffers: list[Tensor] = dedup([x for x in params if not x.requires_grad])   # buffers are still realized
@@ -94,7 +90,7 @@ def Muon(params: list[Tensor], lr=0.001, momentum=0.95, weight_decay=0.1, ns_ste
   """
   assert not fused, "FUSE_OPTIM not allowed for Muon optimizer"
   return LARS(params, lr, momentum, weight_decay, ns_steps, ns_coefficients, nesterov,
-              classic=False, pre_wd=False, tcoef=0.0, device=None, fused=fused)
+              classic=False, pre_wd=False, tcoef=0.0, device=device, fused=fused)
 
 class LARS(Optimizer):
   """
