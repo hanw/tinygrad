@@ -452,6 +452,24 @@ def _psum_accumulate_row(vs: int, psum_addr: int, psum_row: int) -> str:
     # symmetric with the MXU dispatch's psum_acc path.
     return f"2 22 {psum_addr} {psum_row} {vs} 0 0 0 0 0"
 
+def _mxu_epilogue(wbase: int, abase: int, tiles: int, bias_vreg: int, dst: int,
+                  bias: bool = True, relu: bool = False,
+                  reduce: int = 0, vmem_dst: bool = False) -> str:
+    # SXU_DISPATCH_MXU_EPILOGUE opcode = 42.  Fused GEMM + bias/relu epilogue
+    # applied at MXU drain time.  vpuOp field carries a 7-bit config:
+    #   bit0 biasEnable, bit1 reluEnable, bit2 reduceEnable,
+    #   bit3 reduceSumsq, bit4 writebackMode (0=vreg, 1=vmem).
+    cfg = (int(bias) | (int(relu) << 1) | (int(reduce != 0) << 2)
+           | (int(reduce == 2) << 3) | (int(vmem_dst) << 4))
+    vmem_addr = dst if vmem_dst else 0
+    vreg_dst  = 0    if vmem_dst else dst
+    return f"2 42 {vmem_addr} {vreg_dst} {bias_vreg} {cfg} 0 {wbase} {abase} {tiles}"
+
+def _load_epilogue_stat(vd: int) -> str:
+    # SXU_LOAD_EPILOGUE_STAT opcode = 43.  Stub for future epilogue
+    # status-register read; currently a no-op that advances pc.
+    return f"2 43 0 {vd} 0 0 0 0 0 0"
+
 def _wait_mxu() -> str: return "2 5 0 0 0 0 0 0 0 0"
 def _load_mxu_result(vd: int) -> str: return f"2 6 0 {vd} 0 0 0 0 0 0"
 
