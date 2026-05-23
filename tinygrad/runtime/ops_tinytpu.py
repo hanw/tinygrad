@@ -1,8 +1,12 @@
-"""
-TinyTPU tinygrad runtime device.
+"""TinyTPU tinygrad runtime device.
 
-Implements a tinygrad Compiled device that drives the BSV TensorCore simulation
-for 4x4 GEMM operations.  Other ops raise NotImplementedError.
+Implements a tinygrad Compiled device that drives the BSV TinyTPU simulator.
+The renderer classifies tinygrad UOps into TinyTPU lowering classes
+(elementwise, reduction, broadcast, movement, GEMM) and emits an SXU_PROGRAM
+descriptor. The runtime binds host buffers into that descriptor, builds the
+simulator bundle, launches the simulator, and copies VMEM results back into
+the tinygrad output buffer. Unsupported kernels raise NotImplementedError with
+lowering diagnostics.
 
 The BSV simulator binary is located via the TINYTPU_SIM environment variable
 (default: <repo_root>/build/mkTbTinyTPURuntime.bexe).
@@ -114,23 +118,11 @@ class TinyTPUCompiler(Compiler):
     pass
 
 
-# ---------------------------------------------------------------------------
-# Legacy descriptor renderer — handles patterns not yet migrated to SXU_PROGRAM
-# ---------------------------------------------------------------------------
-
-
-
-# ---------------------------------------------------------------------------
-# Renderer — detects 4x4 GEMM from UOps, emits JSON descriptor
-# ---------------------------------------------------------------------------
 class TinyTPURenderer(Renderer):
-    """
-    Minimal renderer for the TinyTPU prototype.
+    """Renderer for TinyTPU SXU_PROGRAM descriptors.
 
-    Supports only the 4×4 GEMM pattern produced by tinygrad for:
-        Tensor(shape=(1,4)) @ Tensor(shape=(4,4))
-
-    Emits a JSON descriptor that TinyTPUProgram uses at call time.
+    The renderer does not emit textual source. It dispatches UOps to focused
+    TinyTPU lowerers and returns a JSON descriptor consumed by TinyTPUProgram.
     """
     compiler = TinyTPUCompiler()
     has_local   = False
