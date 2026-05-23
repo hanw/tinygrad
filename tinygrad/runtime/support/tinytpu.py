@@ -4,10 +4,7 @@ import numpy as np
 from tinygrad.renderer.tinytpu.common import (
   _vmem, _wmem, _amem, _load, _store, _vpu, _mxu, _wait_mxu, _load_mxu_result,
   _halt, _output_vmem, _end, _bundle, _broadcast)
-
-ROWS = 4
-COLS = 4
-TILE_ELEMS = ROWS * COLS
+from tinygrad.runtime.support.tinytpu_isa import ROWS, COLS, TILE_ELEMS
 
 def build_vpu_binary_bundle(lhs_i32: np.ndarray, rhs_i32: np.ndarray, num_elems: int, vpu_op: int,
                             lhs_broadcast: bool = False, rhs_broadcast: bool = False) -> str:
