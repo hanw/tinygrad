@@ -470,6 +470,23 @@ def _load_epilogue_stat(vd: int) -> str:
     # status-register read; currently a no-op that advances pc.
     return f"2 43 0 {vd} 0 0 0 0 0 0"
 
+def _set_requant_config(scale_mul: int, scale_shift: int) -> str:
+    # SXU_SET_REQUANT_CONFIG opcode = 44. scaleMul packed little-endian:
+    # byte 0 -> mxuWBase, byte 1 -> mxuABase, byte 2 -> mxuTLen,
+    # byte 3 -> vmemAddr. scaleShift (5 bits) in vpuOp low bits.
+    m = scale_mul & 0xFFFFFFFF
+    b0, b1, b2, b3 = m & 0xff, (m >> 8) & 0xff, (m >> 16) & 0xff, (m >> 24) & 0xff
+    return f"2 44 {b3} 0 0 {scale_shift & 0x1f} 0 {b0} {b1} {b2}"
+
+def _mxu_requant(wbase: int, abase: int, tiles: int, asram_dst: int) -> str:
+    # SXU_DISPATCH_MXU_REQUANT opcode = 45. ASRAM target base in vmemAddr;
+    # GEMM operands in mxu* fields.
+    return f"2 45 {asram_dst} 0 0 0 0 {wbase} {abase} {tiles}"
+
+def _output_asram(addr: int) -> str:
+    # Record type 7: OUTPUT_ASRAM. Emit asram_result row at addr after HALT.
+    return f"7 {addr}"
+
 def _wait_mxu() -> str: return "2 5 0 0 0 0 0 0 0 0"
 def _load_mxu_result(vd: int) -> str: return f"2 6 0 {vd} 0 0 0 0 0 0"
 

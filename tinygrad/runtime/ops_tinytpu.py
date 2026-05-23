@@ -37,6 +37,7 @@ from tinygrad.renderer.tinytpu.common import (
     _set_pred_ne_zero, _skip_if_not_pred,
     _wait_mxu, _load_mxu_result, _load_vpu_result, _load_xlu_result,
     _mxu_epilogue, _load_epilogue_stat,
+    _set_requant_config, _mxu_requant, _output_asram,
     _halt, _output_mxu, _output_vmem, _end, _bundle, _find_unique_param_arg)
 from tinygrad.renderer.tinytpu.gemm import _infer_tiling, _tiling_failure_note
 
@@ -912,6 +913,13 @@ def _parse_vmem_output(stdout: str) -> list[int] | None:
     for line in stdout.splitlines():
         if line.strip().startswith("vmem_result "):
             return _parse_result_line(line.strip(), "vmem_result", _ROWS * _COLS)
+    return None
+
+def _parse_asram_output(stdout: str) -> list[int] | None:
+    """Extract first asram_result from BSV sim stdout. Returns None if not found."""
+    for line in stdout.splitlines():
+        if line.strip().startswith("asram_result "):
+            return _parse_result_line(line.strip(), "asram_result", _COLS)
     return None
 
 def _parse_multi_vmem_output(stdout: str) -> list[list[int]]:
