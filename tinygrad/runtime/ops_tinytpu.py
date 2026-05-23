@@ -13,10 +13,10 @@ The BSV simulator binary is located via the TINYTPU_SIM environment variable
 """
 
 from __future__ import annotations
-import os, json, subprocess, tempfile
+import os, json
 from collections import Counter
 import numpy as np
-from tinygrad.device import Compiled, Allocator, BufferSpec, Compiler
+from tinygrad.device import Compiled, Allocator, BufferSpec
 from tinygrad.renderer import Renderer
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.dtype import PtrDType, dtypes
@@ -44,14 +44,15 @@ from tinygrad.renderer.tinytpu.common import (
     _set_requant_config, _mxu_requant, _output_asram,
     _halt, _output_mxu, _output_vmem, _end, _bundle, _find_unique_param_arg)
 from tinygrad.renderer.tinytpu.gemm import _infer_tiling, _tiling_failure_note
+from tinygrad.runtime.support.compiler_tinytpu import (
+    TinyTPUCompiler, TinyTPUKernel, SUPPORTED_TINYTPU_OPS, unsupported_message)
+from tinygrad.runtime.support import tinytpu as tinytpu_rt
+from tinygrad.runtime.support.tinytpu import ROWS as _ROWS, COLS as _COLS, TILE_ELEMS as _TILE_ELEMS
 
 # ---------------------------------------------------------------------------
 # Constants matching the BSV TensorCore#(4,4,16) prototype
 # ---------------------------------------------------------------------------
-_ROWS   = 4
-_COLS   = 4
 _BYTES_PER_ELEM = 4           # Int#(32) = 4 bytes
-_TILE_ELEMS = _ROWS * _COLS   # 16 elements per VMEM tile
 _VPU_OPS = {"ADD": 0, "MUL": 1, "MAX": 3, "SUM_REDUCE": 4, "CMPLT": 5, "CMPNE": 6, "SUB": 7, "CMPEQ": 8, "MAX_REDUCE": 9, "SHL": 10, "SHR": 11, "MIN": 12, "MIN_REDUCE": 13, "DIV": 14, "AND": 15, "OR": 16, "XOR": 17,
              "FADD": 18, "FMUL": 19, "FSUB": 20, "FMAX": 21, "FCMPLT": 22, "FRECIP": 23, "I2F": 24, "F2I": 25, "NOT": 26, "SELECT": 27, "COPY": 28,
              "SUM_REDUCE_COL": 29, "MAX_REDUCE_COL": 30, "MIN_REDUCE_COL": 31,
@@ -107,15 +108,6 @@ class TinytpuAllocator(Allocator["TinytpuDevice"]):
 
     def _offset(self, buf: bytearray, offset: int, size: int) -> bytearray:
         return buf[offset : offset + size]
-
-
-# ---------------------------------------------------------------------------
-# Compiler — JSON descriptor pass-through (bundle building happens at
-# call time because it needs buffer data). Future: move bundle building
-# here once we have a buffer-independent program format.
-# ---------------------------------------------------------------------------
-class TinyTPUCompiler(Compiler):
-    pass
 
 
 class TinyTPURenderer(Renderer):
@@ -1017,34 +1009,7 @@ def _build_full_gemm_bundle(act_rows_i8: np.ndarray, weight_matrix_i8: np.ndarra
 
 
 def _run_bundle(sim: str, bundle_text: str) -> str:
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-        f.write(bundle_text)
-        bundle_path = f.name
-
-    try:
-        env = {**os.environ, "TINYTPU_BUNDLE": bundle_path}
-        proc = subprocess.run([sim], env=env, capture_output=True, text=True, timeout=30)
-    finally:
-        os.unlink(bundle_path)
-
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"TinyTPU sim exited {proc.returncode}\n"
-            f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
-        )
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("FAIL:") or line.startswith("ERROR:"):
-            raise RuntimeError(
-                f"TinyTPU simulator reported failure: {line}\n"
-                f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
-            )
-    if "status ok" not in {line.strip() for line in proc.stdout.splitlines()}:
-        raise RuntimeError(
-            f"TinyTPU simulator did not report `status ok`\n"
-            f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
-        )
-    return proc.stdout
+    return tinytpu_rt.run_bundle(sim, bundle_text)
 
 
 def _require_int8_range(name: str, values: np.ndarray) -> None:
@@ -1073,20 +1038,20 @@ def _unsupported_message(prog: dict) -> str:
 # ---------------------------------------------------------------------------
 # Program — drives the BSV simulator
 # ---------------------------------------------------------------------------
-_SUPPORTED_OPS = {"SXU_PROGRAM"}
+_SUPPORTED_OPS = SUPPORTED_TINYTPU_OPS
 
 class TinyTPUProgram:
     def __init__(self, name: str, lib: bytes, *args, **kwargs):
         self.name = name
-        self.prog = json.loads(lib)
+        self.kernel = TinyTPUKernel.from_json(lib)
         self.sim = _sim_path()
 
     def _run(self, bundle_text: str) -> str:
-        return _run_bundle(self.sim, bundle_text)
+        return tinytpu_rt.run_bundle(self.sim, bundle_text)
 
     def _run_vmem(self, bundle_text: str) -> list[int]:
         """Run bundle and parse the first vmem_result line."""
-        result = _parse_vmem_output(self._run(bundle_text))
+        result = tinytpu_rt.parse_vmem_output(self._run(bundle_text))
         if result is None:
             raise RuntimeError("TinyTPU sim produced no vmem_result")
         return result
@@ -1111,143 +1076,20 @@ class TinyTPUProgram:
                  vals: tuple = (),
                  wait: bool = False,
                  **kwargs) -> float | None:
-        prog = self.prog
-        op = prog.get("op")
+        prog = self.kernel.desc
+        op = self.kernel.op
         if op not in _SUPPORTED_OPS:
-            raise NotImplementedError(_unsupported_message(prog))
+            raise NotImplementedError(unsupported_message(prog))
         return getattr(self, f"_exec_{op.lower()}")(bufs)
 
     def _exec_sxu_program(self, bufs):
-        prog = self.prog
-        data_plan = prog["data_plan"]
-        instructions = prog["instructions"]
-        outputs = prog["outputs"]
-        is_bool_out = prog.get("bool_out", False)
-
-        # Build bundle from data_plan + instructions + outputs
-        data_lines: list[str] = []
-        for entry in data_plan:
-            mem_type = entry["type"]
-            if entry.get("layout") == "broadcast_const":
-                val = int(entry["value"])
-                data_lines.append(_vmem(int(entry["addr"]), [val] * _TILE_ELEMS))
-                continue
-            param_idx = int(entry["param"])
-            buf_data = bufs[param_idx]
-
-            if mem_type == "WMEM":
-                weight_i32 = np.frombuffer(bytes(buf_data), dtype="<i4")
-                _require_int8_range("weight", weight_i32)
-                weight_i8 = weight_i32.astype(np.int8)
-                nk, nwt = entry["num_k_tiles"], entry["num_weight_tiles"]
-                weight_matrix = weight_i8.reshape(nk * _ROWS, nwt * _COLS)
-                for k in range(nk):
-                    for t in range(nwt):
-                        w_tile = weight_matrix[k*_ROWS:(k+1)*_ROWS, t*_COLS:(t+1)*_COLS]
-                        data_lines.append(_wmem(k*nwt+t, [int(x) for x in w_tile.flatten()]))
-
-            elif mem_type == "AMEM":
-                act_i32 = np.frombuffer(bytes(buf_data), dtype="<i4")
-                _require_int8_range("activation", act_i32)
-                act_i8 = act_i32.astype(np.int8)
-                nv, nk = entry["num_vecs"], entry["num_k_tiles"]
-                act_rows = act_i8.reshape(nv, nk * _ROWS)
-                for row in range(nv):
-                    for k in range(nk):
-                        a_tile = act_rows[row, k*_ROWS:(k+1)*_ROWS]
-                        data_lines.append(_amem(row*nk+k, [int(x) for x in a_tile]))
-
-            elif mem_type == "VMEM":
-                is_bool = entry.get("bool", False)
-                is_broadcast = entry.get("broadcast", False)
-                raw = np.frombuffer(bytes(buf_data), dtype=np.bool_ if is_bool else "<i4")
-                if is_bool:
-                    raw = raw.astype(np.int32)
-                addr = int(entry["addr"])
-                offset = int(entry.get("offset", 0))
-                count = int(entry.get("count", _TILE_ELEMS))
-                if is_broadcast:
-                    val = int(raw[0]) if len(raw) > 0 else 0
-                    data_lines.append(_vmem(addr, [val] * _TILE_ELEMS))
-                    continue
-                mode = entry.get("mode", "TILE")
-                if mode == "ROW_BROADCAST":
-                    nwt = entry.get("num_weight_tiles", 1)
-                    for t in range(nwt):
-                        tile = [0] * _TILE_ELEMS
-                        for i in range(_COLS):
-                            tile[i] = int(raw[t*_COLS+i])
-                        data_lines.append(_vmem(addr+t, tile))
-                elif mode == "PAD_FILL":
-                    # Scatter source positions into the output tile per the
-                    # renderer-supplied dst->src map; unlisted positions stay
-                    # at zero (pad_value defaults to 0). Single-tile only.
-                    pad_val = int(entry.get("pad_value", 0))
-                    tile = [pad_val] * _TILE_ELEMS
-                    for dst, src in entry["pad_map"]:
-                        if src is None:
-                            continue
-                        if 0 <= src < len(raw):
-                            tile[dst] = int(raw[src])
-                    data_lines.append(_vmem(addr, tile))
-                elif mode == "MATRIX_TILE":
-                    # Pack matrix[row_base:row_base+tile_rows, col_base:col_base+tile_cols]
-                    # into a 4x4 tile with pad_value fill for out-of-bounds cells.
-                    pad_val = int(entry.get("pad_value", 0))
-                    nrows_mat = int(entry["matrix_nrows"])
-                    ncols_mat = int(entry["matrix_ncols"])
-                    row_base  = int(entry.get("row_base", 0))
-                    col_base  = int(entry.get("col_base", 0))
-                    tile_rows = int(entry.get("tile_rows", _ROWS))
-                    tile_cols = int(entry.get("tile_cols", _COLS))
-                    tile = [pad_val] * _TILE_ELEMS
-                    for r in range(tile_rows):
-                        mr = row_base + r
-                        if mr >= nrows_mat: break
-                        for c in range(tile_cols):
-                            mc = col_base + c
-                            if mc >= ncols_mat: break
-                            tile[r * _COLS + c] = int(raw[mr * ncols_mat + mc])
-                    data_lines.append(_vmem(addr, tile))
-                else:
-                    pad_val = int(entry.get("pad_value", 0))
-                    tile = [pad_val] * _TILE_ELEMS
-                    chunk = raw[offset:offset+count]
-                    for i in range(min(count, len(chunk))):
-                        tile[i] = int(chunk[i])
-                    data_lines.append(_vmem(addr, tile))
-
-        # Output records
-        output_lines = [_output_vmem(int(o["addr"])) for o in outputs] + [_end()]
-        bundle_text = _bundle(*(data_lines + instructions + output_lines))
-
-        # Run sim
+        bundle_text = self.kernel.build_bundle(bufs)
         stdout = self._run(bundle_text)
-        vmem_results = _parse_multi_vmem_output(stdout)
-        expected = int(prog["num_output_tiles"])
-        if len(vmem_results) != expected:
-            raise RuntimeError(f"SXU_PROGRAM expected {expected} vmem tiles, got {len(vmem_results)}\n{stdout[:500]}")
-
-        # Write results to output buffer
-        out_buf = bufs[int(prog["out"])]
-        out_dtype = np.dtype(np.bool_) if is_bool_out else np.dtype("<i4")
-        reduce_mode = prog.get("reduce")
-        out_offset = 0
-        for idx, out_entry in enumerate(outputs):
-            count = int(out_entry["count"])
-            tile_data = vmem_results[idx]
-            if reduce_mode and count == 1:
-                # Scalar reductions use VPU_*_REDUCE_TILE, so the scalar is
-                # broadcast to every position of the output tile.
-                chunk_out = np.array([tile_data[0]], dtype=out_dtype)
-            elif out_entry.get("extract") == "row_heads":
-                # Row reductions: each sublane holds a reduction broadcast
-                # across its row; extract position [r * _COLS] for r in range(count).
-                chunk_out = np.array([tile_data[r * _COLS] for r in range(count)], dtype=out_dtype)
-            else:
-                chunk_out = np.array(tile_data[:count], dtype=out_dtype)
-            out_buf[out_offset:out_offset+len(chunk_out)*out_dtype.itemsize] = chunk_out.tobytes()
-            out_offset += len(chunk_out) * out_dtype.itemsize
+        vmem_results = tinytpu_rt.parse_multi_vmem_output(stdout)
+        try:
+            self.kernel.write_outputs(bufs, vmem_results)
+        except RuntimeError as exc:
+            raise RuntimeError(f"{exc}\n{stdout[:500]}") from exc
         return 1e-3
 
 # ---------------------------------------------------------------------------
