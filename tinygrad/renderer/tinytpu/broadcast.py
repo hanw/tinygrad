@@ -240,18 +240,27 @@ def _classify_colbc(uops: list[UOp]) -> dict | None:
     else:
       return None
   else:
+    # Pick the compute op by finding an actual binary UOp whose sources are
+    # loads of the two input params — not by raw op_counts. A column-broadcast
+    # ADD lowering produces a single address-arithmetic MUL (constant stride),
+    # which would otherwise shadow the real ADD here.
     non_comm_ops = {"CMPLT": Ops.CMPLT, "CMPNE": Ops.CMPNE, "SUB": Ops.SUB}
+    op_table = {"CMPLT": Ops.CMPLT, "CMPNE": Ops.CMPNE, "CMPEQ": Ops.CMPEQ,
+                "MAX": Ops.MAX, "SUB": Ops.SUB,
+                "MUL": Ops.MUL, "ADD": Ops.ADD}
     vpu_name = None
-    for name in ("CMPLT", "CMPNE", "CMPEQ", "MAX", "MIN", "SUB", "MUL", "ADD"):
-      if op_counts.get(name, 0):
+    op_uop = None
+    for name in ("CMPLT", "CMPNE", "CMPEQ", "MAX", "SUB", "MUL", "ADD"):
+      cand = next((u for u in uops if u.op is op_table[name] and _has_load_src(u)
+                   and {_unique_param_arg(s) for s in u.src if s.op is Ops.LOAD} == {lhs_arg, rhs_arg}),
+                  None)
+      if cand is not None:
         vpu_name = name
+        op_uop = cand
         break
     if vpu_name is None:
       return None
     if vpu_name in non_comm_ops:
-      op_uop = next((u for u in uops if u.op is non_comm_ops[vpu_name] and _has_load_src(u)), None)
-      if op_uop is None:
-        return None
       lhs_param = _unique_param_arg(op_uop.src[0])
       rhs_param = _unique_param_arg(op_uop.src[1])
       if lhs_param == rhs_arg and rhs_param == lhs_arg:
