@@ -19,7 +19,7 @@ from tinygrad.runtime.support.tinytpu_isa import ROWS as _ROWS, COLS as _COLS, T
 _ALU_TO_VPU = {Ops.ADD: "ADD", Ops.MUL: "MUL", Ops.SUB: "SUB", Ops.MAX: "MAX",
                Ops.CMPLT: "CMPLT", Ops.CMPNE: "CMPNE", Ops.CMPEQ: "CMPEQ",
                Ops.AND: "AND", Ops.OR: "OR", Ops.XOR: "XOR",
-               Ops.SHL: "SHL", Ops.SHR: "SHR", Ops.IDIV: "DIV"}
+               Ops.SHL: "SHL", Ops.SHR: "SHR", Ops.CDIV: "DIV"}
 # tinygrad ALU op -> float VPU op name (operands are float).
 _FLOAT_VPU = {Ops.ADD: "FADD", Ops.MUL: "FMUL", Ops.SUB: "FSUB",
               Ops.MAX: "FMAX", Ops.CMPLT: "FCMPLT"}
@@ -178,7 +178,7 @@ def _store_lanes(store: UOp) -> list[UOp]:
   one scalar value (and are unrolled into many STOREs instead).
   """
   v = store.src[1]
-  return list(v.src) if v.op is Ops.VECTORIZE else [v]
+  return list(v.src) if v.op is Ops.STACK else [v]
 
 # ---------------------------------------------------------------------------
 # InstSel pass — graph rewrites expanding ops with no single VPU opcode
@@ -191,13 +191,13 @@ def _expand_sqrt(x: UOp) -> UOp:
 def _expand_mod(x: UOp) -> UOp:
   # mod(a, b) = a - (a // b) * b; the VPU has no direct mod opcode.
   a, b = x.src[0], x.src[1]
-  return a.alu(Ops.SUB, a.alu(Ops.IDIV, b).alu(Ops.MUL, b))
+  return a.alu(Ops.SUB, a.alu(Ops.CDIV, b).alu(Ops.MUL, b))
 
 _INSTSEL = PatternMatcher([
   (UPat(Ops.SQRT, name="x"), _expand_sqrt),
-  (UPat(Ops.MOD, name="x"), _expand_mod),
+  (UPat(Ops.CMOD, name="x"), _expand_mod),
 ])
-_INSTSEL_OPS = (Ops.SQRT, Ops.MOD)
+_INSTSEL_OPS = (Ops.SQRT, Ops.CMOD)
 
 def _run_instsel(uops: list[UOp]) -> list[UOp]:
   """Apply InstSel graph rewrites; return the (possibly rewritten) uop list."""

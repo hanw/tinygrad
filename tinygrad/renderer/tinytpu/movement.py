@@ -225,7 +225,7 @@ def _lower_transpose(uops: list[UOp]) -> dict | None:
   shape_int = (op_counts.get("STORE", 0) == 4 and op_counts.get("LOAD", 0) == 4
                and op_counts.get("RANGE", 0) == 1 and op_counts.get("MUL", 0) == 1)
   shape_float = (op_counts.get("STORE", 0) == 1 and op_counts.get("LOAD", 0) == 4
-                 and op_counts.get("VECTORIZE", 0) == 1 and op_counts.get("RANGE", 0) == 1
+                 and op_counts.get("STACK", 0) == 1 and op_counts.get("RANGE", 0) == 1
                  and op_counts.get("MUL", 0) == 1)
   if not (shape_int or shape_float):
     return None
@@ -259,7 +259,7 @@ def _lower_transpose(uops: list[UOp]) -> dict | None:
     store_idx_uops.append(addr.src[1] if addr.op is Ops.INDEX else None)
     while val.op is Ops.CAST:
       val = val.src[0]
-    if val.op is Ops.VECTORIZE:
+    if val.op is Ops.STACK:
       for l in val.src:
         while l.op is Ops.CAST:
           l = l.src[0]
