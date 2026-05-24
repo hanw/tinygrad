@@ -318,7 +318,15 @@ def lower_gemm_fallback(uops: list[UOp]) -> dict | None:
 
     has_mulacc = any(u.op is Ops.MULACC for u in uops)
     has_store = op_counts.get("STORE", 0) > 0
-    is_gemm = has_mulacc or (len(params) == 3 and op_counts.get("MUL", 0) > 0
+    # The compute signature of a non-WMMA matmul is acc += a*b, where the MUL
+    # multiplies two loaded values. Address-arithmetic MULs (RANGE * stride
+    # or CONST * stride) must not qualify — otherwise reductions and other
+    # kernels with stride MULs get silently lowered as a GEMM and produce
+    # garbage.
+    has_load_mul = any(u.op is Ops.MUL and len(u.src) == 2
+                       and all(s.op is Ops.LOAD for s in u.src)
+                       for u in uops)
+    is_gemm = has_mulacc or (len(params) == 3 and has_load_mul
                               and op_counts.get("RANGE", 0) > 0 and has_store)
     if is_gemm and len(param_sizes) == 3 and op_counts.get("GROUP", 0) == 0:
         tiling = _infer_tiling(param_sizes.get(0), param_sizes.get(1), param_sizes.get(2, 0))
