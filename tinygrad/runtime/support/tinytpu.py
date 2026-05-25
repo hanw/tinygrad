@@ -146,14 +146,28 @@ def parse_multi_vmem_output(stdout: str) -> list[list[int]]:
   return [parse_result_line(line.strip(), "vmem_result", TILE_ELEMS)
           for line in stdout.splitlines() if line.strip().startswith("vmem_result ")]
 
+_VCD_COUNTER = [0]
+
 def run_bundle(sim: str, bundle_text: str) -> str:
   with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
     f.write(bundle_text)
     bundle_path = f.name
 
+  # Optional VCD waveform dump. TINYTPU_VCD may be a file path (single dump,
+  # overwritten each call) or a directory (numbered sim_NNN.vcd per call).
+  sim_args = [sim]
+  vcd_target = os.environ.get("TINYTPU_VCD")
+  if vcd_target:
+    if os.path.isdir(vcd_target):
+      _VCD_COUNTER[0] += 1
+      vcd_path = os.path.join(vcd_target, f"sim_{_VCD_COUNTER[0]:03d}.vcd")
+    else:
+      vcd_path = vcd_target
+    sim_args += ["-V", vcd_path]
+
   try:
     env = {**os.environ, "TINYTPU_BUNDLE": bundle_path}
-    proc = subprocess.run([sim], env=env, capture_output=True, text=True, timeout=30)
+    proc = subprocess.run(sim_args, env=env, capture_output=True, text=True, timeout=30)
   finally:
     os.unlink(bundle_path)
 
