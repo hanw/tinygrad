@@ -40,7 +40,7 @@ from tinygrad.renderer.tinytpu.common import (
     _psum_accumulate_row, _set_pred_if_zero, _skip_if_pred,
     _set_pred_ne_zero, _skip_if_not_pred,
     _wait_mxu, _load_mxu_result, _load_vpu_result, _load_xlu_result,
-    _mxu_epilogue, _load_epilogue_stat,
+    _mxu_epilogue, _load_epilogue_stat, _mxu_vpu_epilogue,
     _set_requant_config, _mxu_requant, _output_asram,
     _halt, _output_mxu, _output_vmem, _end, _bundle, _find_unique_param_arg)
 from tinygrad.renderer.tinytpu.gemm import _infer_tiling, _tiling_failure_note
