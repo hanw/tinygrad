@@ -33,4 +33,8 @@ VPU_BOOL_OPS = {VPU_OPS["CMPLT"], VPU_OPS["CMPNE"], VPU_OPS["CMPEQ"]}
 
 SXU_OPS = {"LOAD_VREG": 0, "STORE_VREG": 1, "DISPATCH_VPU": 2, "DISPATCH_XLU_BROADCAST": 3, "DISPATCH_MXU": 4, "WAIT_MXU": 5, "LOAD_MXU_RESULT": 6, "HALT": 7, "DISPATCH_SELECT": 8, "BROADCAST_SCALAR": 9, "BROADCAST_ROW": 10, "BROADCAST_COL": 11, "DISPATCH_XLU_TRANSPOSE": 12, "LOAD_VPU_RESULT": 13, "LOAD_XLU_RESULT": 14, "PSUM_WRITE": 15, "PSUM_ACCUMULATE": 16, "PSUM_READ": 17,
              "DISPATCH_MXU_EPILOGUE": 42, "LOAD_EPILOGUE_STAT": 43,
-             "SET_REQUANT_CONFIG": 44, "DISPATCH_MXU_REQUANT": 45}
+             "SET_REQUANT_CONFIG": 44, "DISPATCH_MXU_REQUANT": 45,
+             # Generic-VPU MXU epilogue (CODA-style composable epilogue).
+             # Stub: enum value reserved, hardware execution lands in a
+             # later slice. See doc/plan-mxu-epilogue-generic-vpu.md.
+             "DISPATCH_MXU_VPU_EPILOGUE": 46}
