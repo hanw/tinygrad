@@ -463,6 +463,19 @@ def _mxu_requant(wbase: int, abase: int, tiles: int, asram_dst: int) -> str:
     # GEMM operands in mxu* fields.
     return f"2 45 {asram_dst} 0 0 0 0 {wbase} {abase} {tiles}"
 
+def _mxu_vpu_epilogue(wbase: int, abase: int, tiles: int, src2_vreg: int,
+                      vpu_op: int, dst: int, vmem_dst: bool = False) -> str:
+    # SXU_DISPATCH_MXU_VPU_EPILOGUE opcode = 46. Generic-VPU MXU epilogue:
+    # at drain, applies vpu_op lane-wise between drainMatrix and the tile
+    # in vreg src2_vreg, writing the result to vreg dst (default) or vmem
+    # address dst (when vmem_dst=True). The Controller's curated subset
+    # is {ADD,SUB,MUL,MAX,MIN}; ops outside the subset pass drainMatrix
+    # through unchanged. vregSrc2.bit0 carries the writeback mode.
+    vmem_addr = dst if vmem_dst else 0
+    vreg_dst  = 0    if vmem_dst else dst
+    wb_bit    = 1    if vmem_dst else 0
+    return f"2 46 {vmem_addr} {vreg_dst} {src2_vreg} {vpu_op} {wb_bit} {wbase} {abase} {tiles}"
+
 def _output_asram(addr: int) -> str:
     # Record type 7: OUTPUT_ASRAM. Emit asram_result row at addr after HALT.
     return f"7 {addr}"
