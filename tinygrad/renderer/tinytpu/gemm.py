@@ -17,7 +17,7 @@ from tinygrad.dtype import PtrDType
 from tinygrad.renderer.tinytpu.common import (
   _ROWS, _COLS, _VPU, _find_unique_param_arg,
   _psum_clear, _mxu_psum_acc, _wait_mxu, _psum_read_row, _mxu,
-  _load_mxu_result, _vpu, _load, _store, _halt)
+  _load_mxu_result, _vpu, _load, _store, _halt, _mxu_vpu_epilogue)
 
 
 def _infer_tiling(out_size: int | None, act_size: int | None, weight_size: int) -> tuple[int, int, int] | None:
@@ -66,16 +66,43 @@ def _tiling_failure_note(out_size: int | None, act_size: int | None, weight_size
 def _generate_gemm_sxu_instructions(num_vecs: int, num_k_tiles: int, num_weight_tiles: int,
                                      *, has_bias: bool = False, bias_vmem_base: int = 0,
                                      has_relu: bool = False,
-                                     use_psum: bool = False) -> list[str]:
+                                     use_psum: bool = False,
+                                     fuse_mxu_vpu_epilogue: bool = False) -> list[str]:
     """Generate SXU instruction strings for a GEMM kernel.
 
     When use_psum=True and num_k_tiles>1, accumulate K-tiles in the
     PSUM bucket bank instead of reading each partial into a vreg and
     chaining VPU_ADDs. This eliminates num_k_tiles-1 VPU_ADDs and
     num_k_tiles LOAD_MXU_RESULT instructions per output tile.
+
+    When fuse_mxu_vpu_epilogue=True, replace the legacy chain of
+    _mxu + _wait_mxu + _load_mxu_result + _load(bias) + _vpu(ADD) + _store
+    with a single _mxu_vpu_epilogue dispatch (op 46) per output tile.
+    Caller must guarantee num_k_tiles == 1 and not has_relu — op 46
+    does not multi-K-accumulate and does not fuse ReLU.
     """
     out_vmem_base = num_weight_tiles if has_bias else 0
     prog_lines: list[str] = []
+
+    if fuse_mxu_vpu_epilogue:
+        # CODA-style single-bundle residual epilogue. One op-46 dispatch
+        # per output tile; the Controller drains the GEMM, adds the
+        # tile-shape src2 lane-wise, and writes the result directly to
+        # VMEM[out_addr].
+        assert has_bias and num_k_tiles == 1 and not has_relu, \
+            "fuse_mxu_vpu_epilogue requires has_bias + num_k_tiles=1 + not has_relu"
+        src2_vreg = 0
+        for row in range(num_vecs):
+            for tile_idx in range(num_weight_tiles):
+                wmem_addr = tile_idx
+                amem_addr = row
+                out_addr  = out_vmem_base + row * num_weight_tiles + tile_idx
+                prog_lines.append(_load(src2_vreg, bias_vmem_base + tile_idx))
+                prog_lines.append(_mxu_vpu_epilogue(
+                    wmem_addr, amem_addr, 1, src2_vreg=src2_vreg,
+                    vpu_op=_VPU["ADD"], dst=out_addr, vmem_dst=True))
+        prog_lines.append(_halt())
+        return prog_lines
 
     psum_path = use_psum and num_k_tiles > 1
 
@@ -270,12 +297,20 @@ def lower_gemm(uops: list[UOp]) -> dict | None:
     # bucket in one cycle, so no zero-tile preload is needed.
     use_psum = num_k_tiles > 1
 
+    # CODA-style residual fusion: collapse the GEMM + tile-shape add
+    # into a single op-46 dispatch per output tile. Requires the
+    # epilogue to be exactly a FULL-shape bias add (no relu) and the
+    # GEMM to fit in one K-tile (op-46 doesn't multi-K-accumulate).
+    fuse_residual = (has_bias and bias_mode == "FULL"
+                     and num_k_tiles == 1 and not has_relu)
+
     # Generate SXU instructions
     instructions = _generate_gemm_sxu_instructions(
         num_vecs, num_k_tiles, num_weight_tiles,
         has_bias=has_bias, bias_vmem_base=bias_vmem_base,
         has_relu=has_relu,
         use_psum=use_psum,
+        fuse_mxu_vpu_epilogue=fuse_residual,
     )
     outputs: list[dict] = []
     for row in range(num_vecs):
