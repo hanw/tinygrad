@@ -87,7 +87,7 @@ class TinyTPUKernel:
             data_lines.append(_amem(row * nk + k, [int(x) for x in a_tile]))
 
       elif mem_type == "VMEM":
-        self._append_vmem_data(data_lines, entry, buf_data)
+        self._append_vmem_data(data_lines, entry, buf_data, bufs)
       else:
         raise ValueError(f"unknown TinyTPU data_plan memory type {mem_type!r}")
 
@@ -117,7 +117,8 @@ class TinyTPUKernel:
       out_offset += len(chunk_out) * out_dtype.itemsize
 
   @staticmethod
-  def _append_vmem_data(data_lines: list[str], entry: dict, buf_data: bytearray) -> None:
+  def _append_vmem_data(data_lines: list[str], entry: dict, buf_data: bytearray,
+                        bufs: tuple[bytearray, ...] = ()) -> None:
     is_bool = entry.get("bool", False)
     raw = np.frombuffer(bytes(buf_data), dtype=np.bool_ if is_bool else "<i4")
     if is_bool: raw = raw.astype(np.int32)
@@ -133,6 +134,24 @@ class TinyTPUKernel:
       for t in range(nwt):
         tile = [0] * TILE_ELEMS
         for i in range(COLS): tile[i] = int(raw[t * COLS + i])
+        data_lines.append(_vmem(addr + t, tile))
+    elif mode == "INTERLEAVE_CS":
+      # RoPE op-46 src2 layout: per weight tile, even lanes hold cos
+      # (from c_param == entry["param"]), odd lanes hold sin (from
+      # entry["s_param"]). Mirrors VPU_IPAIR_ROTATE's src2 packing.
+      # Same layout convention as FULL-mode residual bias: one VMEM
+      # slot per weight tile, shared across all row dispatches.
+      nwt = int(entry.get("num_weight_tiles", 1))
+      s_param_idx = entry.get("s_param")
+      assert s_param_idx is not None, "INTERLEAVE_CS requires s_param"
+      raw_c = raw
+      raw_s = np.frombuffer(bytes(bufs[int(s_param_idx)]), dtype="<i4")
+      for t in range(nwt):
+        tile = [0] * TILE_ELEMS
+        for r in range(ROWS):
+          for c in range(COLS):
+            flat = t * TILE_ELEMS + r * COLS + c
+            tile[r * COLS + c] = int(raw_c[flat]) if (c % 2 == 0) else int(raw_s[flat])
         data_lines.append(_vmem(addr + t, tile))
     elif mode == "PAD_FILL":
       tile = [int(entry.get("pad_value", 0))] * TILE_ELEMS

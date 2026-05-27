@@ -18,6 +18,8 @@ from tinygrad.renderer.tinytpu.common import (
   _ROWS, _COLS, _VPU, _find_unique_param_arg,
   _psum_clear, _mxu_psum_acc, _wait_mxu, _psum_read_row, _mxu,
   _load_mxu_result, _vpu, _load, _store, _halt, _mxu_vpu_epilogue)
+from tinygrad.renderer.tinytpu.upat_recognizers import (
+  recognize_residual_epilogue, recognize_rope_epilogue)
 
 
 def _infer_tiling(out_size: int | None, act_size: int | None, weight_size: int) -> tuple[int, int, int] | None:
@@ -67,7 +69,8 @@ def _generate_gemm_sxu_instructions(num_vecs: int, num_k_tiles: int, num_weight_
                                      *, has_bias: bool = False, bias_vmem_base: int = 0,
                                      has_relu: bool = False,
                                      use_psum: bool = False,
-                                     fuse_mxu_vpu_epilogue: bool = False) -> list[str]:
+                                     fuse_mxu_vpu_epilogue: bool = False,
+                                     fuse_ipair_rotate: bool = False) -> list[str]:
     """Generate SXU instruction strings for a GEMM kernel.
 
     When use_psum=True and num_k_tiles>1, accumulate K-tiles in the
@@ -80,17 +83,29 @@ def _generate_gemm_sxu_instructions(num_vecs: int, num_k_tiles: int, num_weight_
     with a single _mxu_vpu_epilogue dispatch (op 46) per output tile.
     Caller must guarantee num_k_tiles == 1 and not has_relu — op 46
     does not multi-K-accumulate and does not fuse ReLU.
+
+    When fuse_ipair_rotate=True, emit op-46 with VPU_IPAIR_ROTATE per
+    output tile. The bias_vmem_base region must already hold the
+    interleaved (cos, sin) tile produced by compiler_tinytpu.py's
+    INTERLEAVE_CS materialization. Mutually exclusive with
+    fuse_mxu_vpu_epilogue (a kernel is either residual or RoPE).
     """
     out_vmem_base = num_weight_tiles if has_bias else 0
     prog_lines: list[str] = []
 
-    if fuse_mxu_vpu_epilogue:
-        # CODA-style single-bundle residual epilogue. One op-46 dispatch
-        # per output tile; the Controller drains the GEMM, adds the
-        # tile-shape src2 lane-wise, and writes the result directly to
-        # VMEM[out_addr].
+    if fuse_mxu_vpu_epilogue or fuse_ipair_rotate:
+        # CODA-style single-bundle epilogue. One op-46 dispatch per
+        # output tile; the Controller drains the GEMM, applies the
+        # lane-wise VPU op against the tile-shape src2, and writes
+        # the result directly to VMEM[out_addr]. The only difference
+        # between residual and RoPE here is which VpuOp we hand the
+        # Controller — the src2 layout is the caller's responsibility
+        # (residual = tile-shape bias, RoPE = interleaved CS).
+        assert not (fuse_mxu_vpu_epilogue and fuse_ipair_rotate), \
+            "residual and rope fusion are mutually exclusive"
         assert has_bias and num_k_tiles == 1 and not has_relu, \
-            "fuse_mxu_vpu_epilogue requires has_bias + num_k_tiles=1 + not has_relu"
+            "op-46 fusion requires has_bias + num_k_tiles=1 + not has_relu"
+        vpu_op = _VPU["IPAIR_ROTATE"] if fuse_ipair_rotate else _VPU["ADD"]
         src2_vreg = 0
         for row in range(num_vecs):
             for tile_idx in range(num_weight_tiles):
@@ -100,7 +115,7 @@ def _generate_gemm_sxu_instructions(num_vecs: int, num_k_tiles: int, num_weight_
                 prog_lines.append(_load(src2_vreg, bias_vmem_base + tile_idx))
                 prog_lines.append(_mxu_vpu_epilogue(
                     wmem_addr, amem_addr, 1, src2_vreg=src2_vreg,
-                    vpu_op=_VPU["ADD"], dst=out_addr, vmem_dst=True))
+                    vpu_op=vpu_op, dst=out_addr, vmem_dst=True))
         prog_lines.append(_halt())
         return prog_lines
 
@@ -169,6 +184,20 @@ def _extract_wmma_epilogue(uops: list[UOp], params: dict[int, UOp], out_arg: int
     extra_params = sorted(k for k in params if k not in {out_arg, act_arg, weight_arg})
     epilogue: list[dict] = []
 
+    # RoPE first — most specific (two extra params, two MULs feeding
+    # one ADD per output lane). If the UPat recognizer fires the
+    # post-WMMA STOREs are exactly the pair-rotate shape and no other
+    # epilogue interpretation is possible.
+    if (len(extra_params) == 2
+        and op_counts.get("MUL", 0) == 2 * out_size
+        and op_counts.get("ADD", 0) == out_size):
+        rope = recognize_rope_epilogue(uops)
+        if rope is not None:
+            epilogue.append({"op": "ROPE", "c_arg": rope.c_param.arg, "s_arg": rope.s_param.arg})
+            # Reject any further fusion attempt (relu, etc.) so the
+            # caller treats this as a complete epilogue.
+            return epilogue, None
+
     if op_counts.get("ADD", 0) and len(extra_params) > 0:
         if len(extra_params) != 1:
             return [], f"wmma add epilogue expected one extra param, found {len(extra_params)}"
@@ -177,6 +206,13 @@ def _extract_wmma_epilogue(uops: list[UOp], params: dict[int, UOp], out_arg: int
         if bias_size == out_cols:
             epilogue.append({"op": "ADD", "arg": bias_arg, "mode": "ROW_BROADCAST"})
         elif bias_size == out_size:
+            # Validate the per-lane structure with the UPat recognizer —
+            # buffer-size match alone doesn't guarantee STORE shape is
+            # a clean residual. The recognizer enforces:
+            #   STORE(INDEX(p_out,i), ADD(GEP(WMMA,i), LOAD(INDEX(p_r,i))))
+            # for every output lane with consistent WMMA + residual buf.
+            if recognize_residual_epilogue(uops) is None:
+                return [], "wmma add epilogue: bias buffer size matches FULL but STORE pattern is not a per-lane residual"
             epilogue.append({"op": "ADD", "arg": bias_arg, "mode": "FULL"})
         else:
             return [], f"wmma add epilogue unsupported bias size {bias_size}"
@@ -236,12 +272,19 @@ def lower_gemm(uops: list[UOp]) -> dict | None:
 
     has_bias = any(step["op"] == "ADD" for step in epilogue)
     has_relu = any(step["op"] == "RELU" for step in epilogue)
+    has_rope = any(step["op"] == "ROPE" for step in epilogue)
     bias_arg = None
     bias_mode = None
+    rope_c_arg = None
+    rope_s_arg = None
     if has_bias:
         bias_step = next(s for s in epilogue if s["op"] == "ADD")
         bias_arg = bias_step["arg"]
         bias_mode = bias_step["mode"]
+    if has_rope:
+        rope_step = next(s for s in epilogue if s["op"] == "ROPE")
+        rope_c_arg = rope_step["c_arg"]
+        rope_s_arg = rope_step["s_arg"]
 
     # Build data_plan: describe which buffers map to which memory addresses
     data_plan: list[dict] = []
@@ -275,6 +318,7 @@ def lower_gemm(uops: list[UOp]) -> dict | None:
 
     # Bias → VMEM (if present)
     bias_vmem_base = 0
+    src2_vmem_base = 0   # base for either residual bias or interleaved CS tile
     if has_bias:
         bias_size = params[bias_arg].dtype.size
         data_plan.append({
@@ -288,9 +332,30 @@ def lower_gemm(uops: list[UOp]) -> dict | None:
             "mode": bias_mode,
             "num_weight_tiles": num_weight_tiles,
         })
+    elif has_rope:
+        # Interleaved CS tile: even lanes = cos (from c_param), odd lanes =
+        # sin (from s_param). One VMEM slot per output tile. Matches the
+        # src2 layout VPU_IPAIR_ROTATE consumes. See compiler_tinytpu.py's
+        # INTERLEAVE_CS mode for the materialization.
+        c_size = params[rope_c_arg].dtype.size
+        s_size = params[rope_s_arg].dtype.size
+        data_plan.append({
+            "type": "VMEM",
+            "addr": src2_vmem_base,
+            "param": rope_c_arg,
+            "s_param": rope_s_arg,
+            "offset": 0,
+            "count": c_size,
+            "s_count": s_size,
+            "dtype": "int32",
+            "layout": "rope_cs",
+            "mode": "INTERLEAVE_CS",
+            "num_weight_tiles": num_weight_tiles,
+            "num_vecs": num_vecs,
+        })
 
     # Output VMEM addresses
-    out_vmem_base = num_weight_tiles if has_bias else 0
+    out_vmem_base = num_weight_tiles if (has_bias or has_rope) else 0
 
     # PSUM accumulation path eliminates the VPU_ADD chain and per-K
     # LOAD_MXU_RESULT for multi-K-tile GEMM. SXU_PSUM_CLEAR zeroes the
@@ -303,14 +368,22 @@ def lower_gemm(uops: list[UOp]) -> dict | None:
     # GEMM to fit in one K-tile (op-46 doesn't multi-K-accumulate).
     fuse_residual = (has_bias and bias_mode == "FULL"
                      and num_k_tiles == 1 and not has_relu)
+    # CODA-style RoPE fusion: same op-46 path but with VPU_IPAIR_ROTATE.
+    # The interleaved-CS data_plan entry above gives us one src2 tile
+    # per output slot at src2_vmem_base + tile_idx (mirroring the
+    # residual layout), so the SXU side is identical to fuse_residual
+    # except for the VpuOp.
+    fuse_rope = has_rope and num_k_tiles == 1
 
     # Generate SXU instructions
     instructions = _generate_gemm_sxu_instructions(
         num_vecs, num_k_tiles, num_weight_tiles,
-        has_bias=has_bias, bias_vmem_base=bias_vmem_base,
+        has_bias=(has_bias or has_rope),
+        bias_vmem_base=bias_vmem_base if has_bias else src2_vmem_base,
         has_relu=has_relu,
         use_psum=use_psum,
         fuse_mxu_vpu_epilogue=fuse_residual,
+        fuse_ipair_rotate=fuse_rope,
     )
     outputs: list[dict] = []
     for row in range(num_vecs):
