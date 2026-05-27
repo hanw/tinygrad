@@ -135,24 +135,40 @@ class TinyTPUKernel:
         tile = [0] * TILE_ELEMS
         for i in range(COLS): tile[i] = int(raw[t * COLS + i])
         data_lines.append(_vmem(addr + t, tile))
+    elif mode == "FULL":
+      # Fused-op-46 residual layout: one VMEM slot per (output_row,
+      # weight_tile). Each slot's row 0 (lanes 0..COLS-1) holds the
+      # bias coefficients for that output row's column range; other
+      # lanes are zero. The Controller's drain branch reads src2Reg[0]
+      # so only the first row of each VMEM tile matters.
+      nwt = int(entry.get("num_weight_tiles", 1))
+      nv  = int(len(raw) // (nwt * COLS))
+      for r in range(nv):
+        for t in range(nwt):
+          tile = [0] * TILE_ELEMS
+          base = (r * nwt + t) * COLS
+          for c in range(COLS):
+            tile[c] = int(raw[base + c])
+          data_lines.append(_vmem(addr + r * nwt + t, tile))
     elif mode == "INTERLEAVE_CS":
-      # RoPE op-46 src2 layout: per weight tile, even lanes hold cos
-      # (from c_param == entry["param"]), odd lanes hold sin (from
-      # entry["s_param"]). Mirrors VPU_IPAIR_ROTATE's src2 packing.
-      # Same layout convention as FULL-mode residual bias: one VMEM
-      # slot per weight tile, shared across all row dispatches.
+      # RoPE op-46 src2 layout: one VMEM slot per (output_row,
+      # weight_tile). Each slot's row 0 holds interleaved (cos, sin)
+      # for that output row's column range — even lanes from c_param,
+      # odd lanes from entry["s_param"]. Matches VPU_IPAIR_ROTATE's
+      # expected src2 packing on row 0.
       nwt = int(entry.get("num_weight_tiles", 1))
       s_param_idx = entry.get("s_param")
       assert s_param_idx is not None, "INTERLEAVE_CS requires s_param"
       raw_c = raw
       raw_s = np.frombuffer(bytes(bufs[int(s_param_idx)]), dtype="<i4")
-      for t in range(nwt):
-        tile = [0] * TILE_ELEMS
-        for r in range(ROWS):
+      nv = int(len(raw_c) // (nwt * COLS))
+      for r in range(nv):
+        for t in range(nwt):
+          tile = [0] * TILE_ELEMS
+          base = (r * nwt + t) * COLS
           for c in range(COLS):
-            flat = t * TILE_ELEMS + r * COLS + c
-            tile[r * COLS + c] = int(raw_c[flat]) if (c % 2 == 0) else int(raw_s[flat])
-        data_lines.append(_vmem(addr + t, tile))
+            tile[c] = int(raw_c[base + c]) if (c % 2 == 0) else int(raw_s[base + c])
+          data_lines.append(_vmem(addr + r * nwt + t, tile))
     elif mode == "PAD_FILL":
       tile = [int(entry.get("pad_value", 0))] * TILE_ELEMS
       for dst, src in entry["pad_map"]:

@@ -90,17 +90,25 @@ def _generate_gemm_sxu_instructions(num_vecs: int, num_k_tiles: int, num_weight_
     INTERLEAVE_CS materialization. Mutually exclusive with
     fuse_mxu_vpu_epilogue (a kernel is either residual or RoPE).
     """
-    out_vmem_base = num_weight_tiles if has_bias else 0
+    # Fused op-46 uses per-(row, tile) src2 slots, so out_vmem_base
+    # must skip past num_vecs * num_weight_tiles slots, not just
+    # num_weight_tiles. Legacy ROW_BROADCAST chain keeps the smaller
+    # offset.
+    if fuse_mxu_vpu_epilogue or fuse_ipair_rotate:
+        out_vmem_base = num_vecs * num_weight_tiles
+    else:
+        out_vmem_base = num_weight_tiles if has_bias else 0
     prog_lines: list[str] = []
 
     if fuse_mxu_vpu_epilogue or fuse_ipair_rotate:
         # CODA-style single-bundle epilogue. One op-46 dispatch per
-        # output tile; the Controller drains the GEMM, applies the
-        # lane-wise VPU op against the tile-shape src2, and writes
-        # the result directly to VMEM[out_addr]. The only difference
-        # between residual and RoPE here is which VpuOp we hand the
-        # Controller — the src2 layout is the caller's responsibility
-        # (residual = tile-shape bias, RoPE = interleaved CS).
+        # output ROW; the Controller drains via getResults (column-
+        # summed) and applies the lane-wise VPU op against src2 row 0,
+        # which the caller has populated with this output row's
+        # coefficients. Result lands at VMEM[out_addr] in row 0
+        # (lanes 0..cols-1); rows 1..3 of the vmem tile are zero.
+        # Residual: src2 row 0 = bias row r.  RoPE: src2 row 0 =
+        # interleaved (cos, sin) for output row r.
         assert not (fuse_mxu_vpu_epilogue and fuse_ipair_rotate), \
             "residual and rope fusion are mutually exclusive"
         assert has_bias and num_k_tiles == 1 and not has_relu, \
@@ -112,7 +120,10 @@ def _generate_gemm_sxu_instructions(num_vecs: int, num_k_tiles: int, num_weight_
                 wmem_addr = tile_idx
                 amem_addr = row
                 out_addr  = out_vmem_base + row * num_weight_tiles + tile_idx
-                prog_lines.append(_load(src2_vreg, bias_vmem_base + tile_idx))
+                # Per-(row, tile) src2 slot — each output row needs its
+                # own coefficient row at lanes 0..cols-1 of the vreg.
+                src2_slot = bias_vmem_base + row * num_weight_tiles + tile_idx
+                prog_lines.append(_load(src2_vreg, src2_slot))
                 prog_lines.append(_mxu_vpu_epilogue(
                     wmem_addr, amem_addr, 1, src2_vreg=src2_vreg,
                     vpu_op=vpu_op, dst=out_addr, vmem_dst=True))
@@ -286,6 +297,14 @@ def lower_gemm(uops: list[UOp]) -> dict | None:
         rope_c_arg = rope_step["c_arg"]
         rope_s_arg = rope_step["s_arg"]
 
+    # Decide fused op-46 path eligibility up front so the data_plan can
+    # size the src2 region correctly (1 slot per (row, weight_tile) vs.
+    # 1 slot per weight_tile for the legacy row-broadcast chain).
+    fuse_residual = (has_bias and bias_mode == "FULL"
+                     and num_k_tiles == 1 and not has_relu)
+    fuse_rope = has_rope and num_k_tiles == 1
+    fused_src2 = fuse_residual or fuse_rope
+
     # Build data_plan: describe which buffers map to which memory addresses
     data_plan: list[dict] = []
 
@@ -354,28 +373,20 @@ def lower_gemm(uops: list[UOp]) -> dict | None:
             "num_vecs": num_vecs,
         })
 
-    # Output VMEM addresses
-    out_vmem_base = num_weight_tiles if (has_bias or has_rope) else 0
+    # Output VMEM addresses. The src2/bias region precedes the output
+    # region. Fused op-46 needs one src2 slot per (row, tile_idx) so the
+    # output region starts at num_vecs * num_weight_tiles. The legacy
+    # row-broadcast chain only needs num_weight_tiles bias slots.
+    out_vmem_base = (num_vecs * num_weight_tiles if fused_src2
+                     else (num_weight_tiles if has_bias else 0))
 
     # PSUM accumulation path eliminates the VPU_ADD chain and per-K
     # LOAD_MXU_RESULT for multi-K-tile GEMM. SXU_PSUM_CLEAR zeroes the
     # bucket in one cycle, so no zero-tile preload is needed.
     use_psum = num_k_tiles > 1
 
-    # CODA-style residual fusion: collapse the GEMM + tile-shape add
-    # into a single op-46 dispatch per output tile. Requires the
-    # epilogue to be exactly a FULL-shape bias add (no relu) and the
-    # GEMM to fit in one K-tile (op-46 doesn't multi-K-accumulate).
-    fuse_residual = (has_bias and bias_mode == "FULL"
-                     and num_k_tiles == 1 and not has_relu)
-    # CODA-style RoPE fusion: same op-46 path but with VPU_IPAIR_ROTATE.
-    # The interleaved-CS data_plan entry above gives us one src2 tile
-    # per output slot at src2_vmem_base + tile_idx (mirroring the
-    # residual layout), so the SXU side is identical to fuse_residual
-    # except for the VpuOp.
-    fuse_rope = has_rope and num_k_tiles == 1
-
-    # Generate SXU instructions
+    # Generate SXU instructions (fuse_residual / fuse_rope decided above
+    # so the data_plan src2-region sizing stays in sync).
     instructions = _generate_gemm_sxu_instructions(
         num_vecs, num_k_tiles, num_weight_tiles,
         has_bias=(has_bias or has_rope),
